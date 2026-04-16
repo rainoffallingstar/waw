@@ -41,6 +41,13 @@ fn run() -> Result<ExitCode, String> {
         return handle_backend_command(&cli.command, &mut loaded_config, cli.dry_run, cli.json);
     }
 
+    if cli.json && !command_supports_json(&cli.command) {
+        return Err(
+            "`--json` is currently supported only for `backends`, `backend ...`, and `show`."
+                .to_string(),
+        );
+    }
+
     let config = &loaded_config.config;
     let selected_backend = cli.backend.or(config.backend);
 
@@ -594,7 +601,7 @@ fn run_show(
                     error: Some(error.clone()),
                 });
             }
-            if single_backend {
+            if single_backend && !json {
                 return Err(error);
             }
             continue;
@@ -885,7 +892,8 @@ fn render_multi_package_details(details: &[PackageDetails]) -> String {
         }
 
         let first = present_values[0];
-        let all_same = present_values.iter().all(|value| *value == first);
+        let all_same = present_values.len() == details.len()
+            && present_values.iter().all(|value| *value == first);
         if all_same {
             lines.push(format!("{field:<label_width$}: {first}"));
             continue;
@@ -3824,6 +3832,10 @@ fn shell_escape(value: &str) -> String {
     }
 }
 
+fn command_supports_json(command: &Subcommand) -> bool {
+    matches!(command, Subcommand::Show { .. })
+}
+
 fn print_help() {
     let config_hint = default_config_path()
         .map(|path| path.display().to_string())
@@ -3858,7 +3870,7 @@ Options:
   -b, --backend <name>     Select backend explicitly
       --config <path>      Load config from a custom path
       --dry-run            Print backend commands without executing them
-      --json               Emit machine-readable JSON for backend management and `show` output
+      --json               Emit machine-readable JSON for `backends`, `backend ...`, and `show`
   -y, --yes                Assume yes where the backend supports it
   -h, --help               Show this help text
   -V, --version            Show version
@@ -4006,6 +4018,19 @@ mod tests {
                 package: "requests".to_string()
             }
         );
+    }
+
+    #[test]
+    fn json_support_is_limited_to_show_outside_backend_commands() {
+        assert!(command_supports_json(&Subcommand::Show {
+            package: "requests".to_string(),
+        }));
+        assert!(!command_supports_json(&Subcommand::List {
+            upgradable: false
+        }));
+        assert!(!command_supports_json(&Subcommand::Search {
+            query: "git".to_string(),
+        }));
     }
 
     #[test]
@@ -4664,14 +4689,16 @@ Version   :
 Summary   :
   npm      Freckle CLI tool using node.js
   pip      The PyPA recommended tool for installing Python packages.
-Homepage  : https://pip.pypa.io/
+Homepage  :
+  pip      https://pip.pypa.io/
 License   :
   npm      Proprietary
   pip      MIT
 Author    :
   npm      sirkitree <sirkitree@gmail.com>
   pip      The pip developers <distutils-sig@python.org>
-Depends On: optimist, freckle
+Depends On:
+  npm      optimist, freckle
 
 == npm extras ==
 Published : over a year ago by sirkitree <sirkitree@gmail.com>
@@ -4804,5 +4831,27 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
             "\"extra_fields\":{\"Location\":\"/opt/homebrew/lib/python3.14/site-packages\"}"
         ));
         assert!(json.contains("\"error\":null"));
+    }
+
+    #[test]
+    fn show_results_json_can_encode_failures() {
+        let json = render_show_results_json(&[ShowBackendResult {
+            backend: Backend::Pip,
+            command: "python3 -m pip show missing".to_string(),
+            success: false,
+            dry_run: false,
+            details: None,
+            raw_output: None,
+            error: Some(
+                "backend command failed with exit code 1: python3 -m pip show missing".to_string(),
+            ),
+        }]);
+
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("\"details\":null"));
+        assert!(json.contains("\"raw_output\":null"));
+        assert!(json.contains(
+            "\"error\":\"backend command failed with exit code 1: python3 -m pip show missing\""
+        ));
     }
 }
