@@ -1,0 +1,8 @@
+[package]
+name = "waw"
+version = "0.1.0"
+edition = "2024"
+description = "A unified Windows package management CLI with apt-get-like commands"
+license = "MIT"
+
+[dependencies]
