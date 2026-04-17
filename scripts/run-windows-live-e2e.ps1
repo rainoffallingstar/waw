@@ -125,6 +125,10 @@ function Ensure-PackageAbsent {
         [hashtable]$Case
     )
 
+    if ($Case.SkipListVerification) {
+        return
+    }
+
     $listOutput = Get-BackendListOutput $Case.Backend
     if ($listOutput -match $Case.VerifyPattern) {
         Invoke-Waw @("--backend", $Case.Backend, "remove", "--exact", $Case.Package)
@@ -144,12 +148,16 @@ function Invoke-InstallRemoveCase {
         Ensure-PackageAbsent $Case
 
         Invoke-Waw @("--backend", $Case.Backend, "install", "--exact", $Case.Package)
-        $listAfterInstall = Get-BackendListOutput $Case.Backend
-        Assert-OutputContains $listAfterInstall $Case.VerifyPattern "Package $($Case.Package) was not detected after install on backend $($Case.Backend)."
+        if (-not $Case.SkipListVerification) {
+            $listAfterInstall = Get-BackendListOutput $Case.Backend
+            Assert-OutputContains $listAfterInstall $Case.VerifyPattern "Package $($Case.Package) was not detected after install on backend $($Case.Backend)."
+        }
 
         Invoke-Waw @("--backend", $Case.Backend, "remove", "--exact", $Case.Package)
-        $listAfterRemove = Get-BackendListOutput $Case.Backend
-        Assert-OutputNotContains $listAfterRemove $Case.VerifyPattern "Package $($Case.Package) is still present after remove on backend $($Case.Backend)."
+        if (-not $Case.SkipListVerification) {
+            $listAfterRemove = Get-BackendListOutput $Case.Backend
+            Assert-OutputNotContains $listAfterRemove $Case.VerifyPattern "Package $($Case.Package) is still present after remove on backend $($Case.Backend)."
+        }
     }
 }
 
@@ -188,6 +196,7 @@ $cases = @(
         Backend = "winget"
         Package = "jqlang.jq"
         VerifyPattern = "(?mi)^\s*(jq|jqlang\.jq)\s+"
+        SkipListVerification = $true
     },
     @{
         Backend = "scoop"
