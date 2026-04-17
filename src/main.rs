@@ -1,13 +1,19 @@
 use std::env;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt::{self, Display};
 use std::fs;
 use std::io::ErrorKind;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ELEVATED_STEP_MARKER: &str = "WAW_ELEVATED_STEP:";
+const ELEVATED_FAILURE_MARKER: &str = "WAW_ELEVATED_FAILURE:";
 
 fn main() -> ExitCode {
     match run() {
@@ -33,12 +39,27 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let mut loaded_config = LoadedConfig::load(cli.config_path.as_deref())?;
+    let backend_assume_yes = cli.assume_yes.unwrap_or(loaded_config.config.assume_yes);
+    let backend_auto_elevate = cli
+        .auto_elevate
+        .unwrap_or(loaded_config.config.auto_elevate);
+
+    if let Some(code) = maybe_relaunch_self_elevated(&cli, &loaded_config.config)? {
+        return Ok(code);
+    }
 
     if matches!(
         cli.command,
         Subcommand::Backends | Subcommand::Backend { action: _ }
     ) {
-        return handle_backend_command(&cli.command, &mut loaded_config, cli.dry_run, cli.json);
+        return handle_backend_command(
+            &cli.command,
+            &mut loaded_config,
+            cli.dry_run,
+            cli.json,
+            backend_assume_yes,
+            backend_auto_elevate,
+        );
     }
 
     if cli.json && !command_supports_json(&cli.command) {
@@ -50,39 +71,49 @@ fn run() -> Result<ExitCode, String> {
 
     let config = &loaded_config.config;
     let selected_backend = cli.backend.or(config.backend);
+    let runtime = runtime_from(config, &cli);
+
+    match &cli.command {
+        Subcommand::Update if selected_backend.is_none() => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_update_all(backends, cli.dry_run, &runtime);
+        }
+        Subcommand::Upgrade { packages } if packages.is_empty() => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_interactive_upgrade(backends, &runtime, cli.dry_run);
+        }
+        _ => {}
+    }
 
     if let Subcommand::Search { query } = &cli.command {
         let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_search(backends, query, &runtime_from(config, &cli));
+        return run_search(backends, query, &runtime);
     }
 
     if let Subcommand::Install {
-        mode: InstallMode::Pick(query),
+        mode: InstallMode::Search(query),
     } = &cli.command
     {
         let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_interactive_install(backends, query, &runtime_from(config, &cli), cli.dry_run);
+        return run_interactive_install(backends, query, &runtime, cli.dry_run);
+    }
+
+    if let Subcommand::Remove {
+        mode: RemoveMode::Search(query),
+    } = &cli.command
+    {
+        let backends = resolve_auto_backends(selected_backend, config)?;
+        return run_interactive_remove(backends, query, &runtime, cli.dry_run);
     }
 
     if let Subcommand::List { upgradable } = &cli.command {
         let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_list(
-            backends,
-            *upgradable,
-            &runtime_from(config, &cli),
-            cli.dry_run,
-        );
+        return run_list(backends, *upgradable, &runtime, cli.dry_run);
     }
 
     if let Subcommand::Show { package } = &cli.command {
         let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_show(
-            backends,
-            package,
-            &runtime_from(config, &cli),
-            cli.dry_run,
-            cli.json,
-        );
+        return run_show(backends, package, &runtime, cli.dry_run, cli.json);
     }
 
     let backend = match selected_backend {
@@ -97,22 +128,14 @@ fn run() -> Result<ExitCode, String> {
         None => Backend::detect(config)?,
     };
 
-    let runtime = runtime_from(config, &cli);
-
     if !cfg!(windows) && !cli.dry_run {
         eprintln!(
             "warning: {APP_NAME} is intended to run on Windows; execution may fail on this host"
         );
     }
 
-    if let Subcommand::Upgrade { packages } = &cli.command {
-        if backend == Backend::Pip && packages.is_empty() {
-            return run_pip_upgrade_all(&runtime, cli.dry_run);
-        }
-    }
-
     let invocations = backend.plan(&cli.command, &runtime)?;
-    execute_invocations(invocations, cli.dry_run)
+    execute_invocations(invocations, cli.dry_run, &runtime)
 }
 
 fn handle_backend_command(
@@ -120,6 +143,8 @@ fn handle_backend_command(
     loaded_config: &mut LoadedConfig,
     dry_run: bool,
     json: bool,
+    assume_yes: bool,
+    auto_elevate: bool,
 ) -> Result<ExitCode, String> {
     match command {
         Subcommand::Backends
@@ -202,6 +227,28 @@ fn handle_backend_command(
                 return Ok(ExitCode::SUCCESS);
             }
 
+            if !backend.supports_bootstrap_install_on_host() {
+                if json {
+                    println!(
+                        "{}",
+                        render_backend_install_json(
+                            *backend,
+                            false,
+                            *enable,
+                            dry_run,
+                            "bootstrap_unsupported",
+                            None
+                        )
+                    );
+                } else {
+                    println!(
+                        "Automatic bootstrap install for {backend} is not supported on this host."
+                    );
+                    println!("Hint: {}", backend.install_hint());
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+
             if backend.is_available() {
                 if json {
                     println!(
@@ -218,11 +265,19 @@ fn handle_backend_command(
                 } else {
                     println!("Backend {backend} is already available.");
                 }
-            } else if let Some(invocation) = backend.install_invocation() {
+            } else if let Some(invocation) = backend.install_invocation(assume_yes) {
                 if !json {
                     println!("Bootstrap command for {backend}:");
                 }
-                execute_invocations(vec![invocation], dry_run)?;
+                execute_invocations(
+                    vec![invocation],
+                    dry_run,
+                    &RuntimeSettings {
+                        assume_yes,
+                        auto_elevate,
+                        config: &loaded_config.config,
+                    },
+                )?;
                 if json {
                     println!(
                         "{}",
@@ -232,27 +287,25 @@ fn handle_backend_command(
                             *enable,
                             dry_run,
                             "bootstrap_requested",
-                            backend.install_invocation().as_ref()
+                            backend.install_invocation(assume_yes).as_ref()
                         )
                     );
                 }
+            } else if json {
+                println!(
+                    "{}",
+                    render_backend_install_json(
+                        *backend,
+                        false,
+                        *enable,
+                        dry_run,
+                        "no_bootstrap",
+                        None
+                    )
+                );
             } else {
-                if json {
-                    println!(
-                        "{}",
-                        render_backend_install_json(
-                            *backend,
-                            false,
-                            *enable,
-                            dry_run,
-                            "no_bootstrap",
-                            None
-                        )
-                    );
-                } else {
-                    println!("Automatic install is not implemented for {backend}.");
-                    println!("Hint: {}", backend.install_hint());
-                }
+                println!("Automatic install is not implemented for {backend}.");
+                println!("Hint: {}", backend.install_hint());
             }
 
             if *enable {
@@ -327,8 +380,102 @@ fn handle_backend_command(
 
 fn runtime_from<'a>(config: &'a Config, cli: &Cli) -> RuntimeSettings<'a> {
     RuntimeSettings {
-        assume_yes: cli.assume_yes || config.assume_yes,
+        assume_yes: cli.assume_yes.unwrap_or(config.assume_yes),
+        auto_elevate: cli.auto_elevate.unwrap_or(config.auto_elevate),
         config,
+    }
+}
+
+fn maybe_relaunch_self_elevated(cli: &Cli, config: &Config) -> Result<Option<ExitCode>, String> {
+    if !cfg!(windows) || cli.dry_run {
+        return Ok(None);
+    }
+
+    if cli.json
+        && !matches!(
+            cli.command,
+            Subcommand::Backends | Subcommand::Backend { action: _ }
+        )
+        && !command_supports_json(&cli.command)
+    {
+        return Ok(None);
+    }
+
+    let runtime = runtime_from(config, cli);
+    if !runtime.auto_elevate || is_process_elevated() {
+        return Ok(None);
+    }
+
+    let selected_backend = cli.backend.or(config.backend);
+    if !command_requires_process_elevation(&cli.command, selected_backend, &runtime)? {
+        return Ok(None);
+    }
+
+    println!("requesting administrator privileges...");
+    let capture = run_current_process_elevated()?;
+    emit_successful_command_output(&capture.stdout, &capture.stderr);
+    Ok(Some(ExitCode::from(capture.status_code as u8)))
+}
+
+fn command_requires_process_elevation(
+    command: &Subcommand,
+    selected_backend: Option<Backend>,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<bool, String> {
+    match command {
+        Subcommand::Update => {
+            let backends = resolve_auto_backends(selected_backend, runtime.config)?;
+            Ok(backends_require_elevation(&backends, runtime))
+        }
+        Subcommand::Upgrade { packages } if packages.is_empty() => Ok(false),
+        Subcommand::Install {
+            mode: InstallMode::Search(_),
+        } => Ok(false),
+        Subcommand::Install {
+            mode: InstallMode::Exact(_),
+        }
+        | Subcommand::Remove {
+            mode: RemoveMode::Search(_),
+        } => Ok(false),
+        Subcommand::Remove {
+            mode: RemoveMode::Exact(_),
+        }
+        | Subcommand::Upgrade { .. }
+        | Subcommand::Hold { .. } => {
+            let backend = resolve_single_backend(selected_backend, runtime.config)?;
+            Ok(backend.requires_elevation_for_mutation(runtime))
+        }
+        Subcommand::Backend {
+            action: BackendAction::Install { backend, .. },
+        } => Ok(backend
+            .install_invocation(runtime.assume_yes)
+            .map(|invocation| invocation.requires_elevation)
+            .unwrap_or(false)),
+        _ => Ok(false),
+    }
+}
+
+fn backends_require_elevation(backends: &[Backend], runtime: &RuntimeSettings<'_>) -> bool {
+    backends
+        .iter()
+        .copied()
+        .any(|backend| backend.requires_elevation_for_mutation(runtime))
+}
+
+fn resolve_single_backend(
+    selected_backend: Option<Backend>,
+    config: &Config,
+) -> Result<Backend, String> {
+    match selected_backend {
+        Some(backend) => {
+            if !config.is_backend_enabled(backend) {
+                return Err(format!(
+                    "backend {backend} is disabled in config. Use `backend enable {backend}` first."
+                ));
+            }
+            Ok(backend)
+        }
+        None => Backend::detect(config),
     }
 }
 
@@ -361,8 +508,20 @@ fn enabled_available_backends(config: &Config) -> Vec<Backend> {
         .collect()
 }
 
-fn execute_invocations(invocations: Vec<Invocation>, dry_run: bool) -> Result<ExitCode, String> {
-    for invocation in invocations {
+fn execute_invocations(
+    invocations: Vec<Invocation>,
+    dry_run: bool,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<ExitCode, String> {
+    let process_is_elevated = runtime.auto_elevate && is_process_elevated();
+    let should_batch_elevate = cfg!(windows)
+        && runtime.auto_elevate
+        && !process_is_elevated
+        && invocations
+            .iter()
+            .any(|invocation| invocation.requires_elevation && !invocation.program.is_empty());
+
+    for invocation in &invocations {
         if let Some(message) = invocation.message.as_deref() {
             println!("{message}");
         }
@@ -371,26 +530,42 @@ fn execute_invocations(invocations: Vec<Invocation>, dry_run: bool) -> Result<Ex
             continue;
         }
 
-        println!("> {}", invocation.render_for_display());
-
         if dry_run {
+            println!("> {}", invocation.render_for_display());
+            continue;
+        }
+    }
+
+    if dry_run {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if should_batch_elevate {
+        run_elevated_invocations(&invocations)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for invocation in invocations {
+        if invocation.program.is_empty() {
             continue;
         }
 
         let display_command = invocation.render_for_display();
-        let status = Command::new(&invocation.program)
-            .args(&invocation.args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|error| format!("failed to launch {}: {error}", invocation.program))?;
+        let progress_label = invocation_progress_label(&invocation);
+        let capture = if cfg!(windows)
+            && runtime.auto_elevate
+            && invocation.requires_elevation
+            && !process_is_elevated
+        {
+            println!("requesting administrator privileges...");
+            run_elevated_invocation(&invocation, &progress_label)?
+        } else {
+            run_logged_command_capture_with_label(&invocation, &progress_label, true)?
+        };
 
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(format!(
-                "backend command failed with exit code {code}: {display_command}"
-            ));
+        if !capture.success {
+            emit_command_logs(&display_command, &capture.stdout, &capture.stderr);
+            return Err(render_command_failure(&invocation, &capture));
         }
     }
 
@@ -416,7 +591,7 @@ fn run_interactive_install(
         );
     }
 
-    let selected_indices = prompt_for_selection(candidates.len())?;
+    let selected_indices = prompt_for_selection("install", candidates.len())?;
     if selected_indices.is_empty() {
         println!("No selection made. Nothing to install.");
         return Ok(ExitCode::SUCCESS);
@@ -435,29 +610,116 @@ fn run_interactive_install(
         }
     }
 
-    execute_invocations(invocations, dry_run)
+    execute_invocations(invocations, dry_run, runtime)
 }
 
-fn run_pip_upgrade_all(runtime: &RuntimeSettings<'_>, dry_run: bool) -> Result<ExitCode, String> {
-    let capture_invocation = Backend::Pip.pip_outdated_invocation();
-    println!("Resolving outdated pip packages...");
-    println!("> {}", capture_invocation.render_for_display());
-
-    if dry_run {
-        println!(
-            "dry-run: would query outdated pip packages first, then print install --upgrade commands."
-        );
-    }
-
-    let output = run_capture(&capture_invocation)?;
-    let packages = parse_pip_outdated_json_names(&output);
-    if packages.is_empty() {
-        println!("No outdated pip packages found.");
+fn run_interactive_remove(
+    backends: Vec<Backend>,
+    query: &str,
+    runtime: &RuntimeSettings<'_>,
+    dry_run: bool,
+) -> Result<ExitCode, String> {
+    let candidates = collect_installed_candidates(&backends, query, runtime)?;
+    if candidates.is_empty() {
+        println!("No matching installed packages found.");
         return Ok(ExitCode::SUCCESS);
     }
 
-    let invocations = Backend::Pip.plan_install_or_upgrade(&packages, runtime, true);
-    execute_invocations(invocations, dry_run)
+    print_candidates(&candidates);
+    if dry_run {
+        println!(
+            "dry-run: installed-package search executed, but uninstall commands will only be printed after selection."
+        );
+    }
+
+    let selected_indices = prompt_for_selection("remove", candidates.len())?;
+    if selected_indices.is_empty() {
+        println!("No selection made. Nothing to remove.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut invocations = Vec::new();
+    for backend in backends {
+        let packages: Vec<RemoveTarget> = selected_indices
+            .iter()
+            .map(|index| &candidates[*index - 1])
+            .filter(|candidate| candidate.backend == backend)
+            .map(remove_target_from_candidate)
+            .collect();
+        if !packages.is_empty() {
+            invocations.extend(backend.plan_remove(&packages, runtime));
+        }
+    }
+
+    execute_invocations(invocations, dry_run, runtime)
+}
+
+fn run_interactive_upgrade(
+    backends: Vec<Backend>,
+    runtime: &RuntimeSettings<'_>,
+    dry_run: bool,
+) -> Result<ExitCode, String> {
+    let candidates = collect_upgradable_candidates(&backends, runtime)?;
+    if candidates.is_empty() {
+        println!("No upgradable packages found.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    print_candidates(&candidates);
+    if dry_run {
+        println!(
+            "dry-run: upgradable-package scan executed, but upgrade commands will only be printed after selection."
+        );
+    }
+
+    let selected_indices = prompt_for_selection("upgrade", candidates.len())?;
+    if selected_indices.is_empty() {
+        println!("No selection made. Nothing to upgrade.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut invocations = Vec::new();
+    for backend in backends {
+        let packages: Vec<String> = selected_indices
+            .iter()
+            .map(|index| &candidates[*index - 1])
+            .filter(|candidate| candidate.backend == backend)
+            .map(|candidate| candidate.install_id.clone())
+            .collect();
+        if !packages.is_empty() {
+            invocations.extend(backend.plan_upgrade(&packages, runtime));
+        }
+    }
+
+    execute_invocations(invocations, dry_run, runtime)
+}
+
+fn run_update_all(
+    backends: Vec<Backend>,
+    dry_run: bool,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<ExitCode, String> {
+    let total = backends.len();
+    let mut failures = Vec::new();
+
+    for backend in backends {
+        if !dry_run {
+            println!("{}", update_backend_summary(backend));
+        }
+        if let Err(error) = execute_invocations(backend.plan_update(runtime), dry_run, runtime) {
+            eprintln!("warning: failed to update {backend}: {error}");
+            failures.push(format!("{backend}: {error}"));
+        }
+    }
+
+    if failures.is_empty() || failures.len() < total {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(format!(
+            "failed to update any backend: {}",
+            failures.join("; ")
+        ))
+    }
 }
 
 fn run_search(
@@ -496,13 +758,25 @@ fn run_list(
             .next()
             .expect("list should always produce one invocation");
         println!("Listing {noun} from {backend}");
-        println!("> {}", invocation.render_for_display());
 
         if dry_run {
+            println!("> {}", invocation.render_for_display());
             continue;
         }
 
-        let capture = run_capture_detailed(&invocation)?;
+        let capture = match run_capture_detailed_with_label(
+            &invocation,
+            &format!("Listing {noun} from {backend}"),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                if single_backend {
+                    return Err(error);
+                }
+                eprintln!("warning: failed to list {noun} from {backend}: {error}");
+                continue;
+            }
+        };
         if !backend.accepts_list_capture(upgradable, &capture) {
             if single_backend {
                 return Err(render_command_failure(&invocation, &capture));
@@ -569,7 +843,6 @@ fn run_show(
             .expect("show should always produce one invocation");
         if !json {
             println!("Showing package details from {backend}: {package}");
-            println!("> {}", invocation.render_for_display());
         }
 
         if dry_run {
@@ -587,7 +860,29 @@ fn run_show(
             continue;
         }
 
-        let capture = run_capture_detailed(&invocation)?;
+        let capture = match run_capture_detailed_with_label(
+            &invocation,
+            &format!("Showing {package} from {backend}"),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                if json {
+                    json_results.push(ShowBackendResult {
+                        backend,
+                        command: invocation.render_for_display(),
+                        success: false,
+                        dry_run: false,
+                        details: None,
+                        raw_output: None,
+                        error: Some(error.clone()),
+                    });
+                }
+                if single_backend && !json {
+                    return Err(error);
+                }
+                continue;
+            }
+        };
         if !capture.success {
             let error = render_command_failure(&invocation, &capture);
             if json {
@@ -684,9 +979,20 @@ fn collect_search_candidates(
         } else {
             println!("Searching candidates for: {query}");
         }
-        println!("> {}", search_invocation.render_for_display());
 
-        let search_output = run_capture(&search_invocation)?;
+        let search_output = match run_capture_with_label(
+            &search_invocation,
+            &format!("Searching {backend} for {query}"),
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                if aggregate {
+                    eprintln!("warning: failed to search {backend}: {error}");
+                    continue;
+                }
+                return Err(error);
+            }
+        };
         candidates.extend(backend.parse_search_candidates(&search_output));
     }
 
@@ -696,8 +1002,101 @@ fn collect_search_candidates(
     Ok(candidates)
 }
 
-fn run_capture(invocation: &Invocation) -> Result<String, String> {
-    let capture = run_capture_detailed(invocation)?;
+fn collect_installed_candidates(
+    backends: &[Backend],
+    query: &str,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<Vec<SearchCandidate>, String> {
+    let mut candidates = Vec::new();
+    let aggregate = backends.len() > 1;
+    let normalized_query = normalize_search_text(query);
+
+    for backend in backends {
+        let invocation = backend
+            .plan_list(false, runtime)
+            .into_iter()
+            .next()
+            .expect("installed package listing should always produce one invocation");
+        if aggregate {
+            println!("Searching installed packages in {backend} for: {query}");
+        } else {
+            println!("Searching installed packages for: {query}");
+        }
+
+        let capture = match run_capture_detailed_with_label(
+            &invocation,
+            &format!("Searching installed packages in {backend} for {query}"),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                if aggregate {
+                    eprintln!(
+                        "warning: failed to inspect installed packages in {backend}: {error}"
+                    );
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        if !backend.accepts_list_capture(false, &capture) {
+            let error = render_command_failure(&invocation, &capture);
+            if aggregate {
+                eprintln!("warning: failed to inspect installed packages in {backend}: {error}");
+                continue;
+            }
+            return Err(error);
+        }
+
+        let Some(rows) = backend.parse_list_entries(false, &capture.stdout) else {
+            let error = format!(
+                "installed package output from {backend} could not be parsed for selection"
+            );
+            if aggregate {
+                eprintln!("warning: {error}");
+                continue;
+            }
+            return Err(error);
+        };
+
+        candidates.extend(rows.into_iter().filter_map(|row| {
+            package_list_entry_matches_query(&row, &normalized_query)
+                .then(|| package_list_entry_candidate(row))
+        }));
+    }
+
+    let candidates = dedupe_installed_candidates(candidates);
+    let candidates = sort_search_candidates(candidates, query, backends);
+    Ok(candidates)
+}
+
+fn collect_upgradable_candidates(
+    backends: &[Backend],
+    runtime: &RuntimeSettings<'_>,
+) -> Result<Vec<SearchCandidate>, String> {
+    let mut candidates = Vec::new();
+    let aggregate = backends.len() > 1;
+
+    for backend in backends {
+        let rows = match collect_upgradable_rows(*backend, runtime) {
+            Ok(rows) => rows,
+            Err(error) => {
+                if aggregate {
+                    eprintln!("warning: failed to inspect pending upgrades for {backend}: {error}");
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+
+        candidates.extend(rows.into_iter().map(package_upgrade_candidate));
+    }
+
+    let candidates = dedupe_installed_candidates(candidates);
+    Ok(sort_search_candidates(candidates, "", backends))
+}
+
+fn run_capture_with_label(invocation: &Invocation, label: &str) -> Result<String, String> {
+    let capture = run_capture_detailed_with_label(invocation, label)?;
     if !capture.success {
         return Err(render_command_failure(invocation, &capture));
     }
@@ -705,21 +1104,11 @@ fn run_capture(invocation: &Invocation) -> Result<String, String> {
     Ok(capture.stdout)
 }
 
-fn run_capture_detailed(invocation: &Invocation) -> Result<CommandCapture, String> {
-    let output = Command::new(&invocation.program)
-        .args(&invocation.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("failed to launch {}: {error}", invocation.program))?;
-
-    Ok(CommandCapture {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        success: output.status.success(),
-        status_code: output.status.code().unwrap_or(1),
-    })
+fn run_capture_detailed_with_label(
+    invocation: &Invocation,
+    label: &str,
+) -> Result<CommandCapture, String> {
+    run_logged_command_capture_with_label(invocation, label, false)
 }
 
 fn render_command_failure(invocation: &Invocation, capture: &CommandCapture) -> String {
@@ -745,6 +1134,252 @@ fn render_backend_output_section(backend: Backend, output: &str) -> Option<Strin
         None
     } else {
         Some(format!("== {backend} ==\n{trimmed}"))
+    }
+}
+
+fn run_logged_command_capture_with_label(
+    invocation: &Invocation,
+    label: &str,
+    inherit_stdin: bool,
+) -> Result<CommandCapture, String> {
+    let capture = CommandLogCapture::new()?;
+    let stdout_file = fs::File::create(&capture.stdout_path)
+        .map_err(|error| format!("failed to open stdout capture file: {error}"))?;
+    let stderr_file = fs::File::create(&capture.stderr_path)
+        .map_err(|error| format!("failed to open stderr capture file: {error}"))?;
+    let progress_label = compact_progress_label(label);
+
+    let mut child = Command::new(&invocation.program)
+        .args(&invocation.args)
+        .stdin(if inherit_stdin {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|error| format!("failed to launch {}: {error}", invocation.program))?;
+
+    let mut reporter = ProgressReporter::new();
+    loop {
+        reporter.tick(&progress_label)?;
+        if child
+            .try_wait()
+            .map_err(|error| format!("failed to monitor {}: {error}", invocation.program))?
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed to collect {} result: {error}", invocation.program))?;
+    reporter.finish(status.success(), &progress_label)?;
+
+    let stdout = read_capture_log(&capture.stdout_path);
+    let stderr = read_capture_log(&capture.stderr_path);
+    capture.cleanup();
+
+    Ok(CommandCapture {
+        stdout,
+        stderr,
+        success: status.success(),
+        status_code: status.code().unwrap_or(1),
+    })
+}
+
+fn emit_command_logs(command: &str, stdout: &str, stderr: &str) {
+    let stdout = stdout.trim_end();
+    let stderr = stderr.trim_end();
+
+    if stdout.is_empty() && stderr.is_empty() {
+        return;
+    }
+
+    eprintln!("--- logs for `{command}` ---");
+    if !stdout.is_empty() {
+        eprintln!("[stdout]");
+        eprintln!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprintln!("[stderr]");
+        eprintln!("{stderr}");
+    }
+}
+
+fn emit_successful_command_output(stdout: &str, stderr: &str) {
+    let stdout = stdout.trim_end();
+    let stderr = stderr.trim_end();
+
+    if !stdout.is_empty() {
+        println!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprintln!("{stderr}");
+    }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_secs() >= 60 {
+        let minutes = elapsed.as_secs() / 60;
+        let seconds = elapsed.as_secs() % 60;
+        format!("{minutes}m{seconds:02}s")
+    } else if elapsed.as_secs() >= 1 {
+        format!(
+            "{}.{:01}s",
+            elapsed.as_secs(),
+            elapsed.subsec_millis() / 100
+        )
+    } else {
+        format!("{}ms", elapsed.as_millis())
+    }
+}
+
+fn collect_upgradable_rows(
+    backend: Backend,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<Vec<PackageListEntry>, String> {
+    let invocation = backend
+        .plan_list(true, runtime)
+        .into_iter()
+        .next()
+        .expect("upgradable list should always produce one invocation");
+    let capture =
+        run_capture_detailed_with_label(&invocation, &format!("Checking updates for {backend}"))?;
+    if !backend.accepts_list_capture(true, &capture) {
+        return Err(render_command_failure(&invocation, &capture));
+    }
+
+    Ok(backend
+        .parse_list_entries(true, &capture.stdout)
+        .unwrap_or_default())
+}
+
+fn package_upgrade_candidate(entry: PackageListEntry) -> SearchCandidate {
+    SearchCandidate {
+        backend: entry.backend,
+        label: entry.name,
+        install_id: entry.package_id,
+        version: Some(match entry.available_version {
+            Some(latest) => format!("{} -> {}", entry.current_version, latest),
+            None => entry.current_version,
+        }),
+        source: None,
+    }
+}
+
+fn update_backend_summary(backend: Backend) -> String {
+    match backend {
+        Backend::Winget => "winget: refreshing sources".to_string(),
+        Backend::Scoop => "scoop: refreshing buckets".to_string(),
+        Backend::Chocolatey => "choco: no dedicated refresh step".to_string(),
+        Backend::Npm => "npm: no dedicated refresh step".to_string(),
+        Backend::Pip => "pip: no dedicated refresh step".to_string(),
+    }
+}
+
+fn compact_progress_label(label: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut compact = label.replace('\n', " ");
+    compact = compact.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = compact.chars().count();
+    if count <= MAX_CHARS {
+        compact
+    } else {
+        let shortened = compact.chars().take(MAX_CHARS - 1).collect::<String>();
+        format!("{shortened}…")
+    }
+}
+
+fn invocation_progress_label(invocation: &Invocation) -> String {
+    let backend = invocation_backend_name(invocation);
+    let args = invocation.args.as_slice();
+
+    if matches!(args, [action] if action == "update") && backend == "scoop" {
+        return "Updating scoop buckets".to_string();
+    }
+    if matches!(args, [action, target] if action == "update" && target == "*") {
+        return format!("Upgrading {backend} packages");
+    }
+    if matches!(args, [action, target] if action == "update" && target == "--global") {
+        return "Upgrading npm global packages".to_string();
+    }
+    if args.len() >= 2 && args[0] == "source" && args[1] == "update" {
+        return format!("Updating {backend} sources");
+    }
+    if args.len() >= 2 && args[0] == "upgrade" && args[1] == "--all" {
+        return format!("Upgrading {backend} packages");
+    }
+    if args.first().map(String::as_str) == Some("upgrade") {
+        return format!("Upgrading {backend} package");
+    }
+    if args.first().map(String::as_str) == Some("install") {
+        return format!("Installing {backend} package");
+    }
+    if args.first().map(String::as_str) == Some("uninstall") {
+        return format!("Removing {backend} package");
+    }
+    if args.first().map(String::as_str) == Some("search") && args.len() >= 2 {
+        return format!("Searching {backend} for {}", args[1]);
+    }
+    if args.len() >= 3 && args[0] == "-m" && args[1] == "pip" && args[2] == "list" {
+        if args.iter().any(|arg| arg == "--outdated") {
+            return "Checking pip updates".to_string();
+        }
+        return "Listing pip packages".to_string();
+    }
+    if args.len() >= 3 && args[0] == "-m" && args[1] == "pip" && args[2] == "install" {
+        if args.iter().any(|arg| arg == "--upgrade") {
+            return "Upgrading pip packages".to_string();
+        }
+        return "Installing pip packages".to_string();
+    }
+    if args.len() >= 3 && args[0] == "-m" && args[1] == "pip" && args[2] == "show" {
+        return "Showing pip package details".to_string();
+    }
+    if args.len() >= 3
+        && args[0] == "-c"
+        && let Some(query) = args.last()
+    {
+        return format!("Searching pip for {query}");
+    }
+    if args.first().map(String::as_str) == Some("status") {
+        return format!("Checking {backend} updates");
+    }
+    if args.first().map(String::as_str) == Some("list") {
+        return format!("Listing {backend} packages");
+    }
+    if args.first().map(String::as_str) == Some("show")
+        || args.first().map(String::as_str) == Some("info")
+        || args.first().map(String::as_str) == Some("view")
+    {
+        return format!("Showing {backend} package details");
+    }
+
+    format!("Running {backend}")
+}
+
+fn invocation_backend_name(invocation: &Invocation) -> &'static str {
+    let program = invocation.program.replace('\\', "/").to_ascii_lowercase();
+    if invocation.args.len() >= 2 && invocation.args[0] == "-m" && invocation.args[1] == "pip" {
+        return "pip";
+    }
+    if program.contains("winget") {
+        "winget"
+    } else if program.contains("scoop") {
+        "scoop"
+    } else if program.contains("choco") {
+        "choco"
+    } else if program.contains("npm") {
+        "npm"
+    } else if program.contains("python") || program.ends_with("/py.exe") || program.ends_with("/py")
+    {
+        "pip"
+    } else {
+        "command"
     }
 }
 
@@ -831,6 +1466,58 @@ fn sort_list_rows(mut rows: Vec<PackageListEntry>) -> Vec<PackageListEntry> {
             ))
     });
     rows
+}
+
+fn package_list_entry_matches_query(entry: &PackageListEntry, query: &str) -> bool {
+    let query_terms: Vec<&str> = query.split_whitespace().collect();
+    if query_terms.is_empty() {
+        return true;
+    }
+
+    let available_version = entry.available_version.as_deref().unwrap_or("");
+    let fields = [
+        normalize_search_text(&entry.name),
+        normalize_search_text(&entry.package_id),
+        normalize_search_text(&entry.backend.to_string()),
+        normalize_search_text(&entry.current_version),
+        normalize_search_text(available_version),
+        normalize_search_text(&format!(
+            "{} {} {} {} {}",
+            entry.name, entry.package_id, entry.backend, entry.current_version, available_version
+        )),
+    ];
+    let compact_fields = fields
+        .iter()
+        .map(|field| compact_search_text(field))
+        .collect::<Vec<_>>();
+
+    query_terms.iter().all(|term| {
+        let compact_term = compact_search_text(term);
+        fields
+            .iter()
+            .zip(compact_fields.iter())
+            .any(|(field, compact_field)| {
+                field.contains(term)
+                    || (!compact_term.is_empty() && compact_field.contains(&compact_term))
+            })
+    })
+}
+
+fn package_list_entry_candidate(entry: PackageListEntry) -> SearchCandidate {
+    SearchCandidate {
+        backend: entry.backend,
+        label: entry.name,
+        install_id: entry.package_id,
+        version: Some(entry.current_version),
+        source: None,
+    }
+}
+
+fn remove_target_from_candidate(candidate: &SearchCandidate) -> RemoveTarget {
+    RemoveTarget {
+        package: candidate.install_id.clone(),
+        version: candidate.version.clone(),
+    }
 }
 
 fn print_package_details_sections(details: &[PackageDetails]) {
@@ -1000,8 +1687,8 @@ fn print_candidates(candidates: &[SearchCandidate]) {
     println!();
 }
 
-fn prompt_for_selection(max: usize) -> Result<Vec<usize>, String> {
-    print!("Select packages to install (e.g. 1 2 5, 1,3-4; empty to cancel): ");
+fn prompt_for_selection(action: &str, max: usize) -> Result<Vec<usize>, String> {
+    print!("Select packages to {action} (e.g. 1 2 5, 1,3-4; empty to cancel): ");
     io::stdout()
         .flush()
         .map_err(|error| format!("failed to flush stdout: {error}"))?;
@@ -1063,7 +1750,8 @@ struct Cli {
     config_path: Option<PathBuf>,
     dry_run: bool,
     json: bool,
-    assume_yes: bool,
+    assume_yes: Option<bool>,
+    auto_elevate: Option<bool>,
     show_help: bool,
     show_version: bool,
     command: Subcommand,
@@ -1076,7 +1764,8 @@ impl Cli {
         let mut config_path = None;
         let mut dry_run = false;
         let mut json = false;
-        let mut assume_yes = false;
+        let mut assume_yes = None;
+        let mut auto_elevate = None;
         let mut show_help = false;
         let mut show_version = false;
 
@@ -1106,7 +1795,19 @@ impl Cli {
                 }
                 "-y" | "--yes" => {
                     parser.next();
-                    assume_yes = true;
+                    assume_yes = Some(true);
+                }
+                "--interactive" => {
+                    parser.next();
+                    assume_yes = Some(false);
+                }
+                "--elevate" => {
+                    parser.next();
+                    auto_elevate = Some(true);
+                }
+                "--no-elevate" => {
+                    parser.next();
+                    auto_elevate = Some(false);
                 }
                 "-h" | "--help" => {
                     parser.next();
@@ -1149,6 +1850,7 @@ impl Cli {
             dry_run,
             json,
             assume_yes,
+            auto_elevate,
             show_help,
             show_version,
             command,
@@ -1161,7 +1863,7 @@ enum Subcommand {
     Update,
     Upgrade { packages: Vec<String> },
     Install { mode: InstallMode },
-    Remove { packages: Vec<String> },
+    Remove { mode: RemoveMode },
     Hold { packages: Vec<String>, enable: bool },
     Search { query: String },
     List { upgradable: bool },
@@ -1173,8 +1875,14 @@ enum Subcommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstallMode {
-    Packages(Vec<String>),
-    Pick(String),
+    Search(String),
+    Exact(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoveMode {
+    Search(String),
+    Exact(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1216,12 +1924,33 @@ impl Subcommand {
                 })
             }
             "install" => {
-                let mut pick = false;
+                enum ParsedInstallMode {
+                    Search,
+                    Exact,
+                }
+
+                let mut mode = None;
                 while let Some(arg) = parser.peek() {
                     match arg {
                         "--pick" | "--select" | "--interactive" => {
                             parser.next();
-                            pick = true;
+                            if matches!(mode, Some(ParsedInstallMode::Exact)) {
+                                return Err(
+                                    "install cannot combine search-selection flags with --exact"
+                                        .to_string(),
+                                );
+                            }
+                            mode = Some(ParsedInstallMode::Search);
+                        }
+                        "--exact" | "--direct" => {
+                            parser.next();
+                            if matches!(mode, Some(ParsedInstallMode::Search)) {
+                                return Err(
+                                    "install cannot combine --exact with search-selection flags"
+                                        .to_string(),
+                                );
+                            }
+                            mode = Some(ParsedInstallMode::Exact);
                         }
                         value if value.starts_with('-') => {
                             return Err(format!("unknown option for install: {value}"));
@@ -1230,17 +1959,64 @@ impl Subcommand {
                     }
                 }
 
-                let mode = if pick {
-                    InstallMode::Pick(parser.take_required_text("install --pick")?)
-                } else {
-                    InstallMode::Packages(parser.take_required_packages("install")?)
+                let mode = match mode.unwrap_or(ParsedInstallMode::Search) {
+                    ParsedInstallMode::Search => {
+                        InstallMode::Search(parser.take_required_text("install")?)
+                    }
+                    ParsedInstallMode::Exact => {
+                        InstallMode::Exact(parser.take_required_packages("install --exact")?)
+                    }
                 };
 
                 Ok(Self::Install { mode })
             }
-            "remove" => Ok(Self::Remove {
-                packages: parser.take_required_packages("remove")?,
-            }),
+            "remove" => {
+                enum ParsedRemoveMode {
+                    Search,
+                    Exact,
+                }
+
+                let mut mode = None;
+                while let Some(arg) = parser.peek() {
+                    match arg {
+                        "--pick" | "--select" | "--interactive" => {
+                            parser.next();
+                            if matches!(mode, Some(ParsedRemoveMode::Exact)) {
+                                return Err(
+                                    "remove cannot combine search-selection flags with --exact"
+                                        .to_string(),
+                                );
+                            }
+                            mode = Some(ParsedRemoveMode::Search);
+                        }
+                        "--exact" | "--direct" => {
+                            parser.next();
+                            if matches!(mode, Some(ParsedRemoveMode::Search)) {
+                                return Err(
+                                    "remove cannot combine --exact with search-selection flags"
+                                        .to_string(),
+                                );
+                            }
+                            mode = Some(ParsedRemoveMode::Exact);
+                        }
+                        value if value.starts_with('-') => {
+                            return Err(format!("unknown option for remove: {value}"));
+                        }
+                        _ => break,
+                    }
+                }
+
+                let mode = match mode.unwrap_or(ParsedRemoveMode::Search) {
+                    ParsedRemoveMode::Search => {
+                        RemoveMode::Search(parser.take_required_text("remove")?)
+                    }
+                    ParsedRemoveMode::Exact => {
+                        RemoveMode::Exact(parser.take_required_packages("remove --exact")?)
+                    }
+                };
+
+                Ok(Self::Remove { mode })
+            }
             "hold" => {
                 let mut enable = true;
                 let mut packages = Vec::new();
@@ -1470,6 +2246,20 @@ impl Backend {
         }
     }
 
+    fn command_override_env(self) -> &'static str {
+        match self {
+            Self::Winget => "WAW_WINGET_CMD",
+            Self::Scoop => "WAW_SCOOP_CMD",
+            Self::Chocolatey => "WAW_CHOCO_CMD",
+            Self::Npm => "WAW_NPM_CMD",
+            Self::Pip => "WAW_PYTHON_CMD",
+        }
+    }
+
+    fn command_override(self) -> Option<String> {
+        env_override(self.command_override_env())
+    }
+
     fn detect(config: &Config) -> Result<Self, String> {
         let candidates = [
             Self::Winget,
@@ -1487,39 +2277,23 @@ impl Backend {
     }
 
     fn is_available(self) -> bool {
-        let candidates = self.command_candidates();
-        candidates.into_iter().any(|(program, args)| {
-            Command::new(&program)
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-        })
+        self.command_candidates()
+            .into_iter()
+            .any(|(program, args)| command_works_or_is_discoverable(&program, &args))
     }
 
     fn command_candidates(self) -> Vec<(String, Vec<String>)> {
         match self {
-            Self::Winget => vec![("winget".to_string(), vec!["--version".to_string()])],
-            Self::Scoop => vec![("scoop".to_string(), vec!["--version".to_string()])],
-            Self::Chocolatey => vec![("choco".to_string(), vec!["-v".to_string()])],
-            Self::Npm => vec![(
-                if cfg!(windows) { "npm.cmd" } else { "npm" }.to_string(),
-                vec!["--version".to_string()],
-            )],
-            Self::Pip => vec![
-                (
-                    "python".to_string(),
-                    vec!["-m".to_string(), "pip".to_string(), "--version".to_string()],
-                ),
-                (
-                    "python3".to_string(),
-                    vec!["-m".to_string(), "pip".to_string(), "--version".to_string()],
-                ),
-                ("pip".to_string(), vec!["--version".to_string()]),
-            ],
+            Self::Winget | Self::Scoop | Self::Chocolatey | Self::Npm => self
+                .discovered_program_candidates()
+                .into_iter()
+                .map(|program| (program, self.version_probe_args()))
+                .collect(),
+            Self::Pip => self
+                .discovered_pip_candidates()
+                .into_iter()
+                .map(|program| (program.clone(), pip_probe_args(&program)))
+                .collect(),
         }
     }
 
@@ -1527,6 +2301,14 @@ impl Backend {
         match self {
             Self::Winget | Self::Scoop | Self::Chocolatey => cfg!(windows),
             Self::Npm | Self::Pip => true,
+        }
+    }
+
+    fn supports_bootstrap_install_on_host(self) -> bool {
+        match self {
+            Self::Scoop | Self::Chocolatey => cfg!(windows),
+            Self::Npm | Self::Pip => cfg!(windows),
+            Self::Winget => false,
         }
     }
 
@@ -1546,7 +2328,11 @@ impl Backend {
         }
     }
 
-    fn install_invocation(self) -> Option<Invocation> {
+    fn install_invocation(self, assume_yes: bool) -> Option<Invocation> {
+        if !self.supports_bootstrap_install_on_host() {
+            return None;
+        }
+
         match self {
             Self::Winget => None,
             Self::Scoop => Some(Invocation::owned(
@@ -1558,7 +2344,8 @@ impl Backend {
                     "-Command".to_string(),
                     "iwr -useb get.scoop.sh | iex".to_string(),
                 ],
-            )),
+            )
+            .with_elevation(cfg!(windows))),
             Self::Chocolatey => Some(Invocation::owned(
                 "powershell",
                 vec![
@@ -1568,52 +2355,69 @@ impl Backend {
                     "-Command".to_string(),
                     "Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))".to_string(),
                 ],
-            )),
-            Self::Npm => Some(Invocation::owned(
-                "winget",
-                vec![
+            )
+            .with_elevation(cfg!(windows))),
+            Self::Npm => {
+                let mut args = vec![
                     "install".to_string(),
                     "--id".to_string(),
                     "OpenJS.NodeJS.LTS".to_string(),
                     "--exact".to_string(),
-                ],
-            )),
-            Self::Pip => Some(Invocation::owned(
-                "winget",
-                vec![
+                    "--accept-source-agreements".to_string(),
+                    "--accept-package-agreements".to_string(),
+                ];
+                if assume_yes {
+                    args.push("--silent".to_string());
+                    args.push("--disable-interactivity".to_string());
+                }
+                Some(Backend::Winget.base_invocation(args).with_elevation(cfg!(windows)))
+            }
+            Self::Pip => {
+                let mut args = vec![
                     "install".to_string(),
                     "--id".to_string(),
                     "Python.Python.3.12".to_string(),
                     "--exact".to_string(),
-                ],
-            )),
+                    "--accept-source-agreements".to_string(),
+                    "--accept-package-agreements".to_string(),
+                ];
+                if assume_yes {
+                    args.push("--silent".to_string());
+                    args.push("--disable-interactivity".to_string());
+                }
+                Some(Backend::Winget.base_invocation(args).with_elevation(cfg!(windows)))
+            }
         }
     }
 
     fn base_invocation(self, args: Vec<String>) -> Invocation {
         match self {
-            Self::Winget => Invocation::owned("winget", args),
-            Self::Scoop => Invocation::owned("scoop", args),
-            Self::Chocolatey => Invocation::owned("choco", args),
-            Self::Npm => Invocation::owned(if cfg!(windows) { "npm.cmd" } else { "npm" }, args),
+            Self::Winget | Self::Scoop | Self::Chocolatey | Self::Npm => {
+                let program = self.preferred_program();
+                Invocation::owned(&program, args)
+            }
             Self::Pip => {
-                let program = if command_works(
-                    "python",
-                    &["-m".to_string(), "pip".to_string(), "--version".to_string()],
-                ) {
-                    "python"
-                } else if command_works(
-                    "python3",
-                    &["-m".to_string(), "pip".to_string(), "--version".to_string()],
-                ) {
-                    "python3"
-                } else {
-                    "python"
-                };
+                let program = self.pip_python_program();
                 let mut pip_args = vec!["-m".to_string(), "pip".to_string()];
                 pip_args.extend(args);
-                Invocation::owned(program, pip_args)
+                Invocation::owned(&program, pip_args)
             }
+        }
+    }
+
+    fn mutating_invocation(self, args: Vec<String>, runtime: &RuntimeSettings<'_>) -> Invocation {
+        self.base_invocation(args)
+            .with_elevation(self.requires_elevation_for_mutation(runtime))
+    }
+
+    fn requires_elevation_for_mutation(self, runtime: &RuntimeSettings<'_>) -> bool {
+        if !cfg!(windows) {
+            return false;
+        }
+
+        match self {
+            Self::Winget | Self::Scoop | Self::Chocolatey | Self::Npm => true,
+            Self::Pip => !runtime.config.pip_user,
         }
     }
 
@@ -1626,13 +2430,25 @@ impl Backend {
             Subcommand::Update => Ok(self.plan_update(runtime)),
             Subcommand::Upgrade { packages } => Ok(self.plan_upgrade(packages, runtime)),
             Subcommand::Install {
-                mode: InstallMode::Packages(packages),
+                mode: InstallMode::Exact(packages),
             } => Ok(self.plan_install(packages, runtime)),
             Subcommand::Install {
-                mode: InstallMode::Pick(_),
+                mode: InstallMode::Search(_),
             } => Ok(Vec::new()),
-            Subcommand::Remove { packages } => Ok(self.plan_remove(packages, runtime)),
-            Subcommand::Hold { packages, enable } => Ok(self.plan_hold(packages, *enable)),
+            Subcommand::Remove {
+                mode: RemoveMode::Search(_),
+            } => Ok(Vec::new()),
+            Subcommand::Remove {
+                mode: RemoveMode::Exact(packages),
+            } => Ok(self.plan_remove(
+                &packages
+                    .iter()
+                    .cloned()
+                    .map(RemoveTarget::unversioned)
+                    .collect::<Vec<_>>(),
+                runtime,
+            )),
+            Subcommand::Hold { packages, enable } => Ok(self.plan_hold(packages, *enable, runtime)),
             Subcommand::Search { query } => Ok(self.plan_search(query, runtime)),
             Subcommand::List { upgradable } => Ok(self.plan_list(*upgradable, runtime)),
             Subcommand::Show { package } => Ok(self.plan_show(package, runtime)),
@@ -1649,9 +2465,9 @@ impl Backend {
                     args.push("--name".to_string());
                     args.push(source.to_string());
                 }
-                vec![self.base_invocation(args)]
+                vec![self.mutating_invocation(args, runtime)]
             }
-            Self::Scoop => vec![self.base_invocation(vec!["update".to_string()])],
+            Self::Scoop => vec![self.mutating_invocation(vec!["update".to_string()], runtime)],
             Self::Chocolatey => vec![Invocation::message(
                 "Chocolatey does not expose a dedicated apt-get-style index refresh. Skipping update as a no-op.",
             )],
@@ -1675,8 +2491,12 @@ impl Backend {
                         "--accept-source-agreements".to_string(),
                         "--accept-package-agreements".to_string(),
                     ];
+                    if runtime.assume_yes {
+                        args.push("--silent".to_string());
+                        args.push("--disable-interactivity".to_string());
+                    }
                     append_source_arg(&mut args, runtime.config.winget_source());
-                    vec![self.base_invocation(args)]
+                    vec![self.mutating_invocation(args, runtime)]
                 } else {
                     packages
                         .iter()
@@ -1692,23 +2512,32 @@ impl Backend {
                             append_source_arg(&mut args, runtime.config.winget_source());
                             if runtime.assume_yes {
                                 args.push("--silent".to_string());
+                                args.push("--disable-interactivity".to_string());
                             }
-                            self.base_invocation(args)
+                            self.mutating_invocation(args, runtime)
                         })
                         .collect()
                 }
             }
             Self::Scoop => {
                 if packages.is_empty() {
-                    vec![self.base_invocation(vec!["update".to_string(), "*".to_string()])]
+                    vec![
+                        self.mutating_invocation(
+                            vec!["update".to_string(), "*".to_string()],
+                            runtime,
+                        ),
+                    ]
                 } else {
                     packages
                         .iter()
                         .map(|package| {
-                            self.base_invocation(vec![
-                                "update".to_string(),
-                                runtime.config.qualify_scoop_package(package),
-                            ])
+                            self.mutating_invocation(
+                                vec![
+                                    "update".to_string(),
+                                    runtime.config.qualify_scoop_package(package),
+                                ],
+                                runtime,
+                            )
                         })
                         .collect()
                 }
@@ -1720,7 +2549,7 @@ impl Backend {
                     if runtime.assume_yes {
                         args.push("-y".to_string());
                     }
-                    vec![self.base_invocation(args)]
+                    vec![self.mutating_invocation(args, runtime)]
                 } else {
                     packages
                         .iter()
@@ -1730,14 +2559,17 @@ impl Backend {
                             if runtime.assume_yes {
                                 args.push("-y".to_string());
                             }
-                            self.base_invocation(args)
+                            self.mutating_invocation(args, runtime)
                         })
                         .collect()
                 }
             }
             Self::Npm => {
                 if packages.is_empty() {
-                    vec![self.base_invocation(vec!["update".to_string(), "--global".to_string()])]
+                    vec![self.mutating_invocation(
+                        vec!["update".to_string(), "--global".to_string()],
+                        runtime,
+                    )]
                 } else {
                     self.plan_install_or_upgrade(packages, runtime, true)
                 }
@@ -1771,21 +2603,25 @@ impl Backend {
                     append_source_arg(&mut args, runtime.config.winget_source());
                     if runtime.assume_yes {
                         args.push("--silent".to_string());
+                        args.push("--disable-interactivity".to_string());
                     }
-                    self.base_invocation(args)
+                    self.mutating_invocation(args, runtime)
                 })
                 .collect(),
             Self::Scoop => packages
                 .iter()
                 .map(|package| {
-                    self.base_invocation(vec![
-                        if upgrade {
-                            "update".to_string()
-                        } else {
-                            "install".to_string()
-                        },
-                        runtime.config.qualify_scoop_package(package),
-                    ])
+                    self.mutating_invocation(
+                        vec![
+                            if upgrade {
+                                "update".to_string()
+                            } else {
+                                "install".to_string()
+                            },
+                            runtime.config.qualify_scoop_package(package),
+                        ],
+                        runtime,
+                    )
                 })
                 .collect(),
             Self::Chocolatey => packages
@@ -1803,7 +2639,7 @@ impl Backend {
                     if runtime.assume_yes {
                         args.push("-y".to_string());
                     }
-                    self.base_invocation(args)
+                    self.mutating_invocation(args, runtime)
                 })
                 .collect(),
             Self::Npm => packages
@@ -1814,11 +2650,10 @@ impl Backend {
                     } else {
                         package.clone()
                     };
-                    self.base_invocation(vec![
-                        "install".to_string(),
-                        versioned,
-                        "--global".to_string(),
-                    ])
+                    self.mutating_invocation(
+                        vec!["install".to_string(), versioned, "--global".to_string()],
+                        runtime,
+                    )
                 })
                 .collect(),
             Self::Pip => packages
@@ -1835,13 +2670,17 @@ impl Backend {
                     if runtime.config.pip_user {
                         args.push("--user".to_string());
                     }
-                    self.base_invocation(args)
+                    self.mutating_invocation(args, runtime)
                 })
                 .collect(),
         }
     }
 
-    fn plan_remove(self, packages: &[String], runtime: &RuntimeSettings<'_>) -> Vec<Invocation> {
+    fn plan_remove(
+        self,
+        packages: &[RemoveTarget],
+        runtime: &RuntimeSettings<'_>,
+    ) -> Vec<Invocation> {
         match self {
             Self::Winget => packages
                 .iter()
@@ -1849,57 +2688,79 @@ impl Backend {
                     let mut args = vec![
                         "uninstall".to_string(),
                         "--id".to_string(),
-                        package.clone(),
+                        package.package.clone(),
                         "--exact".to_string(),
                     ];
+                    if let Some(version) = package.version.as_deref() {
+                        args.push("--version".to_string());
+                        args.push(version.to_string());
+                    }
                     append_source_arg(&mut args, runtime.config.winget_source());
-                    self.base_invocation(args)
+                    if runtime.assume_yes {
+                        args.push("--silent".to_string());
+                        args.push("--disable-interactivity".to_string());
+                    }
+                    self.mutating_invocation(args, runtime)
                 })
                 .collect(),
             Self::Scoop => packages
                 .iter()
                 .map(|package| {
-                    self.base_invocation(vec![
-                        "uninstall".to_string(),
-                        runtime.config.qualify_scoop_package(package),
-                    ])
+                    self.mutating_invocation(
+                        vec![
+                            "uninstall".to_string(),
+                            runtime.config.qualify_scoop_package(&package.package),
+                        ],
+                        runtime,
+                    )
                 })
                 .collect(),
             Self::Chocolatey => packages
                 .iter()
                 .map(|package| {
-                    let mut args = vec!["uninstall".to_string(), package.clone()];
+                    let mut args = vec!["uninstall".to_string(), package.package.clone()];
                     if runtime.assume_yes {
                         args.push("-y".to_string());
                     }
-                    self.base_invocation(args)
+                    self.mutating_invocation(args, runtime)
                 })
                 .collect(),
             Self::Npm => packages
                 .iter()
                 .map(|package| {
-                    self.base_invocation(vec![
-                        "uninstall".to_string(),
-                        package.clone(),
-                        "--global".to_string(),
-                    ])
+                    self.mutating_invocation(
+                        vec![
+                            "uninstall".to_string(),
+                            package.package.clone(),
+                            "--global".to_string(),
+                        ],
+                        runtime,
+                    )
                 })
                 .collect(),
             Self::Pip => packages
                 .iter()
                 .map(|package| {
-                    self.base_invocation(vec![
-                        "uninstall".to_string(),
-                        package.clone(),
-                        "--no-input".to_string(),
-                        "--yes".to_string(),
-                    ])
+                    self.mutating_invocation(
+                        vec![
+                            "uninstall".to_string(),
+                            package.package.clone(),
+                            "--no-input".to_string(),
+                            "--yes".to_string(),
+                        ],
+                        runtime,
+                    )
                 })
                 .collect(),
         }
     }
 
-    fn plan_hold(self, packages: &[String], enable: bool) -> Vec<Invocation> {
+    fn plan_hold(
+        self,
+        packages: &[String],
+        enable: bool,
+        runtime: &RuntimeSettings<'_>,
+    ) -> Vec<Invocation> {
         match self {
             Self::Winget => packages
                 .iter()
@@ -1915,27 +2776,33 @@ impl Backend {
                         args.push("--blocking".to_string());
                     }
                     args.push("--exact".to_string());
-                    self.base_invocation(args)
+                    self.mutating_invocation(args, runtime)
                 })
                 .collect(),
             Self::Scoop => packages
                 .iter()
                 .map(|package| {
-                    self.base_invocation(vec![
-                        if enable { "hold" } else { "unhold" }.to_string(),
-                        package.clone(),
-                    ])
+                    self.mutating_invocation(
+                        vec![
+                            if enable { "hold" } else { "unhold" }.to_string(),
+                            package.clone(),
+                        ],
+                        runtime,
+                    )
                 })
                 .collect(),
             Self::Chocolatey => packages
                 .iter()
                 .map(|package| {
-                    self.base_invocation(vec![
-                        "pin".to_string(),
-                        if enable { "add" } else { "remove" }.to_string(),
-                        "--name".to_string(),
-                        package.clone(),
-                    ])
+                    self.mutating_invocation(
+                        vec![
+                            "pin".to_string(),
+                            if enable { "add" } else { "remove" }.to_string(),
+                            "--name".to_string(),
+                            package.clone(),
+                        ],
+                        runtime,
+                    )
                 })
                 .collect(),
             Self::Npm | Self::Pip => vec![Invocation::message(
@@ -2114,15 +2981,19 @@ impl Backend {
         )
     }
 
-    fn pip_outdated_invocation(self) -> Invocation {
-        self.base_invocation(vec![
-            "list".to_string(),
-            "--outdated".to_string(),
-            "--format=json".to_string(),
-        ])
-    }
-
     fn pip_python_program(self) -> String {
+        if let Some(program) = self.command_override() {
+            return program;
+        }
+
+        if let Some(program) = self
+            .discovered_pip_candidates()
+            .into_iter()
+            .find(|program| is_python_launcher(program))
+        {
+            return program;
+        }
+
         if command_works(
             "python",
             &["-m".to_string(), "pip".to_string(), "--version".to_string()],
@@ -2136,6 +3007,301 @@ impl Backend {
         } else {
             "python".to_string()
         }
+    }
+
+    fn preferred_program(self) -> String {
+        self.command_override()
+            .or_else(|| self.discovered_program_candidates().into_iter().next())
+            .unwrap_or_else(|| self.default_program_name().to_string())
+    }
+
+    fn discovered_program_candidates(self) -> Vec<String> {
+        let mut programs = Vec::new();
+        if let Some(program) = self.command_override() {
+            push_unique_string(&mut programs, program);
+            return programs;
+        }
+
+        for program in find_programs_on_path(env::var_os("PATH").as_deref(), self.path_names()) {
+            push_unique_string(&mut programs, program);
+        }
+
+        for path in self.known_program_paths() {
+            push_unique_path_if_present(&mut programs, path);
+        }
+
+        if programs.is_empty() {
+            push_unique_string(&mut programs, self.default_program_name().to_string());
+        }
+
+        programs
+    }
+
+    fn discovered_pip_candidates(self) -> Vec<String> {
+        let mut programs = Vec::new();
+        if let Some(program) = self.command_override() {
+            push_unique_string(&mut programs, program);
+            return programs;
+        }
+
+        for program in find_programs_on_path(env::var_os("PATH").as_deref(), pip_path_names()) {
+            push_unique_string(&mut programs, program);
+        }
+
+        for path in pip_known_program_paths() {
+            push_unique_path_if_present(&mut programs, path);
+        }
+
+        if programs.is_empty() {
+            push_unique_string(&mut programs, "python".to_string());
+            push_unique_string(&mut programs, "python3".to_string());
+            push_unique_string(&mut programs, "pip".to_string());
+        }
+
+        programs
+    }
+
+    fn default_program_name(self) -> &'static str {
+        match self {
+            Self::Winget => "winget",
+            Self::Scoop => "scoop",
+            Self::Chocolatey => "choco",
+            Self::Npm => {
+                if cfg!(windows) {
+                    "npm.cmd"
+                } else {
+                    "npm"
+                }
+            }
+            Self::Pip => "python",
+        }
+    }
+
+    fn path_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Winget => {
+                if cfg!(windows) {
+                    &["winget.exe"]
+                } else {
+                    &["winget"]
+                }
+            }
+            Self::Scoop => {
+                if cfg!(windows) {
+                    &["scoop.cmd", "scoop.exe", "scoop.ps1"]
+                } else {
+                    &["scoop"]
+                }
+            }
+            Self::Chocolatey => {
+                if cfg!(windows) {
+                    &["choco.exe", "choco.bat"]
+                } else {
+                    &["choco"]
+                }
+            }
+            Self::Npm => {
+                if cfg!(windows) {
+                    &["npm.cmd", "npm.exe"]
+                } else {
+                    &["npm"]
+                }
+            }
+            Self::Pip => &[],
+        }
+    }
+
+    fn version_probe_args(self) -> Vec<String> {
+        match self {
+            Self::Winget | Self::Scoop | Self::Npm => vec!["--version".to_string()],
+            Self::Chocolatey => vec!["-v".to_string()],
+            Self::Pip => pip_probe_args("python"),
+        }
+    }
+
+    fn known_program_paths(self) -> Vec<PathBuf> {
+        match self {
+            Self::Winget => winget_known_program_paths(),
+            Self::Scoop => scoop_known_program_paths(),
+            Self::Chocolatey => choco_known_program_paths(),
+            Self::Npm => npm_known_program_paths(),
+            Self::Pip => pip_known_program_paths(),
+        }
+    }
+}
+
+fn env_override(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn command_works_or_is_discoverable(program: &str, args: &[String]) -> bool {
+    command_works(program, args) || path_looks_present(Path::new(program))
+}
+
+fn path_looks_present(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => true,
+        Err(_) => false,
+    }
+}
+
+fn push_unique_string(items: &mut Vec<String>, value: String) {
+    if !items.contains(&value) {
+        items.push(value);
+    }
+}
+
+fn push_unique_path_if_present(items: &mut Vec<String>, path: PathBuf) {
+    if path_looks_present(&path) {
+        push_unique_string(items, path.display().to_string());
+    }
+}
+
+fn find_programs_on_path(path_var: Option<&OsStr>, names: &[&str]) -> Vec<String> {
+    let mut programs = Vec::new();
+    let Some(path_var) = path_var else {
+        return programs;
+    };
+
+    for dir in env::split_paths(path_var) {
+        for name in names {
+            let candidate = dir.join(name);
+            if path_looks_present(&candidate) {
+                push_unique_string(&mut programs, candidate.display().to_string());
+            }
+        }
+    }
+
+    programs
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))
+}
+
+fn local_app_data_dir() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| user_home_dir().map(|home| home.join("AppData").join("Local")))
+}
+
+fn program_data_dir() -> PathBuf {
+    env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+}
+
+fn winget_known_program_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(local_app_data) = local_app_data_dir() {
+        paths.push(
+            local_app_data
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("winget.exe"),
+        );
+    }
+    paths
+}
+
+fn scoop_known_program_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(scoop_root) = env::var_os("SCOOP")
+        .map(PathBuf::from)
+        .or_else(|| user_home_dir().map(|home| home.join("scoop")))
+    {
+        paths.push(scoop_root.join("shims").join("scoop.cmd"));
+        paths.push(scoop_root.join("shims").join("scoop.ps1"));
+    }
+    paths
+}
+
+fn choco_known_program_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(choco_root) = env::var_os("ChocolateyInstall").map(PathBuf::from) {
+        paths.push(choco_root.join("bin").join("choco.exe"));
+    }
+    if let Some(local_app_data) = local_app_data_dir() {
+        paths.push(
+            local_app_data
+                .join("UniGetUI")
+                .join("Chocolatey")
+                .join("bin")
+                .join("choco.exe"),
+        );
+    }
+    paths.push(
+        program_data_dir()
+            .join("chocolatey")
+            .join("bin")
+            .join("choco.exe"),
+    );
+    paths
+}
+
+fn npm_known_program_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if cfg!(windows) {
+        if let Some(program_files) = env::var_os("ProgramFiles").map(PathBuf::from) {
+            paths.push(program_files.join("nodejs").join("npm.cmd"));
+        }
+        if let Some(program_files_x86) = env::var_os("ProgramFiles(x86)").map(PathBuf::from) {
+            paths.push(program_files_x86.join("nodejs").join("npm.cmd"));
+        }
+    }
+    paths
+}
+
+fn pip_known_program_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(local_app_data) = local_app_data_dir() {
+        let python_root = local_app_data.join("Programs").join("Python");
+        paths.push(python_root.join("Launcher").join("py.exe"));
+
+        if let Ok(entries) = fs::read_dir(&python_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if name.starts_with("python") {
+                    let base = entry.path();
+                    paths.push(base.join("python.exe"));
+                    paths.push(base.join("Scripts").join("pip.exe"));
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn pip_path_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["python.exe", "python3.exe", "py.exe", "pip.exe", "pip3.exe"]
+    } else {
+        &["python", "python3", "pip", "pip3"]
+    }
+}
+
+fn is_python_launcher(program: &str) -> bool {
+    let lower = program.to_ascii_lowercase();
+    lower.ends_with("python")
+        || lower.ends_with("python.exe")
+        || lower.ends_with("python3")
+        || lower.ends_with("python3.exe")
+        || lower.ends_with("\\py.exe")
+        || lower == "py"
+        || lower == "py.exe"
+}
+
+fn pip_probe_args(program: &str) -> Vec<String> {
+    if is_python_launcher(program) {
+        vec!["-m".to_string(), "pip".to_string(), "--version".to_string()]
+    } else {
+        vec!["--version".to_string()]
     }
 }
 
@@ -2155,6 +3321,7 @@ impl Display for Backend {
 struct Config {
     backend: Option<Backend>,
     assume_yes: bool,
+    auto_elevate: bool,
     winget_source: Option<String>,
     choco_source: Option<String>,
     scoop_bucket: Option<String>,
@@ -2170,7 +3337,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             backend: None,
-            assume_yes: false,
+            assume_yes: true,
+            auto_elevate: true,
             winget_source: None,
             choco_source: None,
             scoop_bucket: None,
@@ -2214,6 +3382,7 @@ impl Config {
             match key {
                 "backend" => config.backend = Some(Backend::parse(&parse_string(value)?)?),
                 "assume_yes" => config.assume_yes = parse_bool(value)?,
+                "auto_elevate" => config.auto_elevate = parse_bool(value)?,
                 "winget_source" => config.winget_source = Some(parse_string(value)?),
                 "choco_source" => config.choco_source = Some(parse_string(value)?),
                 "scoop_bucket" => config.scoop_bucket = Some(parse_string(value)?),
@@ -2288,6 +3457,7 @@ impl Config {
             lines.push(format!("backend = \"{backend}\""));
         }
         lines.push(format!("assume_yes = {}", self.assume_yes));
+        lines.push(format!("auto_elevate = {}", self.auto_elevate));
         if let Some(source) = &self.winget_source {
             lines.push(format!("winget_source = {}", render_toml_string(source)));
         }
@@ -2611,6 +3781,7 @@ fn render_json_object(entries: &[(String, String)]) -> String {
 #[derive(Debug, Clone, Copy)]
 struct RuntimeSettings<'a> {
     assume_yes: bool,
+    auto_elevate: bool,
     config: &'a Config,
 }
 
@@ -2624,9 +3795,25 @@ struct SearchCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoveTarget {
+    package: String,
+    version: Option<String>,
+}
+
+impl RemoveTarget {
+    fn unversioned(package: String) -> Self {
+        Self {
+            package,
+            version: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageListEntry {
     backend: Backend,
     name: String,
+    package_id: String,
     current_version: String,
     available_version: Option<String>,
 }
@@ -2665,6 +3852,87 @@ struct CommandCapture {
     status_code: i32,
 }
 
+struct CommandLogCapture {
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+impl CommandLogCapture {
+    fn new() -> Result<Self, String> {
+        let base = unique_capture_base("waw-command")?;
+        Ok(Self {
+            stdout_path: base.with_extension("stdout.log"),
+            stderr_path: base.with_extension("stderr.log"),
+        })
+    }
+
+    fn cleanup(&self) {
+        let _ = fs::remove_file(&self.stdout_path);
+        let _ = fs::remove_file(&self.stderr_path);
+    }
+}
+
+struct ProgressReporter {
+    enabled: bool,
+    frame_index: usize,
+    last_width: usize,
+    started_at: Instant,
+}
+
+impl ProgressReporter {
+    fn new() -> Self {
+        Self {
+            enabled: io::stderr().is_terminal(),
+            frame_index: 0,
+            last_width: 0,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn tick(&mut self, label: &str) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+        let frame = FRAMES[self.frame_index % FRAMES.len()];
+        self.frame_index += 1;
+        self.render(&format!("{frame} {label}"))
+    }
+
+    fn finish(&mut self, success: bool, label: &str) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let status = if success { "ok" } else { "failed" };
+        self.render(&format!(
+            "{status} {label} ({})",
+            format_elapsed(self.started_at.elapsed())
+        ))?;
+        io::stderr()
+            .write_all(b"\n")
+            .and_then(|_| io::stderr().flush())
+            .map_err(|error| format!("failed to update progress output: {error}"))?;
+        self.last_width = 0;
+        Ok(())
+    }
+
+    fn render(&mut self, message: &str) -> Result<(), String> {
+        let padding = self.last_width.saturating_sub(message.chars().count());
+        let padded = if padding == 0 {
+            message.to_string()
+        } else {
+            format!("{message}{}", " ".repeat(padding))
+        };
+        self.last_width = message.chars().count();
+        io::stderr()
+            .write_all(format!("\r{padded}").as_bytes())
+            .and_then(|_| io::stderr().flush())
+            .map_err(|error| format!("failed to update progress output: {error}"))
+    }
+}
+
 const PIP_SEARCH_SCRIPT: &str = r#"import json, sys, urllib.request
 query = sys.argv[1].strip().lower()
 req = urllib.request.Request("https://pypi.org/simple/", headers={"Accept": "application/vnd.pypi.simple.v1+json"})
@@ -2682,6 +3950,7 @@ struct Invocation {
     program: String,
     args: Vec<String>,
     message: Option<String>,
+    requires_elevation: bool,
 }
 
 impl Invocation {
@@ -2690,6 +3959,7 @@ impl Invocation {
             program: program.to_string(),
             args,
             message: None,
+            requires_elevation: false,
         }
     }
 
@@ -2698,7 +3968,13 @@ impl Invocation {
             program: String::new(),
             args: Vec::new(),
             message: Some(message.to_string()),
+            requires_elevation: false,
         }
+    }
+
+    fn with_elevation(mut self, requires_elevation: bool) -> Self {
+        self.requires_elevation = requires_elevation;
+        self
     }
 
     fn render_for_display(&self) -> String {
@@ -2731,19 +4007,563 @@ fn command_works(program: &str, args: &[String]) -> bool {
         .unwrap_or(false)
 }
 
+fn is_process_elevated() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[bool](([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+fn run_current_process_elevated() -> Result<CommandCapture, String> {
+    let current_exe = env::current_exe()
+        .map_err(|error| format!("failed to resolve current executable for elevation: {error}"))?;
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+
+    run_elevated_program(current_exe.as_os_str(), &args, "Running elevated command")
+}
+
+fn run_elevated_invocation(invocation: &Invocation, label: &str) -> Result<CommandCapture, String> {
+    let args: Vec<OsString> = invocation.args.iter().map(OsString::from).collect();
+
+    run_elevated_program(OsStr::new(&invocation.program), &args, label)
+}
+
+fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
+    let capture = ElevationCapture::new()?;
+    let working_directory = env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let inner_command = build_elevated_batch_command(
+        invocations,
+        capture.stdout_path.as_os_str(),
+        capture.stderr_path.as_os_str(),
+    );
+    let wrapper_command = build_elevated_wrapper_command(
+        &inner_command,
+        capture.started_path.as_os_str(),
+        &working_directory,
+    );
+
+    let outcome =
+        run_logged_elevated_wrapper_command(&wrapper_command, &capture, "elevated command batch")?;
+    if outcome.status.success() {
+        Ok(())
+    } else {
+        emit_command_logs(
+            "elevated command batch",
+            &outcome.stdout_log,
+            &visible_elevated_stderr(&outcome.stderr_log),
+        );
+        Err(format_elevated_batch_failure(
+            outcome.status.code().unwrap_or(1),
+            &outcome.stderr_log,
+        ))
+    }
+}
+
+fn run_elevated_program(
+    program: &OsStr,
+    args: &[OsString],
+    label: &str,
+) -> Result<CommandCapture, String> {
+    let capture = ElevationCapture::new()?;
+    let working_directory = env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let inner_command = build_elevated_child_command(
+        program,
+        args,
+        capture.stdout_path.as_os_str(),
+        capture.stderr_path.as_os_str(),
+    );
+    let wrapper_command = build_elevated_wrapper_command(
+        &inner_command,
+        capture.started_path.as_os_str(),
+        &working_directory,
+    );
+
+    let outcome = run_logged_elevated_wrapper_command(&wrapper_command, &capture, label)?;
+    let visible_stderr = visible_elevated_stderr(&outcome.stderr_log);
+    if !outcome.status.success() {
+        emit_command_logs(
+            &program.to_string_lossy(),
+            &outcome.stdout_log,
+            &visible_stderr,
+        );
+    }
+
+    Ok(CommandCapture {
+        stdout: outcome.stdout_log,
+        stderr: visible_stderr,
+        success: outcome.status.success(),
+        status_code: outcome.status.code().unwrap_or(1),
+    })
+}
+
+struct ElevatedCommandOutcome {
+    status: std::process::ExitStatus,
+    stdout_log: String,
+    stderr_log: String,
+}
+
+fn run_logged_elevated_wrapper_command(
+    wrapper_command: &str,
+    capture: &ElevationCapture,
+    label: &str,
+) -> Result<ElevatedCommandOutcome, String> {
+    let mut child = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", wrapper_command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!("failed to request administrator privileges for {label}: {error}",)
+        })?;
+
+    let mut reporter = ProgressReporter::new();
+    loop {
+        let current_label = latest_elevated_step(&read_capture_log(&capture.stderr_path))
+            .unwrap_or_else(|| label.to_string());
+        reporter.tick(&current_label)?;
+
+        if child
+            .try_wait()
+            .map_err(|error| format!("failed to monitor elevated process: {error}"))?
+            .is_some()
+        {
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to collect elevated process result: {error}"))?;
+    let stdout_log = read_capture_log(&capture.stdout_path);
+    let stderr_log = read_capture_log(&capture.stderr_path);
+    let final_label = latest_elevated_step(&stderr_log).unwrap_or_else(|| label.to_string());
+    reporter.finish(output.status.success(), &final_label)?;
+
+    if !capture.started_path.exists() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        capture.cleanup();
+        return Err(if stderr.is_empty() {
+            "administrator privileges were not granted. Confirm the Windows UAC prompt and try again."
+                .to_string()
+        } else {
+            format!("administrator privileges were not granted: {stderr}")
+        });
+    }
+
+    capture.cleanup();
+    Ok(ElevatedCommandOutcome {
+        status: output.status,
+        stdout_log,
+        stderr_log,
+    })
+}
+
+fn escape_powershell_single_quoted(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn escape_powershell_single_quoted_os(value: &OsStr) -> String {
+    escape_powershell_single_quoted(&value.to_string_lossy())
+}
+
+fn unique_capture_base(prefix: &str) -> Result<PathBuf, String> {
+    Ok(env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("failed to build capture timestamp: {error}"))?
+            .as_nanos()
+    )))
+}
+
+struct ElevationCapture {
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    started_path: PathBuf,
+}
+
+impl ElevationCapture {
+    fn new() -> Result<Self, String> {
+        let base = unique_capture_base("waw-elevated")?;
+        Ok(Self {
+            stdout_path: base.with_extension("stdout.log"),
+            stderr_path: base.with_extension("stderr.log"),
+            started_path: base.with_extension("started"),
+        })
+    }
+
+    fn cleanup(&self) {
+        let _ = fs::remove_file(&self.stdout_path);
+        let _ = fs::remove_file(&self.stderr_path);
+        let _ = fs::remove_file(&self.started_path);
+    }
+}
+
+fn build_elevated_child_command(
+    program: &OsStr,
+    args: &[OsString],
+    stdout_path: &OsStr,
+    stderr_path: &OsStr,
+) -> String {
+    let argument_list = args
+        .iter()
+        .map(|arg| format!("'{}'", escape_powershell_single_quoted_os(arg)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tolerated_exit_snippet = tolerated_elevated_exit_snippet_os(program, args);
+    format!(
+        "{}$proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput '{}' -RedirectStandardError '{}'; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} exit $code",
+        powershell_utf8_setup(),
+        escape_powershell_single_quoted_os(program),
+        argument_list,
+        escape_powershell_single_quoted_os(stdout_path),
+        escape_powershell_single_quoted_os(stderr_path),
+        tolerated_exit_snippet,
+    )
+}
+
+fn build_elevated_batch_command(
+    invocations: &[Invocation],
+    stdout_path: &OsStr,
+    stderr_path: &OsStr,
+) -> String {
+    let commands = invocations
+        .iter()
+        .filter(|invocation| !invocation.program.is_empty())
+        .map(build_elevated_invocation_command)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "{}$ErrorActionPreference = 'Stop'; & {{ {commands}; exit 0 }} 1>> '{}' 2>> '{}'",
+        powershell_utf8_setup(),
+        escape_powershell_single_quoted_os(stdout_path),
+        escape_powershell_single_quoted_os(stderr_path),
+    )
+}
+
+fn build_elevated_invocation_command(invocation: &Invocation) -> String {
+    let argument_list = invocation
+        .args
+        .iter()
+        .map(|arg| format!("'{}'", escape_powershell_single_quoted(arg)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rendered_command = invocation.render_for_display();
+    let tolerated_exit_snippet =
+        tolerated_elevated_exit_snippet(&invocation.program, &invocation.args);
+    format!(
+        "[Console]::Error.WriteLine('{}{}'); & '{}' @({}); $code = if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }}; {} if ($code -ne 0) {{ [Console]::Error.WriteLine('{}{}:' + $code); exit $code }}",
+        ELEVATED_STEP_MARKER,
+        escape_powershell_single_quoted(&rendered_command),
+        escape_powershell_single_quoted(&invocation.program),
+        argument_list,
+        tolerated_exit_snippet,
+        ELEVATED_FAILURE_MARKER,
+        escape_powershell_single_quoted(&rendered_command),
+    )
+}
+
+fn tolerated_elevated_exit_snippet(program: &str, args: &[String]) -> &'static str {
+    if is_winget_uninstall_command(program, args) {
+        "if ($code -ne 0 -and [uint32]$code -eq 0x800401F5) { $code = 0 }; "
+    } else {
+        ""
+    }
+}
+
+fn tolerated_elevated_exit_snippet_os(program: &OsStr, args: &[OsString]) -> &'static str {
+    let program = program.to_string_lossy();
+    let args = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if is_winget_uninstall_command_os(&program, &args) {
+        "if ($code -ne 0 -and [uint32]$code -eq 0x800401F5) { $code = 0 }; "
+    } else {
+        ""
+    }
+}
+
+fn is_winget_uninstall_command(program: &str, args: &[String]) -> bool {
+    let program = program.replace('\\', "/").to_ascii_lowercase();
+    program.contains("winget") && args.first().map(String::as_str) == Some("uninstall")
+}
+
+fn is_winget_uninstall_command_os(program: &str, args: &[String]) -> bool {
+    let program = program.replace('\\', "/").to_ascii_lowercase();
+    program.contains("winget") && args.first().map(String::as_str) == Some("uninstall")
+}
+
+fn build_elevated_wrapper_command(
+    child_command: &str,
+    started_path: &OsStr,
+    working_directory: &str,
+) -> String {
+    format!(
+        concat!(
+            "$ErrorActionPreference = 'Stop'; ",
+            "$proc = Start-Process -FilePath 'powershell' ",
+            "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', '{}') ",
+            "-WorkingDirectory '{}' -Verb RunAs -WindowStyle Hidden -PassThru; ",
+            "Set-Content -LiteralPath '{}' -Value 'started' -NoNewline; ",
+            "$proc.WaitForExit(); ",
+            "$proc.Refresh(); ",
+            "exit $proc.ExitCode"
+        ),
+        escape_powershell_single_quoted(child_command),
+        escape_powershell_single_quoted(working_directory),
+        escape_powershell_single_quoted_os(started_path),
+    )
+}
+
+fn powershell_utf8_setup() -> &'static str {
+    concat!(
+        "$utf8NoBom = New-Object System.Text.UTF8Encoding($false); ",
+        "[Console]::InputEncoding = $utf8NoBom; ",
+        "[Console]::OutputEncoding = $utf8NoBom; ",
+        "$OutputEncoding = $utf8NoBom; ",
+        "chcp.com 65001 > $null; "
+    )
+}
+
+fn read_capture_log(path: &Path) -> String {
+    fs::read(path)
+        .map(|bytes| decode_capture_text(&bytes, true))
+        .unwrap_or_default()
+}
+
+fn latest_elevated_step(stderr_log: &str) -> Option<String> {
+    stderr_log
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(ELEVATED_STEP_MARKER))
+        .next_back()
+        .map(ToString::to_string)
+}
+
+fn visible_elevated_stderr(stderr_log: &str) -> String {
+    let lines = stderr_log
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with(ELEVATED_STEP_MARKER)
+                && !trimmed.starts_with(ELEVATED_FAILURE_MARKER)
+        })
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn decode_capture_text(bytes: &[u8], final_chunk: bool) -> String {
+    let (encoding, skip) = detect_capture_encoding(bytes);
+    let body = &bytes[skip..];
+    match encoding {
+        CaptureEncoding::Utf8 => decode_utf8_capture(body, final_chunk),
+        CaptureEncoding::Utf16Le => decode_utf16_capture(body, final_chunk, true),
+        CaptureEncoding::Utf16Be => decode_utf16_capture(body, final_chunk, false),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+fn detect_capture_encoding(bytes: &[u8]) -> (CaptureEncoding, usize) {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        (CaptureEncoding::Utf8, 3)
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        (CaptureEncoding::Utf16Le, 2)
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        (CaptureEncoding::Utf16Be, 2)
+    } else if looks_like_utf16_le(bytes) {
+        (CaptureEncoding::Utf16Le, 0)
+    } else if looks_like_utf16_be(bytes) {
+        (CaptureEncoding::Utf16Be, 0)
+    } else {
+        (CaptureEncoding::Utf8, 0)
+    }
+}
+
+fn looks_like_utf16_le(bytes: &[u8]) -> bool {
+    looks_like_utf16(bytes, true)
+}
+
+fn looks_like_utf16_be(bytes: &[u8]) -> bool {
+    looks_like_utf16(bytes, false)
+}
+
+fn looks_like_utf16(bytes: &[u8], little_endian: bool) -> bool {
+    let sample = bytes.len().min(64);
+    if sample < 2 {
+        return false;
+    }
+
+    let mut zero_slots = 0usize;
+    let mut zero_matches = 0usize;
+    let mut nonzero_slots = 0usize;
+    let mut nonzero_matches = 0usize;
+
+    for (index, byte) in bytes[..sample].iter().enumerate() {
+        let zero_expected = if little_endian {
+            index % 2 == 1
+        } else {
+            index % 2 == 0
+        };
+
+        if zero_expected {
+            zero_slots += 1;
+            if *byte == 0 {
+                zero_matches += 1;
+            }
+        } else {
+            nonzero_slots += 1;
+            if *byte != 0 {
+                nonzero_matches += 1;
+            }
+        }
+    }
+
+    zero_slots >= 2
+        && zero_matches * 4 >= zero_slots * 3
+        && nonzero_slots >= 2
+        && nonzero_matches * 4 >= nonzero_slots * 3
+}
+
+fn decode_utf8_capture(bytes: &[u8], final_chunk: bool) -> String {
+    if final_chunk {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    let mut output = String::new();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        match std::str::from_utf8(&bytes[start..]) {
+            Ok(valid) => {
+                output.push_str(valid);
+                return output;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    output.push_str(
+                        std::str::from_utf8(&bytes[start..start + valid_up_to])
+                            .expect("valid utf-8 prefix"),
+                    );
+                    start += valid_up_to;
+                }
+
+                match error.error_len() {
+                    Some(error_len) => {
+                        output.push('\u{FFFD}');
+                        start += error_len;
+                    }
+                    None => return output,
+                }
+            }
+        }
+    }
+
+    output
+}
+
+fn decode_utf16_capture(bytes: &[u8], final_chunk: bool, little_endian: bool) -> String {
+    let even_len = bytes.len() - (bytes.len() % 2);
+    let mut units = bytes[..even_len]
+        .chunks_exact(2)
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    let had_odd_tail = bytes.len() % 2 == 1;
+
+    if !final_chunk {
+        if matches!(units.last(), Some(unit) if (0xD800..=0xDBFF).contains(unit)) {
+            units.pop();
+        }
+        return String::from_utf16_lossy(&units);
+    }
+
+    let mut output = String::from_utf16_lossy(&units);
+    if had_odd_tail {
+        output.push('\u{FFFD}');
+    }
+    output
+}
+
+fn format_elevated_batch_failure(exit_code: i32, stderr_log: &str) -> String {
+    if let Some((command, command_exit_code)) = parse_elevated_failure(stderr_log) {
+        format!("backend command failed with exit code {command_exit_code}: {command}")
+    } else {
+        format!("one or more elevated backend commands failed with exit code {exit_code}")
+    }
+}
+
+fn parse_elevated_failure(stderr_log: &str) -> Option<(String, i32)> {
+    stderr_log
+        .lines()
+        .filter_map(parse_elevated_failure_line)
+        .next_back()
+}
+
+fn parse_elevated_failure_line(line: &str) -> Option<(String, i32)> {
+    let payload = line.trim().strip_prefix(ELEVATED_FAILURE_MARKER)?;
+    let (command, exit_code) = payload.rsplit_once(':')?;
+    let exit_code = parse_windows_exit_code(exit_code)?;
+    Some((command.to_string(), exit_code))
+}
+
+fn parse_windows_exit_code(value: &str) -> Option<i32> {
+    value
+        .parse::<i32>()
+        .ok()
+        .or_else(|| value.parse::<u32>().ok().map(|code| code as i32))
+}
+
 fn parse_winget_search_candidates(output: &str) -> Vec<SearchCandidate> {
     let mut candidates = Vec::new();
-    let mut previous_line = "";
     let mut dashed_header_seen = false;
-    let mut id_index = None;
-    let mut version_index = None;
-    let mut source_index = None;
 
     for line in output.lines() {
         if !dashed_header_seen && line.contains("---") {
-            id_index = find_char_index(previous_line, "Id");
-            version_index = find_char_index(previous_line, "Version");
-            source_index = find_char_index(previous_line, "Source");
             dashed_header_seen = true;
             continue;
         }
@@ -2754,42 +4574,77 @@ fn parse_winget_search_candidates(output: &str) -> Vec<SearchCandidate> {
                 continue;
             }
 
-            if let (Some(id_index), Some(version_index)) = (id_index, version_index) {
-                let name = slice_chars(line, 0, id_index).trim().to_string();
-                let id_end = version_index;
-                let id = slice_chars(line, id_index, id_end).trim().to_string();
-                let version_end = source_index.unwrap_or_else(|| line.chars().count());
-                let version = slice_chars(line, version_index, version_end)
-                    .trim()
-                    .to_string();
-                let source = source_index
-                    .map(|start| {
-                        slice_chars(line, start, line.chars().count())
-                            .trim()
-                            .to_string()
-                    })
-                    .filter(|value| !value.is_empty());
-
-                if !id.is_empty() {
-                    candidates.push(SearchCandidate {
-                        backend: Backend::Winget,
-                        label: if name.is_empty() { id.clone() } else { name },
-                        install_id: id,
-                        version: if version.is_empty() {
-                            None
-                        } else {
-                            Some(version)
-                        },
-                        source,
-                    });
-                }
+            if let Some(candidate) = parse_winget_search_candidate_line(trimmed) {
+                candidates.push(candidate);
             }
         }
-
-        previous_line = line;
     }
 
     candidates
+}
+
+fn parse_winget_search_candidate_line(line: &str) -> Option<SearchCandidate> {
+    let mut parts = Vec::new();
+    let mut in_token = false;
+    let mut token_start = 0usize;
+
+    for (index, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            if in_token {
+                parts.push((token_start, &line[token_start..index]));
+                in_token = false;
+            }
+        } else if !in_token {
+            in_token = true;
+            token_start = index;
+        }
+    }
+
+    if in_token {
+        parts.push((token_start, &line[token_start..]));
+    }
+
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let mut last_index = parts.len();
+    let mut source = None;
+    if !looks_like_version(parts[last_index - 1].1) {
+        source = Some(parts[last_index - 1].1.to_string());
+        last_index -= 1;
+    }
+
+    let version_index = (0..last_index)
+        .rev()
+        .find(|index| looks_like_version(parts[*index].1))?;
+    if version_index == 0 {
+        return None;
+    }
+
+    let (id_start, id) = parts[version_index - 1];
+    if id.is_empty() {
+        return None;
+    }
+
+    let name = line[..id_start].trim();
+    let version = parts[version_index].1.trim();
+
+    Some(SearchCandidate {
+        backend: Backend::Winget,
+        label: if name.is_empty() {
+            id.to_string()
+        } else {
+            name.to_string()
+        },
+        install_id: id.to_string(),
+        version: if version.is_empty() {
+            None
+        } else {
+            Some(version.to_string())
+        },
+        source,
+    })
 }
 
 fn parse_scoop_search_candidates(output: &str) -> Vec<SearchCandidate> {
@@ -2975,10 +4830,25 @@ fn parse_winget_tabular_entries(output: &str, upgradable: bool) -> Option<Vec<Pa
 
     for line in output.lines() {
         if !dashed_header_seen && line.contains("---") {
-            id_index = find_char_index(previous_line, "Id");
-            version_index = find_char_index(previous_line, "Version");
-            available_index = find_char_index(previous_line, "Available");
-            source_index = find_char_index(previous_line, "Source");
+            let column_starts = infer_tabular_column_starts(line);
+            id_index =
+                find_char_index(previous_line, "Id").or_else(|| column_starts.get(1).copied());
+            version_index =
+                find_char_index(previous_line, "Version").or_else(|| column_starts.get(2).copied());
+            available_index = find_char_index(previous_line, "Available").or_else(|| {
+                if upgradable {
+                    column_starts.get(3).copied()
+                } else {
+                    None
+                }
+            });
+            source_index = find_char_index(previous_line, "Source").or_else(|| {
+                if upgradable {
+                    column_starts.get(4).copied()
+                } else {
+                    column_starts.get(3).copied()
+                }
+            });
             dashed_header_seen = true;
             continue;
         }
@@ -3007,9 +4877,11 @@ fn parse_winget_tabular_entries(output: &str, upgradable: bool) -> Option<Vec<Pa
                     .filter(|value| !value.is_empty());
 
                 if !id.is_empty() {
+                    let display_name = if name.is_empty() { id.clone() } else { name };
                     entries.push(PackageListEntry {
                         backend: Backend::Winget,
-                        name: if name.is_empty() { id } else { name },
+                        name: display_name,
+                        package_id: id,
                         current_version: if current_version.is_empty() {
                             "-".to_string()
                         } else {
@@ -3018,6 +4890,8 @@ fn parse_winget_tabular_entries(output: &str, upgradable: bool) -> Option<Vec<Pa
                         available_version: if upgradable { available_version } else { None },
                     });
                 }
+            } else if let Some(entry) = parse_winget_tabular_row_by_columns(line, upgradable) {
+                entries.push(entry);
             }
         }
 
@@ -3039,32 +4913,169 @@ fn parse_winget_tabular_entries(output: &str, upgradable: bool) -> Option<Vec<Pa
     }
 }
 
+fn infer_tabular_column_starts(separator_line: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut in_dash_run = false;
+
+    for (index, ch) in separator_line.chars().enumerate() {
+        if ch == '-' {
+            if !in_dash_run {
+                starts.push(index);
+                in_dash_run = true;
+            }
+        } else {
+            in_dash_run = false;
+        }
+    }
+
+    starts
+}
+
+fn parse_winget_tabular_row_by_columns(line: &str, upgradable: bool) -> Option<PackageListEntry> {
+    let columns = split_columns_by_spacing(line);
+    if upgradable {
+        if columns.len() < 4 {
+            return None;
+        }
+        let name = columns.first()?.to_string();
+        let id = columns.get(1)?.to_string();
+        let current_version = columns.get(2)?.to_string();
+        let available_version = columns.get(3)?.to_string();
+        if id.is_empty()
+            || !looks_like_version(&current_version)
+            || !looks_like_version(&available_version)
+        {
+            return None;
+        }
+        Some(PackageListEntry {
+            backend: Backend::Winget,
+            name,
+            package_id: id,
+            current_version: normalize_list_version(&current_version),
+            available_version: Some(normalize_list_version(&available_version)),
+        })
+    } else {
+        if columns.len() < 3 {
+            return None;
+        }
+        let name = columns.first()?.to_string();
+        let id = columns.get(1)?.to_string();
+        let current_version = columns.get(2)?.to_string();
+        if id.is_empty() || !looks_like_version(&current_version) {
+            return None;
+        }
+        Some(PackageListEntry {
+            backend: Backend::Winget,
+            name,
+            package_id: id,
+            current_version: normalize_list_version(&current_version),
+            available_version: None,
+        })
+    }
+}
+
+fn split_columns_by_spacing(line: &str) -> Vec<String> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut columns = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index].is_whitespace() {
+            let whitespace_start = index;
+            while index < chars.len() && chars[index].is_whitespace() {
+                index += 1;
+            }
+
+            if index - whitespace_start >= 2 {
+                let value = chars[start..whitespace_start]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !value.is_empty() {
+                    columns.push(value);
+                }
+                start = index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+
+    let tail = chars[start..].iter().collect::<String>().trim().to_string();
+    if !tail.is_empty() {
+        columns.push(tail);
+    }
+
+    columns
+}
+
 fn parse_scoop_list_entries(output: &str) -> Option<Vec<PackageListEntry>> {
     let mut entries = Vec::new();
+    let mut previous_line = "";
+    let mut dashed_header_seen = false;
+    let mut version_index = None;
+    let mut source_index = None;
+
     for line in output.lines() {
+        if !dashed_header_seen && line.contains("---") {
+            version_index = find_char_index(previous_line, "Version");
+            source_index = find_char_index(previous_line, "Source");
+            dashed_header_seen = true;
+            continue;
+        }
+
         let trimmed = line.trim();
         if trimmed.is_empty()
             || trimmed.starts_with("Installed apps")
             || trimmed.starts_with("Name")
             || trimmed.starts_with("---")
         {
+            previous_line = line;
             continue;
         }
 
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        let Some(version) = parts.last() else {
-            continue;
-        };
-        if parts.len() < 2 || !looks_like_version(version) {
-            return None;
+        if let (Some(version_index), Some(source_index)) = (version_index, source_index) {
+            let name = slice_chars(line, 0, version_index).trim().to_string();
+            let version = slice_chars(line, version_index, source_index)
+                .trim()
+                .to_string();
+
+            if !name.is_empty() && !version.is_empty() {
+                entries.push(PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: name.clone(),
+                    package_id: name,
+                    current_version: normalize_list_version(&version),
+                    available_version: None,
+                });
+            }
+        } else {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let Some(version_index) = parts.iter().position(|part| looks_like_version(part)) else {
+                previous_line = line;
+                continue;
+            };
+            if version_index == 0 {
+                return None;
+            }
+            let version = parts[version_index];
+            let name = parts[..version_index].join(" ");
+            if name.is_empty() {
+                return None;
+            }
+
+            entries.push(PackageListEntry {
+                backend: Backend::Scoop,
+                name: name.clone(),
+                package_id: name,
+                current_version: normalize_list_version(version),
+                available_version: None,
+            });
         }
 
-        entries.push(PackageListEntry {
-            backend: Backend::Scoop,
-            name: parts[..parts.len() - 1].join(" "),
-            current_version: normalize_list_version(version),
-            available_version: None,
-        });
+        previous_line = line;
     }
     Some(entries)
 }
@@ -3087,9 +5098,7 @@ fn parse_scoop_upgrade_entries(output: &str) -> Option<Vec<PackageListEntry>> {
         let latest = normalize_list_version(right.trim());
         let left = left.trim().trim_end_matches(':').trim();
         let parts: Vec<&str> = left.split_whitespace().collect();
-        let Some(current) = parts.last() else {
-            return None;
-        };
+        let current = parts.last()?;
         if parts.len() < 2 {
             return None;
         }
@@ -3097,6 +5106,10 @@ fn parse_scoop_upgrade_entries(output: &str) -> Option<Vec<PackageListEntry>> {
         entries.push(PackageListEntry {
             backend: Backend::Scoop,
             name: parts[..parts.len() - 1]
+                .join(" ")
+                .trim_end_matches(':')
+                .to_string(),
+            package_id: parts[..parts.len() - 1]
                 .join(" ")
                 .trim_end_matches(':')
                 .to_string(),
@@ -3118,12 +5131,11 @@ fn parse_choco_list_entries(output: &str) -> Option<Vec<PackageListEntry>> {
             continue;
         }
 
-        let Some((name, version)) = trimmed.split_once('|') else {
-            return None;
-        };
+        let (name, version) = trimmed.split_once('|')?;
         entries.push(PackageListEntry {
             backend: Backend::Chocolatey,
             name: name.trim().to_string(),
+            package_id: name.trim().to_string(),
             current_version: normalize_list_version(version.trim()),
             available_version: None,
         });
@@ -3151,6 +5163,7 @@ fn parse_choco_upgrade_entries(output: &str) -> Option<Vec<PackageListEntry>> {
         entries.push(PackageListEntry {
             backend: Backend::Chocolatey,
             name: parts[0].trim().to_string(),
+            package_id: parts[0].trim().to_string(),
             current_version: normalize_list_version(parts[1].trim()),
             available_version: Some(normalize_list_version(parts[2].trim())),
         });
@@ -3193,9 +5206,11 @@ fn parse_npm_list_entries(output: &str) -> Option<Vec<PackageListEntry>> {
 
         if trimmed.starts_with("\"version\"") {
             let version = extract_json_string_value_after_key(trimmed, 0, "\"version\"")?;
+            let name = current_name.take()?;
             entries.push(PackageListEntry {
                 backend: Backend::Npm,
-                name: current_name.take()?,
+                package_id: name.clone(),
+                name,
                 current_version: version,
                 available_version: None,
             });
@@ -3242,6 +5257,7 @@ fn parse_npm_upgrade_entries(output: &str) -> Option<Vec<PackageListEntry>> {
             let name = current_name.take()?;
             entries.push(PackageListEntry {
                 backend: Backend::Npm,
+                package_id: name.clone(),
                 name,
                 current_version: current_version.take().unwrap_or_else(|| "-".to_string()),
                 available_version: latest_version.take(),
@@ -3282,6 +5298,7 @@ fn parse_pip_json_entries(output: &str, upgradable: bool) -> Option<Vec<PackageL
         };
         entries.push(PackageListEntry {
             backend: Backend::Pip,
+            package_id: name.clone(),
             name,
             current_version: version,
             available_version: latest,
@@ -3610,21 +5627,6 @@ fn normalize_field_label(label: &str) -> String {
         .join(" ")
 }
 
-fn parse_pip_outdated_json_names(output: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut idx = 0usize;
-    while let Some(name_pos) = output[idx..].find("\"name\"") {
-        let start = idx + name_pos;
-        if let Some(name) = extract_json_string_value(output, start) {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        idx = start + 6;
-    }
-    names
-}
-
 fn dedupe_candidates(candidates: Vec<SearchCandidate>) -> Vec<SearchCandidate> {
     dedupe_search_candidates(candidates)
 }
@@ -3638,6 +5640,23 @@ fn dedupe_search_candidates(candidates: Vec<SearchCandidate>) -> Vec<SearchCandi
                     .install_id
                     .eq_ignore_ascii_case(&candidate.install_id)
                 && existing.source == candidate.source
+        }) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn dedupe_installed_candidates(candidates: Vec<SearchCandidate>) -> Vec<SearchCandidate> {
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        if !deduped.iter().any(|existing: &SearchCandidate| {
+            existing.backend == candidate.backend
+                && existing
+                    .install_id
+                    .eq_ignore_ascii_case(&candidate.install_id)
+                && existing.label.eq_ignore_ascii_case(&candidate.label)
+                && existing.version == candidate.version
         }) {
             deduped.push(candidate);
         }
@@ -3682,11 +5701,29 @@ fn search_match_rank(label: &str, install_id: &str, query: &str) -> u8 {
         return 3;
     }
 
-    if label == query || install_id == query {
+    let compact_query = compact_search_text(query);
+    let compact_label = compact_search_text(label);
+    let compact_install_id = compact_search_text(install_id);
+
+    if label == query
+        || install_id == query
+        || (!compact_query.is_empty()
+            && (compact_label == compact_query || compact_install_id == compact_query))
+    {
         0
-    } else if label.starts_with(query) || install_id.starts_with(query) {
+    } else if label.starts_with(query)
+        || install_id.starts_with(query)
+        || (!compact_query.is_empty()
+            && (compact_label.starts_with(&compact_query)
+                || compact_install_id.starts_with(&compact_query)))
+    {
         1
-    } else if label.contains(query) || install_id.contains(query) {
+    } else if label.contains(query)
+        || install_id.contains(query)
+        || (!compact_query.is_empty()
+            && (compact_label.contains(&compact_query)
+                || compact_install_id.contains(&compact_query)))
+    {
         2
     } else {
         3
@@ -3702,6 +5739,13 @@ fn backend_rank_for_search(backend: Backend, backends: &[Backend]) -> usize {
 
 fn normalize_search_text(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn compact_search_text(value: &str) -> String {
+    normalize_search_text(value)
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .collect()
 }
 
 fn extract_json_string_value_after_key(input: &str, start: usize, key: &str) -> Option<String> {
@@ -3846,14 +5890,15 @@ fn print_help() {
 {APP_NAME} {APP_VERSION}
 
 Usage:
-  {APP_NAME} [--backend <winget|scoop|choco|npm|pip>] [--config <path>] [--dry-run] [--json] [-y] <command> [args...]
+{APP_NAME} [--backend <winget|scoop|choco|npm|pip>] [--config <path>] [--dry-run] [--json] [--interactive] [--no-elevate] <command> [args...]
 
 Commands:
-  update                   Refresh package metadata where supported
-  upgrade [pkg...]         Upgrade all packages, or only the named packages
-  install <pkg...>         Install one or more packages
-  install --pick <query>   Search interactively across the selected/auto backends, then choose packages
-  remove <pkg...>          Uninstall one or more packages
+  update                   Refresh package metadata across all enabled+available backends in auto mode
+  upgrade [pkg...]         Preview available upgrades and choose packages interactively, or upgrade only the named packages on the selected backend
+  install <query...>       Search interactively across the selected/auto backends, then choose packages
+  install --exact <pkg...> Install one or more packages directly on the selected backend
+  remove <query...>        Search installed packages across the selected/auto backends, then choose packages to uninstall
+  remove --exact <pkg...>  Uninstall one or more packages directly on the selected backend
   hold [--off] <pkg...>    Add or remove an upgrade hold
   search <query...>        Search the selected backend, or all enabled+available backends in auto mode
   list [--upgradable]      List packages in a normalized table, using the selected backend or all enabled+available backends in auto mode
@@ -3862,7 +5907,7 @@ Commands:
   backend list             Same as `backends`
   backend enable <name>    Enable a backend in config
   backend disable <name>   Disable a backend in config
-  backend install <name>   Run a bootstrap install command when available
+  backend install <name>   Run a bootstrap install command when supported on this host
   backend default <name>   Set the default backend and enable it if needed
   backend default auto     Clear the explicit default and return to auto detection
 
@@ -3871,7 +5916,10 @@ Options:
       --config <path>      Load config from a custom path
       --dry-run            Print backend commands without executing them
       --json               Emit machine-readable JSON for `backends`, `backend ...`, and `show`
-  -y, --yes                Assume yes where the backend supports it
+  -y, --yes                Force non-interactive execution (default)
+      --interactive        Allow backend commands to prompt when supported
+      --elevate            Force automatic Windows elevation attempts
+      --no-elevate         Disable automatic Windows elevation attempts
   -h, --help               Show this help text
   -V, --version            Show version
 
@@ -3880,9 +5928,13 @@ Default config path:
 
 Examples:
   {APP_NAME} update
+  {APP_NAME} --interactive upgrade
   {APP_NAME} upgrade
-  {APP_NAME} install Git.Git
-  {APP_NAME} install --pick git
+  {APP_NAME} --backend winget upgrade
+  {APP_NAME} install git
+  {APP_NAME} install --exact Git.Git
+  {APP_NAME} remove git
+  {APP_NAME} remove --exact Git.Git
   {APP_NAME} hold --off Git.Git
   {APP_NAME} search powertoys
   {APP_NAME} list --upgradable
@@ -3944,7 +5996,7 @@ mod tests {
         assert_eq!(
             cli.command,
             Subcommand::Install {
-                mode: InstallMode::Packages(vec!["git".to_string()])
+                mode: InstallMode::Search("git".to_string())
             }
         );
     }
@@ -4021,6 +6073,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_interactive_and_no_elevate_globals() {
+        let cli = Cli::parse(
+            ["--interactive", "--no-elevate", "upgrade"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(cli.assume_yes, Some(false));
+        assert_eq!(cli.auto_elevate, Some(false));
+        assert_eq!(cli.command, Subcommand::Upgrade { packages: vec![] });
+    }
+
+    #[test]
     fn json_support_is_limited_to_show_outside_backend_commands() {
         assert!(command_supports_json(&Subcommand::Show {
             package: "requests".to_string(),
@@ -4034,7 +6100,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_interactive_install() {
+    fn parses_install_search_by_default() {
+        let cli = Cli::parse(
+            ["install", "visual", "studio"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Install {
+                mode: InstallMode::Search("visual studio".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_install_pick_alias() {
         let cli = Cli::parse(
             ["install", "--pick", "visual", "studio"]
                 .into_iter()
@@ -4045,7 +6128,64 @@ mod tests {
         assert_eq!(
             cli.command,
             Subcommand::Install {
-                mode: InstallMode::Pick("visual studio".to_string())
+                mode: InstallMode::Search("visual studio".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_install_exact_mode() {
+        let cli = Cli::parse(
+            ["install", "--exact", "Git.Git", "Microsoft.PowerToys"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Install {
+                mode: InstallMode::Exact(vec![
+                    "Git.Git".to_string(),
+                    "Microsoft.PowerToys".to_string()
+                ])
+            }
+        );
+    }
+
+    #[test]
+    fn parses_remove_search_by_default() {
+        let cli = Cli::parse(
+            ["remove", "visual", "studio"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Remove {
+                mode: RemoveMode::Search("visual studio".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_remove_exact_mode() {
+        let cli = Cli::parse(
+            ["remove", "--exact", "Git.Git", "Microsoft.PowerToys"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Remove {
+                mode: RemoveMode::Exact(vec![
+                    "Git.Git".to_string(),
+                    "Microsoft.PowerToys".to_string()
+                ])
             }
         );
     }
@@ -4073,8 +6213,308 @@ pip_user = true
         );
         assert_eq!(config.qualify_scoop_package("git"), "extras/git");
         assert!(config.pip_user);
+        assert!(config.auto_elevate);
         assert!(config.enable_winget);
         assert!(config.enable_pip);
+    }
+
+    #[test]
+    fn config_defaults_to_non_interactive_and_auto_elevate() {
+        let config = Config::default();
+
+        assert!(config.assume_yes);
+        assert!(config.auto_elevate);
+    }
+
+    #[test]
+    fn process_elevation_is_skipped_for_upgrade_preview_before_selection() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            config: &config,
+        };
+
+        let requires = command_requires_process_elevation(
+            &Subcommand::Upgrade { packages: vec![] },
+            Some(Backend::Winget),
+            &runtime,
+        )
+        .expect("elevation check should succeed");
+
+        assert!(!requires);
+    }
+
+    #[test]
+    fn process_elevation_is_skipped_for_install_search_before_selection() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            config: &config,
+        };
+
+        let requires = command_requires_process_elevation(
+            &Subcommand::Install {
+                mode: InstallMode::Search("git".to_string()),
+            },
+            None,
+            &runtime,
+        )
+        .expect("elevation check should succeed");
+
+        assert!(!requires);
+    }
+
+    #[test]
+    fn process_elevation_is_skipped_for_user_pip_installs() {
+        let config = Config {
+            pip_user: true,
+            ..Config::default()
+        };
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            config: &config,
+        };
+
+        let requires = command_requires_process_elevation(
+            &Subcommand::Install {
+                mode: InstallMode::Exact(vec!["requests".to_string()]),
+            },
+            Some(Backend::Pip),
+            &runtime,
+        )
+        .expect("elevation check should succeed");
+
+        assert!(!requires);
+    }
+
+    #[test]
+    fn backend_bootstrap_install_reports_when_elevation_is_needed() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            config: &config,
+        };
+
+        let requires = command_requires_process_elevation(
+            &Subcommand::Backend {
+                action: BackendAction::Install {
+                    backend: Backend::Chocolatey,
+                    enable: false,
+                },
+            },
+            None,
+            &runtime,
+        )
+        .expect("elevation check should succeed");
+
+        assert_eq!(requires, cfg!(windows));
+    }
+
+    #[test]
+    fn npm_and_pip_bootstrap_only_exist_on_windows_hosts() {
+        assert_eq!(
+            Backend::Npm.install_invocation(true).is_some(),
+            cfg!(windows)
+        );
+        assert_eq!(
+            Backend::Pip.install_invocation(true).is_some(),
+            cfg!(windows)
+        );
+    }
+
+    #[test]
+    fn elevated_child_command_redirects_stdout_and_stderr() {
+        let command = build_elevated_child_command(
+            OsStr::new(r"C:\Tools\waw.exe"),
+            &[OsString::from("upgrade"), OsString::from("--all")],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("Start-Process -FilePath 'C:\\Tools\\waw.exe'"));
+        assert!(command.contains("@('upgrade', '--all')"));
+        assert!(command.contains("-RedirectStandardOutput 'C:\\Temp\\waw.stdout.log'"));
+        assert!(command.contains("-RedirectStandardError 'C:\\Temp\\waw.stderr.log'"));
+        assert!(command.contains("chcp.com 65001 > $null"));
+        assert!(command.contains("exit $code"));
+    }
+
+    #[test]
+    fn elevated_child_command_tolerates_winget_uninstall_not_found() {
+        let command = build_elevated_child_command(
+            OsStr::new(r"C:\Users\fallingstar\AppData\Local\Microsoft\WindowsApps\winget.exe"),
+            &[
+                OsString::from("uninstall"),
+                OsString::from("--id"),
+                OsString::from("ARP\\User\\X64\\ProxyPilot"),
+                OsString::from("--exact"),
+            ],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("[uint32]$code -eq 0x800401F5"));
+    }
+
+    #[test]
+    fn elevated_wrapper_command_launches_hidden_admin_powershell() {
+        let command = build_elevated_wrapper_command(
+            "& 'C:\\Tools\\waw.exe' @('upgrade')",
+            OsStr::new(r"C:\Temp\waw.started"),
+            r"C:\Users\fallingstar\claudecode\waw",
+        );
+
+        assert!(command.contains("Start-Process -FilePath 'powershell'"));
+        assert!(command.contains("-Verb RunAs"));
+        assert!(command.contains("-WindowStyle Hidden"));
+        assert!(command.contains("Set-Content -LiteralPath 'C:\\Temp\\waw.started'"));
+        assert!(command.contains("$proc.WaitForExit()"));
+    }
+
+    #[test]
+    fn elevated_batch_command_runs_each_invocation_and_redirects_logs() {
+        let command = build_elevated_batch_command(
+            &[
+                Invocation::owned("winget", vec!["upgrade".to_string(), "--all".to_string()]),
+                Invocation::owned(
+                    "npm.cmd",
+                    vec!["update".to_string(), "--global".to_string()],
+                ),
+            ],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("& {"));
+        assert!(command.contains("& 'winget' @('upgrade', '--all')"));
+        assert!(command.contains("& 'npm.cmd' @('update', '--global')"));
+        assert!(command.contains("chcp.com 65001 > $null"));
+        assert!(
+            command
+                .contains("[Console]::Error.WriteLine('WAW_ELEVATED_STEP:winget upgrade --all')")
+        );
+        assert!(command.contains(
+            "[Console]::Error.WriteLine('WAW_ELEVATED_FAILURE:winget upgrade --all:' + $code)"
+        ));
+        assert!(command.contains("1>> 'C:\\Temp\\waw.stdout.log'"));
+        assert!(command.contains("2>> 'C:\\Temp\\waw.stderr.log'"));
+    }
+
+    #[test]
+    fn elevated_batch_command_tolerates_winget_uninstall_not_found() {
+        let command = build_elevated_batch_command(
+            &[Invocation::owned(
+                "winget",
+                vec![
+                    "uninstall".to_string(),
+                    "--id".to_string(),
+                    "ARP\\User\\X64\\ProxyPilot".to_string(),
+                    "--exact".to_string(),
+                ],
+            )],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("[uint32]$code -eq 0x800401F5"));
+    }
+
+    #[test]
+    fn decode_capture_text_handles_utf16le_with_bom() {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(utf16le_bytes("winget upgrade\r\n"));
+
+        assert_eq!(decode_capture_text(&bytes, false), "winget upgrade\r\n");
+        assert_eq!(decode_capture_text(&bytes, true), "winget upgrade\r\n");
+    }
+
+    #[test]
+    fn decode_capture_text_handles_utf16le_without_bom() {
+        let bytes = utf16le_bytes("source update\r\n");
+
+        assert_eq!(decode_capture_text(&bytes, false), "source update\r\n");
+        assert_eq!(decode_capture_text(&bytes, true), "source update\r\n");
+    }
+
+    #[test]
+    fn decode_capture_text_defers_incomplete_utf8_until_final_chunk() {
+        let bytes = vec![b'o', b'k', b' ', 0xE4, 0xB8];
+
+        assert_eq!(decode_capture_text(&bytes, false), "ok ");
+        assert_eq!(decode_capture_text(&bytes, true), "ok �");
+    }
+
+    #[test]
+    fn parse_elevated_failure_extracts_latest_failure_marker() {
+        let stderr_log = concat!(
+            "warning output\r\n",
+            "WAW_ELEVATED_STEP:winget upgrade --all\r\n",
+            "WAW_ELEVATED_FAILURE:winget upgrade --all:5\r\n",
+            "WAW_ELEVATED_STEP:npm.cmd update --global\r\n",
+            "WAW_ELEVATED_FAILURE:npm.cmd update --global:17\r\n"
+        );
+
+        assert_eq!(
+            parse_elevated_failure(stderr_log),
+            Some(("npm.cmd update --global".to_string(), 17))
+        );
+    }
+
+    #[test]
+    fn parse_elevated_failure_handles_utf16le_capture_logs() {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(utf16le_bytes(
+            "WAW_ELEVATED_FAILURE:winget upgrade --all:7\r\n",
+        ));
+        let stderr_log = decode_capture_text(&bytes, true);
+
+        assert_eq!(
+            parse_elevated_failure(&stderr_log),
+            Some(("winget upgrade --all".to_string(), 7))
+        );
+    }
+
+    #[test]
+    fn parse_elevated_failure_accepts_unsigned_windows_exit_code() {
+        assert_eq!(
+            parse_elevated_failure(
+                "WAW_ELEVATED_FAILURE:winget uninstall --id ProxyPilot:2147746293\r\n"
+            ),
+            Some(("winget uninstall --id ProxyPilot".to_string(), -2147221003))
+        );
+    }
+
+    #[test]
+    fn visible_elevated_stderr_strips_internal_markers() {
+        let stderr_log = concat!(
+            "WAW_ELEVATED_STEP:winget upgrade --all\r\n",
+            "real stderr line\r\n",
+            "WAW_ELEVATED_FAILURE:winget upgrade --all:9\r\n"
+        );
+
+        assert_eq!(visible_elevated_stderr(stderr_log), "real stderr line\n");
+    }
+
+    #[test]
+    fn format_elevated_batch_failure_prefers_precise_failure_marker() {
+        let stderr_log = "WAW_ELEVATED_FAILURE:winget upgrade --all:9\r\n";
+
+        assert_eq!(
+            format_elevated_batch_failure(1, stderr_log),
+            "backend command failed with exit code 9: winget upgrade --all"
+        );
+    }
+
+    #[test]
+    fn format_elevated_batch_failure_falls_back_without_marker() {
+        assert_eq!(
+            format_elevated_batch_failure(13, "plain stderr output"),
+            "one or more elevated backend commands failed with exit code 13"
+        );
     }
 
     #[test]
@@ -4082,24 +6522,80 @@ pip_user = true
         let config = Config::default();
         let runtime = RuntimeSettings {
             assume_yes: false,
+            auto_elevate: true,
             config: &config,
         };
         let plan = Backend::Winget
             .plan(&Subcommand::Upgrade { packages: vec![] }, &runtime)
             .expect("plan should build");
 
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
+        assert_eq!(plan[0].requires_elevation, cfg!(windows));
         assert_eq!(
-            plan,
-            vec![Invocation::owned(
-                "winget",
-                vec![
-                    "upgrade".to_string(),
-                    "--all".to_string(),
-                    "--include-unknown".to_string(),
-                    "--accept-source-agreements".to_string(),
-                    "--accept-package-agreements".to_string(),
-                ],
-            )]
+            plan[0].args,
+            vec![
+                "upgrade".to_string(),
+                "--all".to_string(),
+                "--include-unknown".to_string(),
+                "--accept-source-agreements".to_string(),
+                "--accept-package-agreements".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn winget_upgrade_all_with_yes_is_non_interactive() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            config: &config,
+        };
+        let plan = Backend::Winget
+            .plan(&Subcommand::Upgrade { packages: vec![] }, &runtime)
+            .expect("plan should build");
+
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
+        assert!(plan[0].args.contains(&"--silent".to_string()));
+        assert!(
+            plan[0]
+                .args
+                .contains(&"--disable-interactivity".to_string())
+        );
+    }
+
+    #[test]
+    fn winget_remove_target_with_version_uses_version_flag() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            config: &config,
+        };
+        let plan = Backend::Winget.plan_remove(
+            &[RemoveTarget {
+                package: "Posit.Quarto".to_string(),
+                version: Some("1.8.26".to_string()),
+            }],
+            &runtime,
+        );
+
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
+        assert_eq!(
+            plan[0].args,
+            vec![
+                "uninstall".to_string(),
+                "--id".to_string(),
+                "Posit.Quarto".to_string(),
+                "--exact".to_string(),
+                "--version".to_string(),
+                "1.8.26".to_string(),
+                "--silent".to_string(),
+                "--disable-interactivity".to_string(),
+            ]
         );
     }
 
@@ -4111,6 +6607,7 @@ pip_user = true
         };
         let runtime = RuntimeSettings {
             assume_yes: false,
+            auto_elevate: true,
             config: &config,
         };
         let plan = Backend::Winget
@@ -4122,17 +6619,16 @@ pip_user = true
             )
             .expect("plan should build");
 
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
         assert_eq!(
-            plan,
-            vec![Invocation::owned(
-                "winget",
-                vec![
-                    "search".to_string(),
-                    "git".to_string(),
-                    "--source".to_string(),
-                    "winget".to_string(),
-                ],
-            )]
+            plan[0].args,
+            vec![
+                "search".to_string(),
+                "git".to_string(),
+                "--source".to_string(),
+                "winget".to_string(),
+            ]
         );
     }
 
@@ -4144,23 +6640,23 @@ pip_user = true
         };
         let runtime = RuntimeSettings {
             assume_yes: false,
+            auto_elevate: true,
             config: &config,
         };
         let plan = Backend::Scoop
             .plan(
                 &Subcommand::Install {
-                    mode: InstallMode::Packages(vec!["git".to_string()]),
+                    mode: InstallMode::Exact(vec!["git".to_string()]),
                 },
                 &runtime,
             )
             .expect("plan should build");
 
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["scoop", "scoop.cmd", "scoop.ps1"]);
         assert_eq!(
-            plan,
-            vec![Invocation::owned(
-                "scoop",
-                vec!["install".to_string(), "extras/git".to_string()],
-            )]
+            plan[0].args,
+            vec!["install".to_string(), "extras/git".to_string()]
         );
     }
 
@@ -4169,6 +6665,7 @@ pip_user = true
         let config = Config::default();
         let runtime = RuntimeSettings {
             assume_yes: false,
+            auto_elevate: true,
             config: &config,
         };
         let plan = Backend::Chocolatey
@@ -4181,17 +6678,16 @@ pip_user = true
             )
             .expect("plan should build");
 
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["choco", "choco.exe", "choco.bat"]);
         assert_eq!(
-            plan,
-            vec![Invocation::owned(
-                "choco",
-                vec![
-                    "pin".to_string(),
-                    "add".to_string(),
-                    "--name".to_string(),
-                    "git".to_string(),
-                ],
-            )]
+            plan[0].args,
+            vec![
+                "pin".to_string(),
+                "add".to_string(),
+                "--name".to_string(),
+                "git".to_string(),
+            ]
         );
     }
 
@@ -4199,6 +6695,36 @@ pip_user = true
     fn parses_selection_ranges_and_deduplicates() {
         let selected = parse_selection("1 3-4 4,2", 5).expect("selection should parse");
         assert_eq!(selected, vec![1, 3, 4, 2]);
+    }
+
+    #[test]
+    fn package_list_query_matches_across_multiple_fields() {
+        let entry = PackageListEntry {
+            backend: Backend::Scoop,
+            name: "QQ NT".to_string(),
+            package_id: "qq-nt".to_string(),
+            current_version: "9.9.29".to_string(),
+            available_version: Some("9.9.30".to_string()),
+        };
+
+        assert!(package_list_entry_matches_query(&entry, "qq"));
+        assert!(package_list_entry_matches_query(&entry, "qq nt"));
+        assert!(package_list_entry_matches_query(&entry, "qqnt"));
+        assert!(package_list_entry_matches_query(&entry, "scoop qq"));
+        assert!(package_list_entry_matches_query(&entry, "9.9.29"));
+        assert!(package_list_entry_matches_query(&entry, "9.9.30"));
+        assert!(!package_list_entry_matches_query(&entry, "winget"));
+        assert!(!package_list_entry_matches_query(&entry, "telegram"));
+    }
+
+    #[test]
+    fn compact_search_rank_matches_separator_insensitive_queries() {
+        assert_eq!(search_match_rank("qq nt", "qq-nt", "qqnt"), 0);
+        assert_eq!(search_match_rank("qq music", "qq-music", "qqmu"), 1);
+        assert_eq!(
+            search_match_rank("lite loader", "liteloader-qqnt", "qqnt"),
+            2
+        );
     }
 
     #[test]
@@ -4286,6 +6812,100 @@ Microsoft PowerToys          Microsoft.PowerToys          0.90.1  winget\n";
     }
 
     #[test]
+    fn parses_winget_search_candidates_from_single_spaced_rows() {
+        let output = "\
+Name Id Version Source\n\
+----------------------\n\
+Git Git.Git 2.45 winget\n\
+";
+
+        let candidates = Backend::Winget.parse_search_candidates(output);
+
+        assert_eq!(
+            candidates,
+            vec![SearchCandidate {
+                backend: Backend::Winget,
+                label: "Git".to_string(),
+                install_id: "Git.Git".to_string(),
+                version: Some("2.45".to_string()),
+                source: Some("winget".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_winget_search_candidates_with_match_column() {
+        let output = "\
+Name                         Id                           Version Match        Source\n\
+-----------------------------------------------------------------------------------\n\
+Git                          Git.Git                      2.47.1  Moniker: git winget\n\
+";
+
+        let candidates = Backend::Winget.parse_search_candidates(output);
+
+        assert_eq!(
+            candidates,
+            vec![SearchCandidate {
+                backend: Backend::Winget,
+                label: "Git".to_string(),
+                install_id: "Git.Git".to_string(),
+                version: Some("2.47.1".to_string()),
+                source: Some("winget".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_winget_installed_list_with_localized_headers() {
+        let output = "\
+名称                         标识符                         版本     源\n\
+-----------------------------------------------------------------------\n\
+Git                          Git.Git                        2.47.1   winget\n\
+Microsoft PowerToys          Microsoft.PowerToys            0.90.1   winget\n\
+";
+
+        assert_eq!(
+            Backend::Winget.parse_list_entries(false, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Winget,
+                    name: "Git".to_string(),
+                    package_id: "Git.Git".to_string(),
+                    current_version: "2.47.1".to_string(),
+                    available_version: None,
+                },
+                PackageListEntry {
+                    backend: Backend::Winget,
+                    name: "Microsoft PowerToys".to_string(),
+                    package_id: "Microsoft.PowerToys".to_string(),
+                    current_version: "0.90.1".to_string(),
+                    available_version: None,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_winget_upgrade_list_with_localized_headers() {
+        let output = "\
+名称                         标识符                         版本     可用     源\n\
+--------------------------------------------------------------------------------\n\
+Git                          Git.Git                        2.47.1   2.48.0   winget\n\
+";
+
+        assert_eq!(
+            Backend::Winget.parse_list_entries(true, output),
+            Some(vec![PackageListEntry {
+                backend: Backend::Winget,
+                name: "Git".to_string(),
+                package_id: "Git.Git".to_string(),
+                current_version: "2.47.1".to_string(),
+                available_version: Some("2.48.0".to_string()),
+            }])
+        );
+    }
+
+    #[test]
     fn parses_npm_search_candidates_from_warning_prefixed_array() {
         let output = r#"npm warn config global
 [
@@ -4363,12 +6983,14 @@ Microsoft PowerToys          Microsoft.PowerToys          0.90.1  winget\n";
                 PackageListEntry {
                     backend: Backend::Npm,
                     name: "@openai/codex".to_string(),
+                    package_id: "@openai/codex".to_string(),
                     current_version: "0.121.0".to_string(),
                     available_version: None,
                 },
                 PackageListEntry {
                     backend: Backend::Npm,
                     name: "npm".to_string(),
+                    package_id: "npm".to_string(),
                     current_version: "11.12.1".to_string(),
                     available_version: None,
                 }
@@ -4397,12 +7019,14 @@ Microsoft PowerToys          Microsoft.PowerToys          0.90.1  winget\n";
                 PackageListEntry {
                     backend: Backend::Npm,
                     name: "@openai/codex".to_string(),
+                    package_id: "@openai/codex".to_string(),
                     current_version: "0.118.0".to_string(),
                     available_version: Some("0.121.0".to_string()),
                 },
                 PackageListEntry {
                     backend: Backend::Npm,
                     name: "happy-coder".to_string(),
+                    package_id: "happy-coder".to_string(),
                     current_version: "0.13.0".to_string(),
                     available_version: Some("0.13.1".to_string()),
                 }
@@ -4423,13 +7047,81 @@ Microsoft PowerToys          Microsoft.PowerToys          0.90.1  winget\n";
                 PackageListEntry {
                     backend: Backend::Pip,
                     name: "certifi".to_string(),
+                    package_id: "certifi".to_string(),
                     current_version: "2026.2.25".to_string(),
                     available_version: None,
                 },
                 PackageListEntry {
                     backend: Backend::Pip,
                     name: "pip".to_string(),
+                    package_id: "pip".to_string(),
                     current_version: "26.0".to_string(),
+                    available_version: None,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_scoop_installed_list_with_source_column() {
+        let output = "\
+Installed apps:
+
+Name    Version  Source  Updated             Info
+----    -------  ------  -------             ----
+git     2.49.0   main    2026-04-17 13:00:00
+neovim  0.10.4   extras  2026-04-16 10:30:00
+";
+
+        assert_eq!(
+            Backend::Scoop.parse_list_entries(false, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: "git".to_string(),
+                    package_id: "git".to_string(),
+                    current_version: "2.49.0".to_string(),
+                    available_version: None,
+                },
+                PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: "neovim".to_string(),
+                    package_id: "neovim".to_string(),
+                    current_version: "0.10.4".to_string(),
+                    available_version: None,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_scoop_installed_list_ignoring_failed_rows() {
+        let output = "\
+Installed apps:
+
+Name         Version      Source Updated             Info
+----         -------      ------ -------             ----
+7zip         26.00        main   2026-04-16 10:54:56
+flclash                          2025-03-19 21:36:37 Install failed
+git          2.53.0.3     main   2026-04-16 12:13:01
+telegram                         2025-02-18 15:42:10 Install failed
+";
+
+        assert_eq!(
+            Backend::Scoop.parse_list_entries(false, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: "7zip".to_string(),
+                    package_id: "7zip".to_string(),
+                    current_version: "26.00".to_string(),
+                    available_version: None,
+                },
+                PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: "git".to_string(),
+                    package_id: "git".to_string(),
+                    current_version: "2.53.0.3".to_string(),
                     available_version: None,
                 }
             ])
@@ -4452,6 +7144,7 @@ Microsoft PowerToys          Microsoft.PowerToys          0.90.1  winget\n";
             Some(vec![PackageListEntry {
                 backend: Backend::Pip,
                 name: "pip".to_string(),
+                package_id: "pip".to_string(),
                 current_version: "26.0".to_string(),
                 available_version: Some("26.0.1".to_string()),
             }])
@@ -4575,6 +7268,53 @@ published over a year ago by swaagie <martijn@swaagman.online>
                     install_id: "requests".to_string(),
                     version: None,
                     source: Some("pypi".to_string()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn installed_candidate_deduping_preserves_distinct_versions() {
+        let candidates = dedupe_installed_candidates(vec![
+            SearchCandidate {
+                backend: Backend::Winget,
+                label: "Quarto".to_string(),
+                install_id: "Posit.Quarto".to_string(),
+                version: Some("1.8.0".to_string()),
+                source: None,
+            },
+            SearchCandidate {
+                backend: Backend::Winget,
+                label: "Quarto".to_string(),
+                install_id: "Posit.Quarto".to_string(),
+                version: Some("1.9.37".to_string()),
+                source: None,
+            },
+            SearchCandidate {
+                backend: Backend::Winget,
+                label: "Quarto".to_string(),
+                install_id: "Posit.Quarto".to_string(),
+                version: Some("1.9.37".to_string()),
+                source: None,
+            },
+        ]);
+
+        assert_eq!(
+            candidates,
+            vec![
+                SearchCandidate {
+                    backend: Backend::Winget,
+                    label: "Quarto".to_string(),
+                    install_id: "Posit.Quarto".to_string(),
+                    version: Some("1.8.0".to_string()),
+                    source: None,
+                },
+                SearchCandidate {
+                    backend: Backend::Winget,
+                    label: "Quarto".to_string(),
+                    install_id: "Posit.Quarto".to_string(),
+                    version: Some("1.9.37".to_string()),
+                    source: None,
                 }
             ]
         );
@@ -4745,6 +7485,7 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
         let config = Config::default();
         let runtime = RuntimeSettings {
             assume_yes: false,
+            auto_elevate: true,
             config: &config,
         };
         let plan = Backend::Pip
@@ -4791,6 +7532,77 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
         assert!(json.contains("\"default_selected\":true"));
         assert!(json.contains("\"backend\":\"choco\""));
         assert!(json.contains("\"enabled\":false"));
+    }
+
+    #[test]
+    fn finds_programs_on_path_using_explicit_file_names() {
+        let base = env::temp_dir().join(format!(
+            "waw-path-discovery-{}-{}",
+            std::process::id(),
+            APP_VERSION
+        ));
+        fs::create_dir_all(&base).expect("temp directory should exist");
+        let program = base.join("winget.exe");
+        fs::write(&program, b"").expect("program marker should be written");
+
+        let joined = env::join_paths([base.as_path()]).expect("PATH should be buildable");
+        let found = find_programs_on_path(Some(joined.as_os_str()), &["winget.exe"]);
+
+        assert_eq!(found, vec![program.display().to_string()]);
+
+        fs::remove_dir_all(&base).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn windows_apps_alias_path_without_real_file_is_not_discovered() {
+        let base = env::temp_dir().join(format!(
+            "waw-windowsapps-alias-{}-{}",
+            std::process::id(),
+            APP_VERSION
+        ));
+        let alias_dir = base.join("Microsoft").join("WindowsApps");
+        fs::create_dir_all(&alias_dir).expect("alias directory should exist");
+
+        let joined = env::join_paths([alias_dir.as_path()]).expect("PATH should be buildable");
+        let found = find_programs_on_path(Some(joined.as_os_str()), &["winget.exe"]);
+
+        assert!(found.is_empty());
+
+        fs::remove_dir_all(&base).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn pip_probe_args_choose_python_module_mode_for_python_launchers() {
+        assert_eq!(
+            pip_probe_args(r"C:\Python313\python.exe"),
+            vec!["-m".to_string(), "pip".to_string(), "--version".to_string()]
+        );
+        assert_eq!(
+            pip_probe_args("py.exe"),
+            vec!["-m".to_string(), "pip".to_string(), "--version".to_string()]
+        );
+        assert_eq!(
+            pip_probe_args(r"C:\Python313\Scripts\pip.exe"),
+            vec!["--version"]
+        );
+    }
+
+    fn assert_program_matches(program: &str, expected_suffixes: &[&str]) {
+        let normalized = program.replace('\\', "/").to_ascii_lowercase();
+        assert!(
+            expected_suffixes.iter().any(|suffix| {
+                let suffix = suffix.replace('\\', "/").to_ascii_lowercase();
+                normalized == suffix || normalized.ends_with(&format!("/{suffix}"))
+            }),
+            "program `{program}` did not match any expected suffix: {expected_suffixes:?}"
+        );
+    }
+
+    fn utf16le_bytes(value: &str) -> Vec<u8> {
+        value
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
     }
 
     #[test]
