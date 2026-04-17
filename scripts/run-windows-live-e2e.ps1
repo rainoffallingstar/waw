@@ -224,28 +224,28 @@ $cases = @(
     @{
         Backend = "winget"
         Package = "jqlang.jq"
-        VerifyPattern = "(?mi)^\s*(jq|jqlang\.jq)\s+"
+        VerifyPattern = "(?mi)^\s*winget\s+(jq|jqlang\.jq)\s+"
         SkipListVerification = $true
     },
     @{
         Backend = "scoop"
         Package = "jq"
-        VerifyPattern = "(?mi)^\s*jq\s+"
+        VerifyPattern = "(?mi)^\s*scoop\s+jq\s+"
     },
     @{
         Backend = "choco"
         Package = "jq"
-        VerifyPattern = "(?mi)^\s*jq\s+"
+        VerifyPattern = "(?mi)^\s*choco\s+jq\s+"
     },
     @{
         Backend = "npm"
         Package = "cowsay"
-        VerifyPattern = "(?mi)^\s*cowsay\s+"
+        VerifyPattern = "(?mi)^\s*npm\s+cowsay\s+"
     },
     @{
         Backend = "pip"
         Package = "pyfiglet"
-        VerifyPattern = "(?mi)^\s*pyfiglet\s+"
+        VerifyPattern = "(?mi)^\s*pip\s+pyfiglet\s+"
     }
 )
 
