@@ -44,8 +44,36 @@ function Invoke-Waw {
 
     $fullArgs = @("--config", $script:ConfigPath, "--no-elevate") + $Arguments
     Write-Host "waw $($fullArgs -join ' ')" -ForegroundColor Cyan
-    $output = & $script:WawBinary @fullArgs 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
+    $stdoutPath = Join-Path $tempRoot ([guid]::NewGuid().ToString() + ".stdout.log")
+    $stderrPath = Join-Path $tempRoot ([guid]::NewGuid().ToString() + ".stderr.log")
+
+    try {
+        $process = Start-Process `
+            -FilePath $script:WawBinary `
+            -ArgumentList $fullArgs `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+
+        $stdout = if (Test-Path -LiteralPath $stdoutPath) {
+            Get-Content -LiteralPath $stdoutPath -Raw
+        } else {
+            ""
+        }
+        $stderr = if (Test-Path -LiteralPath $stderrPath) {
+            Get-Content -LiteralPath $stderrPath -Raw
+        } else {
+            ""
+        }
+        $output = ($stdout + $stderr)
+        $exitCode = $process.ExitCode
+    }
+    finally {
+        Remove-Item -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+    }
 
     if (-not $AllowFailure -and $exitCode -ne 0) {
         throw "waw failed with exit code ${exitCode}:`n$output"
