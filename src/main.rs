@@ -2345,7 +2345,7 @@ impl Backend {
                     "iwr -useb get.scoop.sh | iex".to_string(),
                 ],
             )
-            .with_elevation(cfg!(windows))),
+            .with_elevation(false)),
             Self::Chocolatey => Some(Invocation::owned(
                 "powershell",
                 vec![
@@ -4058,8 +4058,9 @@ fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
         capture.stdout_path.as_os_str(),
         capture.stderr_path.as_os_str(),
     );
+    write_powershell_script(&capture.script_path, &inner_command)?;
     let wrapper_command = build_elevated_wrapper_command(
-        &inner_command,
+        capture.script_path.as_os_str(),
         capture.started_path.as_os_str(),
         &working_directory,
     );
@@ -4097,8 +4098,9 @@ fn run_elevated_program(
         capture.stdout_path.as_os_str(),
         capture.stderr_path.as_os_str(),
     );
+    write_powershell_script(&capture.script_path, &inner_command)?;
     let wrapper_command = build_elevated_wrapper_command(
-        &inner_command,
+        capture.script_path.as_os_str(),
         capture.started_path.as_os_str(),
         &working_directory,
     );
@@ -4209,6 +4211,7 @@ struct ElevationCapture {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     started_path: PathBuf,
+    script_path: PathBuf,
 }
 
 impl ElevationCapture {
@@ -4218,6 +4221,7 @@ impl ElevationCapture {
             stdout_path: base.with_extension("stdout.log"),
             stderr_path: base.with_extension("stderr.log"),
             started_path: base.with_extension("started"),
+            script_path: base.with_extension("ps1"),
         })
     }
 
@@ -4225,6 +4229,7 @@ impl ElevationCapture {
         let _ = fs::remove_file(&self.stdout_path);
         let _ = fs::remove_file(&self.stderr_path);
         let _ = fs::remove_file(&self.started_path);
+        let _ = fs::remove_file(&self.script_path);
     }
 }
 
@@ -4323,8 +4328,15 @@ fn is_winget_uninstall_command_os(program: &str, args: &[String]) -> bool {
     program.contains("winget") && args.first().map(String::as_str) == Some("uninstall")
 }
 
+fn write_powershell_script(path: &Path, content: &str) -> Result<(), String> {
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(content.as_bytes());
+    fs::write(path, bytes)
+        .map_err(|error| format!("failed to write elevated PowerShell script: {error}"))
+}
+
 fn build_elevated_wrapper_command(
-    child_command: &str,
+    script_path: &OsStr,
     started_path: &OsStr,
     working_directory: &str,
 ) -> String {
@@ -4332,14 +4344,14 @@ fn build_elevated_wrapper_command(
         concat!(
             "$ErrorActionPreference = 'Stop'; ",
             "$proc = Start-Process -FilePath 'powershell' ",
-            "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', '{}') ",
+            "-ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', '{}') ",
             "-WorkingDirectory '{}' -Verb RunAs -WindowStyle Hidden -PassThru; ",
             "Set-Content -LiteralPath '{}' -Value 'started' -NoNewline; ",
             "$proc.WaitForExit(); ",
             "$proc.Refresh(); ",
             "exit $proc.ExitCode"
         ),
-        escape_powershell_single_quoted(child_command),
+        escape_powershell_single_quoted_os(script_path),
         escape_powershell_single_quoted(working_directory),
         escape_powershell_single_quoted_os(started_path),
     )
@@ -6327,6 +6339,15 @@ pip_user = true
     }
 
     #[test]
+    fn scoop_bootstrap_does_not_require_elevation() {
+        let invocation = Backend::Scoop
+            .install_invocation(true)
+            .expect("scoop bootstrap should be available on windows hosts");
+
+        assert!(!invocation.requires_elevation);
+    }
+
+    #[test]
     fn elevated_child_command_redirects_stdout_and_stderr() {
         let command = build_elevated_child_command(
             OsStr::new(r"C:\Tools\waw.exe"),
@@ -6363,16 +6384,37 @@ pip_user = true
     #[test]
     fn elevated_wrapper_command_launches_hidden_admin_powershell() {
         let command = build_elevated_wrapper_command(
-            "& 'C:\\Tools\\waw.exe' @('upgrade')",
+            OsStr::new(r"C:\Temp\elevated-script.ps1"),
             OsStr::new(r"C:\Temp\waw.started"),
             r"C:\Users\fallingstar\claudecode\waw",
         );
 
         assert!(command.contains("Start-Process -FilePath 'powershell'"));
+        assert!(
+            command
+                .contains("-ExecutionPolicy', 'Bypass', '-File', 'C:\\Temp\\elevated-script.ps1'")
+        );
         assert!(command.contains("-Verb RunAs"));
         assert!(command.contains("-WindowStyle Hidden"));
         assert!(command.contains("Set-Content -LiteralPath 'C:\\Temp\\waw.started'"));
         assert!(command.contains("$proc.WaitForExit()"));
+    }
+
+    #[test]
+    fn write_powershell_script_writes_utf8_bom() {
+        let path = env::temp_dir().join(format!(
+            "waw-elevated-script-test-{}-{}.ps1",
+            std::process::id(),
+            APP_VERSION
+        ));
+
+        write_powershell_script(&path, "Write-Host 'hello'").expect("script should be written");
+        let bytes = fs::read(&path).expect("script should be readable");
+
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert!(String::from_utf8_lossy(&bytes[3..]).contains("Write-Host 'hello'"));
+
+        fs::remove_file(&path).expect("script should be removed");
     }
 
     #[test]
