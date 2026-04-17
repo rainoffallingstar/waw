@@ -1,7 +1,14 @@
 # waw
 
-`waw` is a Rust command-line package manager frontend for Windows-style workflows.
-It exposes an `apt-get`-like interface while delegating work to:
+> 📦 A Rust package manager frontend for Windows-style workflows.
+>
+> `waw` exposes an `apt-get`-like CLI while delegating work to `winget`, `scoop`, `choco`, `npm`, and `pip`.
+
+It was originally prototyped from the Rust version built during the UniGetUI-inspired work, and is now structured as its own standalone repository.
+
+## ✨ Overview
+
+`waw` aims to make day-to-day package management feel consistent across multiple backends:
 
 - `winget`
 - `scoop`
@@ -9,9 +16,9 @@ It exposes an `apt-get`-like interface while delegating work to:
 - `npm`
 - `pip`
 
-It was originally prototyped from the Rust version built during the UniGetUI-inspired work, and is now structured as its own standalone repository.
+## 🧰 Commands
 
-## Commands
+### Core commands
 
 - `update`
 - `upgrade`
@@ -22,6 +29,9 @@ It was originally prototyped from the Rust version built during the UniGetUI-ins
 - `search`
 - `list`
 - `show`
+
+### Backend commands
+
 - `backends`
 - `backend list`
 - `backend enable`
@@ -29,13 +39,13 @@ It was originally prototyped from the Rust version built during the UniGetUI-ins
 - `backend install`
 - `backend default`
 
-## Usage
+## 🚀 Usage
 
 ```text
 waw [--backend <winget|scoop|choco|npm|pip>] [--config <path>] [--dry-run] [--json] [--interactive] [--no-elevate] <command> [args...]
 ```
 
-Examples:
+### Quick examples
 
 ```powershell
 waw update
@@ -43,6 +53,7 @@ waw --interactive upgrade
 waw upgrade
 waw install git
 waw install --exact Git.Git
+waw remove quarto
 waw search requests
 waw list --upgradable
 waw show pip
@@ -52,7 +63,7 @@ waw backend enable pip
 waw backend default auto
 ```
 
-## Features
+## 🌟 Features
 
 - Auto-detects enabled and available backends.
 - Runs `update` and full-system `upgrade` across all enabled and available backends in auto mode.
@@ -61,23 +72,27 @@ waw backend default auto
 - Defers `install <query>` elevation until after package selection, then performs a single elevated install pass when needed.
 - Uses interactive `yay`-style selection as the default `install` behavior.
 - Preserves direct package installation via `install --exact`.
+- Uses interactive installed-package selection for `remove`.
+- Supports version-aware uninstall planning for backends such as `winget`.
 - Aggregates `search` across multiple enabled backends in auto mode.
 - Normalizes `list` output into a combined table when possible.
 - Normalizes `show` output into structured package details.
 - Renders multi-backend `show` results as a comparison view.
 - Supports machine-readable JSON output for backend management and `show`.
 
-`backend install <name>` is a bootstrap helper. It is currently supported only where this project has a host-specific bootstrap path, which today means Windows-oriented flows for `scoop`, `choco`, `npm`, and `pip`.
+> 🛠️ `backend install <name>` is a bootstrap helper.
+>
+> It is currently supported only where this project has a host-specific bootstrap path, which today means Windows-oriented flows for `scoop`, `choco`, `npm`, and `pip`.
 
-## Config
+## ⚙️ Config
 
-Default config paths:
+### Default config paths
 
 - Windows: `%APPDATA%\waw\config.toml`
 - Linux/macOS: `$XDG_CONFIG_HOME/waw/config.toml`
 - Fallback: `$HOME/.config/waw/config.toml`
 
-Supported keys:
+### Supported keys
 
 ```toml
 backend = "winget"
@@ -94,7 +109,7 @@ enable_npm = true
 enable_pip = true
 ```
 
-## Backend Command Overrides
+## 🔌 Backend Command Overrides
 
 For testing, CI, or custom installations, you can override the executable used for each backend:
 
@@ -106,9 +121,11 @@ $env:WAW_NPM_CMD = "C:\Program Files\nodejs\npm.cmd"
 $env:WAW_PYTHON_CMD = "C:\Python313\python.exe"
 ```
 
-`WAW_PYTHON_CMD` should point to a Python executable that can run `-m pip`.
+> 🐍 `WAW_PYTHON_CMD` should point to a Python executable that can run `-m pip`.
 
-## Build
+## 🏗️ Build
+
+### Local builds
 
 Debug build:
 
@@ -121,6 +138,8 @@ Release build:
 ```powershell
 cargo build --release
 ```
+
+### Windows helper scripts
 
 Windows release helper:
 
@@ -142,7 +161,7 @@ Live Windows end-to-end test:
 powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-live-e2e.ps1 -Binary .\target\release\waw.exe
 ```
 
-## CI
+## 🤖 CI
 
 The repository includes a Windows CI workflow that runs:
 
@@ -151,17 +170,22 @@ The repository includes a Windows CI workflow that runs:
 - `powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-live-e2e.ps1 -Binary .\target\release\waw.exe`
 - `powershell -ExecutionPolicy Bypass -File .\scripts\build-windows-release.ps1`
 
-On pushes to the default branch and on manual workflow runs, a rolling prerelease is published after the test gates pass. The release tag format is `YYYY-MM-DD` in the Asia/Shanghai calendar, and every successful build on the same day reuses that same tag and overwrites the `waw.exe` asset.
+> 🚢 Release behavior
+>
+> On pushes to the default branch and on manual workflow runs, a rolling prerelease is published after the test gates pass.
+>
+> The release tag format is `YYYY-MM-DD` in the Asia/Shanghai calendar, and every successful build on the same day reuses that same tag and overwrites the `waw.exe` asset.
 
-## Beta Smoke Checklist
+## 🧪 Beta Smoke Checklist
 
 1. Run `cargo run -- upgrade` in a real Windows administrator environment.
 2. Confirm only one UAC prompt appears.
 3. Confirm the current terminal continues showing output after elevation.
 4. Run `cargo run -- install git` and confirm it searches first, then elevates only at the install stage.
-5. Run `cargo run -- backends` and confirm it does not report an unusable `winget` alias as available.
+5. Run `cargo run -- remove quarto` and confirm versioned package selections uninstall the chosen version.
+6. Run `cargo run -- backends` and confirm it does not report an unusable `winget` alias as available.
 
-## JSON Show Output
+## 🧾 JSON Show Output
 
 `waw --json show <package>` emits an array of per-backend results. Each item includes:
 
