@@ -564,6 +564,9 @@ fn execute_invocations(
         };
 
         if !capture.success {
+            if is_tolerable_command_failure(&invocation, &capture) {
+                continue;
+            }
             emit_command_logs(&display_command, &capture.stdout, &capture.stderr);
             return Err(render_command_failure(&invocation, &capture));
         }
@@ -4246,11 +4249,15 @@ fn build_elevated_child_command(
         .join(", ");
     let tolerated_exit_snippet = tolerated_elevated_exit_snippet_os(program, args);
     format!(
-        "{}$proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput '{}' -RedirectStandardError '{}'; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} exit $code",
+        "{}$proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput '{}' -RedirectStandardError '{}'; $stdoutText = if (Test-Path -LiteralPath '{}') {{ Get-Content -LiteralPath '{}' -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath '{}') {{ Get-Content -LiteralPath '{}' -Raw }} else {{ '' }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} exit $code",
         powershell_utf8_setup(),
         escape_powershell_single_quoted_os(program),
         argument_list,
         escape_powershell_single_quoted_os(stdout_path),
+        escape_powershell_single_quoted_os(stderr_path),
+        escape_powershell_single_quoted_os(stdout_path),
+        escape_powershell_single_quoted_os(stdout_path),
+        escape_powershell_single_quoted_os(stderr_path),
         escape_powershell_single_quoted_os(stderr_path),
         tolerated_exit_snippet,
     )
@@ -4286,7 +4293,7 @@ fn build_elevated_invocation_command(invocation: &Invocation) -> String {
     let tolerated_exit_snippet =
         tolerated_elevated_exit_snippet(&invocation.program, &invocation.args);
     format!(
-        "[Console]::Error.WriteLine('{}{}'); & '{}' @({}); $code = if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }}; {} if ($code -ne 0) {{ [Console]::Error.WriteLine('{}{}:' + $code); exit $code }}",
+        "[Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -ne 0) {{ [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
         ELEVATED_STEP_MARKER,
         escape_powershell_single_quoted(&rendered_command),
         escape_powershell_single_quoted(&invocation.program),
@@ -4300,6 +4307,8 @@ fn build_elevated_invocation_command(invocation: &Invocation) -> String {
 fn tolerated_elevated_exit_snippet(program: &str, args: &[String]) -> &'static str {
     if is_winget_uninstall_command(program, args) {
         "if ($code -ne 0 -and [uint32]$code -eq 0x800401F5) { $code = 0 }; "
+    } else if is_winget_upgrade_command(program, args) {
+        "if ($code -ne 0 -and (($stdoutText + \"`n\" + $stderrText) -match 'No applicable upgrade found' -or ($stdoutText + \"`n\" + $stderrText) -match 'does not apply to your system or requirements' -or ($stdoutText + \"`n\" + $stderrText) -match '找不到适用的升级' -or ($stdoutText + \"`n\" + $stderrText) -match '较新的包在配置的源中可用')) { $code = 0 }; "
     } else {
         ""
     }
@@ -4313,6 +4322,8 @@ fn tolerated_elevated_exit_snippet_os(program: &OsStr, args: &[OsString]) -> &'s
         .collect::<Vec<_>>();
     if is_winget_uninstall_command_os(&program, &args) {
         "if ($code -ne 0 -and [uint32]$code -eq 0x800401F5) { $code = 0 }; "
+    } else if is_winget_upgrade_command_os(&program, &args) {
+        "if ($code -ne 0 -and (($stdoutText + \"`n\" + $stderrText) -match 'No applicable upgrade found' -or ($stdoutText + \"`n\" + $stderrText) -match 'does not apply to your system or requirements' -or ($stdoutText + \"`n\" + $stderrText) -match '找不到适用的升级' -or ($stdoutText + \"`n\" + $stderrText) -match '较新的包在配置的源中可用')) { $code = 0 }; "
     } else {
         ""
     }
@@ -4326,6 +4337,32 @@ fn is_winget_uninstall_command(program: &str, args: &[String]) -> bool {
 fn is_winget_uninstall_command_os(program: &str, args: &[String]) -> bool {
     let program = program.replace('\\', "/").to_ascii_lowercase();
     program.contains("winget") && args.first().map(String::as_str) == Some("uninstall")
+}
+
+fn is_winget_upgrade_command(program: &str, args: &[String]) -> bool {
+    let program = program.replace('\\', "/").to_ascii_lowercase();
+    program.contains("winget") && args.first().map(String::as_str) == Some("upgrade")
+}
+
+fn is_winget_upgrade_command_os(program: &str, args: &[String]) -> bool {
+    let program = program.replace('\\', "/").to_ascii_lowercase();
+    program.contains("winget") && args.first().map(String::as_str) == Some("upgrade")
+}
+
+fn is_tolerable_command_failure(invocation: &Invocation, capture: &CommandCapture) -> bool {
+    if is_winget_upgrade_command(&invocation.program, &invocation.args) {
+        let output = format!("{}\n{}", capture.stdout, capture.stderr);
+        return winget_no_applicable_upgrade_message(&output);
+    }
+    false
+}
+
+fn winget_no_applicable_upgrade_message(output: &str) -> bool {
+    let normalized = output.to_ascii_lowercase();
+    normalized.contains("no applicable upgrade found")
+        || normalized.contains("does not apply to your system or requirements")
+        || output.contains("找不到适用的升级")
+        || output.contains("较新的包在配置的源中可用")
 }
 
 fn write_powershell_script(path: &Path, content: &str) -> Result<(), String> {
@@ -6382,6 +6419,24 @@ pip_user = true
     }
 
     #[test]
+    fn elevated_child_command_tolerates_winget_no_applicable_upgrade() {
+        let command = build_elevated_child_command(
+            OsStr::new(r"C:\Users\fallingstar\AppData\Local\Microsoft\WindowsApps\winget.exe"),
+            &[
+                OsString::from("upgrade"),
+                OsString::from("--id"),
+                OsString::from("Posit.Quarto"),
+                OsString::from("--exact"),
+            ],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("No applicable upgrade found"));
+        assert!(command.contains("找不到适用的升级"));
+    }
+
+    #[test]
     fn elevated_wrapper_command_launches_hidden_admin_powershell() {
         let command = build_elevated_wrapper_command(
             OsStr::new(r"C:\Temp\elevated-script.ps1"),
@@ -6432,8 +6487,12 @@ pip_user = true
         );
 
         assert!(command.contains("& {"));
-        assert!(command.contains("& 'winget' @('upgrade', '--all')"));
-        assert!(command.contains("& 'npm.cmd' @('update', '--global')"));
+        assert!(command.contains("Start-Process -FilePath 'winget'"));
+        assert!(command.contains("Start-Process -FilePath 'npm.cmd'"));
+        assert!(command.contains("-ArgumentList @('upgrade', '--all')"));
+        assert!(command.contains("-ArgumentList @('update', '--global')"));
+        assert!(command.contains("-RedirectStandardOutput $wawStdout"));
+        assert!(command.contains("-RedirectStandardError $wawStderr"));
         assert!(command.contains("chcp.com 65001 > $null"));
         assert!(
             command
@@ -6463,6 +6522,26 @@ pip_user = true
         );
 
         assert!(command.contains("[uint32]$code -eq 0x800401F5"));
+    }
+
+    #[test]
+    fn elevated_batch_command_tolerates_winget_no_applicable_upgrade() {
+        let command = build_elevated_batch_command(
+            &[Invocation::owned(
+                "winget",
+                vec![
+                    "upgrade".to_string(),
+                    "--id".to_string(),
+                    "Posit.Quarto".to_string(),
+                    "--exact".to_string(),
+                ],
+            )],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("No applicable upgrade found"));
+        assert!(command.contains("找不到适用的升级"));
     }
 
     #[test]
@@ -6528,6 +6607,39 @@ pip_user = true
             ),
             Some(("winget uninstall --id ProxyPilot".to_string(), -2147221003))
         );
+    }
+
+    #[test]
+    fn winget_no_applicable_upgrade_message_matches_english_and_chinese() {
+        assert!(winget_no_applicable_upgrade_message(
+            "No applicable upgrade found; a newer package version is available in the configured sources, but it does not apply to your system or requirements."
+        ));
+        assert!(winget_no_applicable_upgrade_message(
+            "找不到适用的升级，较新的包在配置的源中可用，但不适用于你的系统或要求"
+        ));
+        assert!(!winget_no_applicable_upgrade_message("generic failure"));
+    }
+
+    #[test]
+    fn tolerable_command_failure_recognizes_winget_upgrade_skip() {
+        let invocation = Invocation::owned(
+            "winget",
+            vec![
+                "upgrade".to_string(),
+                "--id".to_string(),
+                "Posit.Quarto".to_string(),
+                "--exact".to_string(),
+            ],
+        );
+        let capture = CommandCapture {
+            stdout: String::new(),
+            stderr: "找不到适用的升级，较新的包在配置的源中可用，但不适用于你的系统或要求"
+                .to_string(),
+            success: false,
+            status_code: 1,
+        };
+
+        assert!(is_tolerable_command_failure(&invocation, &capture));
     }
 
     #[test]
