@@ -127,7 +127,8 @@ function Ensure-BackendAvailable {
     }
 
     $dryRun = Invoke-Waw @("--dry-run", "backend", "install", $Backend, "--enable")
-    Assert-OutputContains $dryRun.Output [regex]::Escape($Backend) "Dry-run bootstrap for $Backend did not produce output."
+    $backendNamePattern = [regex]::Escape($Backend)
+    Assert-OutputContains $dryRun.Output $backendNamePattern "Dry-run bootstrap for $Backend did not produce output."
 
     if ($Backend -eq "winget") {
         throw "winget is required for the live E2E workflow but is not available on this runner."
