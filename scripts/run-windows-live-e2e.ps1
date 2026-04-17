@@ -164,6 +164,7 @@ $script:ConfigPath = Join-Path $tempRoot "config.toml"
 @"
 assume_yes = true
 auto_elevate = false
+winget_source = "winget"
 enable_winget = true
 enable_scoop = true
 enable_choco = true
