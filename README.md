@@ -69,6 +69,7 @@ waw backend default auto
 - Runs `update` and full-system `upgrade` across all enabled and available backends in auto mode.
 - Discovers backend commands from environment overrides, `PATH`, and common Windows install locations.
 - Defaults to non-interactive execution and can auto-request Windows elevation for mutating commands.
+- Uses the native Windows UAC elevation flow for mutating operations instead of a hidden PowerShell wrapper.
 - Defers `install <query>` elevation until after package selection, then performs a single elevated install pass when needed.
 - Uses interactive `yay`-style selection as the default `install` behavior.
 - Preserves direct package installation via `install --exact`.
@@ -82,7 +83,9 @@ waw backend default auto
 
 > 🛠️ `backend install <name>` is a bootstrap helper.
 >
-> It is currently supported only where this project has a host-specific bootstrap path, which today means Windows-oriented flows for `scoop`, `choco`, `npm`, and `pip`.
+> Automatic bootstrap execution is intentionally limited.
+>
+> Today, `npm` and `pip` can be bootstrapped through `winget` on Windows. For `scoop` and `choco`, `waw` prints the official installation hint instead of executing remote install scripts on your behalf.
 
 ## ⚙️ Config
 
@@ -144,13 +147,13 @@ cargo build --release
 Windows release helper:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build-windows-release.ps1
+powershell -File .\scripts\build-windows-release.ps1
 ```
 
 Windows test helper:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-tests.ps1
+powershell -File .\scripts\run-windows-tests.ps1
 ```
 
 Include `-Clippy` to run `cargo clippy --all-targets --all-features -- -D warnings` before executing the test binaries.
@@ -158,17 +161,19 @@ Include `-Clippy` to run `cargo clippy --all-targets --all-features -- -D warnin
 Live Windows end-to-end test:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-live-e2e.ps1 -Binary .\target\release\waw.exe
+powershell -File .\scripts\run-windows-live-e2e.ps1 -Binary .\target\release\waw.exe
 ```
+
+If your local PowerShell execution policy blocks repo scripts, you can still add `-ExecutionPolicy Bypass` manually for local development.
 
 ## 🤖 CI
 
 The repository includes a Windows CI workflow that runs:
 
-- `powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-tests.ps1`
+- `powershell -File .\scripts\run-windows-tests.ps1`
 - `cargo build --release`
-- `powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-live-e2e.ps1 -Binary .\target\release\waw.exe`
-- `powershell -ExecutionPolicy Bypass -File .\scripts\build-windows-release.ps1`
+- `powershell -File .\scripts\run-windows-live-e2e.ps1 -Binary .\target\release\waw.exe`
+- `powershell -File .\scripts\build-windows-release.ps1`
 
 > 🚢 Release behavior
 >

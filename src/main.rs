@@ -22,6 +22,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ELEVATED_STEP_MARKER: &str = "WAW_ELEVATED_STEP:";
 const ELEVATED_SUCCESS_MARKER: &str = "WAW_ELEVATED_SUCCESS:";
 const ELEVATED_FAILURE_MARKER: &str = "WAW_ELEVATED_FAILURE:";
+const ELEVATED_BOOTSTRAP_FAILURE_MARKER: &str = "WAW_ELEVATED_BOOTSTRAP_FAILURE:";
 
 #[cfg(windows)]
 type Handle = *mut c_void;
@@ -4255,7 +4256,12 @@ fn run_logged_elevated_command_file(
     label: &str,
     working_directory: &str,
 ) -> Result<ElevatedCommandOutcome, String> {
-    let mut process = launch_elevated_command_file(command_path, working_directory, label)?;
+    let mut process = launch_elevated_command_file(
+        command_path,
+        capture.stderr_path.as_os_str(),
+        working_directory,
+        label,
+    )?;
 
     let mut reporter = ProgressReporter::new();
     loop {
@@ -4327,10 +4333,12 @@ fn windows_arg_escape(value: &str) -> String {
     escaped
 }
 
-fn build_elevated_loader_command(command_path: &OsStr) -> String {
+fn build_elevated_loader_command(command_path: &OsStr, stderr_path: &OsStr) -> String {
     format!(
-        "$ErrorActionPreference = 'Stop'; [scriptblock]::Create([System.IO.File]::ReadAllText('{}', [System.Text.Encoding]::UTF8)).Invoke()",
+        "$ErrorActionPreference = 'Stop'; try {{ [scriptblock]::Create([System.IO.File]::ReadAllText('{}', [System.Text.Encoding]::UTF8)).Invoke() }} catch {{ $wawMessage = ($_.Exception.Message | Out-String).Trim(); if ([string]::IsNullOrWhiteSpace($wawMessage)) {{ $wawMessage = ($_ | Out-String).Trim() }}; Add-Content -LiteralPath '{}' -Value ('{}' + $wawMessage) -Encoding utf8; throw }}",
         escape_powershell_single_quoted_os(command_path),
+        escape_powershell_single_quoted_os(stderr_path),
+        ELEVATED_BOOTSTRAP_FAILURE_MARKER,
     )
 }
 
@@ -4388,12 +4396,13 @@ impl ElevatedProcessHandle {
 
 fn launch_elevated_command_file(
     command_path: &OsStr,
+    stderr_path: &OsStr,
     working_directory: &str,
     label: &str,
 ) -> Result<ElevatedProcessHandle, String> {
     #[cfg(windows)]
     {
-        let loader_command = build_elevated_loader_command(command_path);
+        let loader_command = build_elevated_loader_command(command_path, stderr_path);
         let parameters = [
             "-NoProfile",
             "-NonInteractive",
@@ -4445,7 +4454,7 @@ fn launch_elevated_command_file(
 
     #[cfg(not(windows))]
     {
-        let _ = (command_path, working_directory, label);
+        let _ = (command_path, stderr_path, working_directory, label);
         Err("native elevation is only available on Windows".to_string())
     }
 }
@@ -4785,6 +4794,7 @@ fn visible_elevated_stderr(stderr_log: &str) -> String {
             !trimmed.starts_with(ELEVATED_STEP_MARKER)
                 && !trimmed.starts_with(ELEVATED_SUCCESS_MARKER)
                 && !trimmed.starts_with(ELEVATED_FAILURE_MARKER)
+                && !trimmed.starts_with(ELEVATED_BOOTSTRAP_FAILURE_MARKER)
         })
         .collect::<Vec<_>>();
 
@@ -4941,6 +4951,8 @@ fn decode_utf16_capture(bytes: &[u8], final_chunk: bool, little_endian: bool) ->
 fn format_elevated_batch_failure(exit_code: i32, stderr_log: &str) -> String {
     if let Some((command, command_exit_code)) = parse_elevated_failure(stderr_log) {
         format!("backend command failed with exit code {command_exit_code}: {command}")
+    } else if let Some(message) = parse_elevated_bootstrap_failure(stderr_log) {
+        format!("elevated bootstrap failed: {message}")
     } else {
         format!("one or more elevated backend commands failed with exit code {exit_code}")
     }
@@ -4958,6 +4970,17 @@ fn parse_elevated_failure_line(line: &str) -> Option<(String, i32)> {
     let (command, exit_code) = payload.rsplit_once(':')?;
     let exit_code = parse_windows_exit_code(exit_code)?;
     Some((command.to_string(), exit_code))
+}
+
+fn parse_elevated_bootstrap_failure(stderr_log: &str) -> Option<String> {
+    stderr_log
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix(ELEVATED_BOOTSTRAP_FAILURE_MARKER)
+                .map(ToString::to_string)
+        })
+        .next_back()
 }
 
 fn parse_windows_exit_code(value: &str) -> Option<i32> {
@@ -6795,13 +6818,19 @@ pip_user = true
 
     #[test]
     fn elevated_loader_command_reads_command_file() {
-        let command = build_elevated_loader_command(OsStr::new(r"C:\Temp\elevated-command.txt"));
+        let command = build_elevated_loader_command(
+            OsStr::new(r"C:\Temp\elevated-command.txt"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
 
         assert!(command.contains("$ErrorActionPreference = 'Stop'"));
         assert!(command.contains(
             "ReadAllText('C:\\Temp\\elevated-command.txt', [System.Text.Encoding]::UTF8)"
         ));
         assert!(command.contains("[scriptblock]::Create("));
+        assert!(command.contains(
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value ('WAW_ELEVATED_BOOTSTRAP_FAILURE:' + $wawMessage) -Encoding utf8"
+        ));
     }
 
     #[test]
@@ -7047,6 +7076,7 @@ pip_user = true
         let stderr_log = concat!(
             "WAW_ELEVATED_STEP:Upgrading winget packages\r\n",
             "WAW_ELEVATED_SUCCESS:Upgrading winget packages\r\n",
+            "WAW_ELEVATED_BOOTSTRAP_FAILURE:loader failed\r\n",
             "real stderr line\r\n",
             "WAW_ELEVATED_FAILURE:Upgrading winget packages:9\r\n"
         );
@@ -7163,6 +7193,17 @@ pip_user = true
         assert_eq!(
             format_elevated_batch_failure(13, "plain stderr output"),
             "one or more elevated backend commands failed with exit code 13"
+        );
+    }
+
+    #[test]
+    fn format_elevated_batch_failure_reports_bootstrap_reason() {
+        assert_eq!(
+            format_elevated_batch_failure(
+                1,
+                "WAW_ELEVATED_BOOTSTRAP_FAILURE:The system cannot find the file specified.\r\n"
+            ),
+            "elevated bootstrap failed: The system cannot find the file specified."
         );
     }
 
