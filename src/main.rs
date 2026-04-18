@@ -10,11 +10,85 @@ use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt;
+
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ELEVATED_STEP_MARKER: &str = "WAW_ELEVATED_STEP:";
 const ELEVATED_SUCCESS_MARKER: &str = "WAW_ELEVATED_SUCCESS:";
 const ELEVATED_FAILURE_MARKER: &str = "WAW_ELEVATED_FAILURE:";
+
+#[cfg(windows)]
+type Handle = *mut c_void;
+#[cfg(windows)]
+type Hwnd = Handle;
+#[cfg(windows)]
+type Hinstance = Handle;
+#[cfg(windows)]
+type Hkey = Handle;
+#[cfg(windows)]
+type Hicon = Handle;
+#[cfg(windows)]
+type Hmonitor = Handle;
+
+#[cfg(windows)]
+const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+#[cfg(windows)]
+const WAIT_OBJECT_0: u32 = 0x0000_0000;
+#[cfg(windows)]
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
+#[cfg(windows)]
+const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+#[cfg(windows)]
+const ERROR_CANCELLED: i32 = 1223;
+
+#[cfg(windows)]
+#[allow(non_snake_case)]
+#[repr(C)]
+union ShellExecuteInfoUnion {
+    hIcon: Hicon,
+    hMonitor: Hmonitor,
+}
+
+#[cfg(windows)]
+#[allow(non_snake_case)]
+#[repr(C)]
+struct ShellExecuteInfoW {
+    cbSize: u32,
+    fMask: u32,
+    hwnd: Hwnd,
+    lpVerb: *const u16,
+    lpFile: *const u16,
+    lpParameters: *const u16,
+    lpDirectory: *const u16,
+    nShow: i32,
+    hInstApp: Hinstance,
+    lpIDList: *mut c_void,
+    lpClass: *const u16,
+    hkeyClass: Hkey,
+    dwHotKey: u32,
+    Anonymous: ShellExecuteInfoUnion,
+    hProcess: Handle,
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+    fn GetExitCodeProcess(handle: Handle, exit_code: *mut u32) -> i32;
+    fn CloseHandle(handle: Handle) -> i32;
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -2378,11 +2452,9 @@ impl Backend {
             Self::Winget => {
                 "Install Microsoft App Installer / WinGet from the Microsoft Store or official package manager distribution."
             }
-            Self::Scoop => {
-                r#"powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb get.scoop.sh | iex""#
-            }
+            Self::Scoop => "Install Scoop using the official quickstart at https://scoop.sh/",
             Self::Chocolatey => {
-                r#"powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))""#
+                "Install Chocolatey using the official guide at https://chocolatey.org/install"
             }
             Self::Npm => "Install Node.js, for example: winget install OpenJS.NodeJS.LTS",
             Self::Pip => "Install Python, for example: winget install Python.Python.3.12",
@@ -2396,28 +2468,7 @@ impl Backend {
 
         match self {
             Self::Winget => None,
-            Self::Scoop => Some(Invocation::owned(
-                "powershell",
-                vec![
-                    "-NoProfile".to_string(),
-                    "-ExecutionPolicy".to_string(),
-                    "Bypass".to_string(),
-                    "-Command".to_string(),
-                    "iwr -useb get.scoop.sh | iex".to_string(),
-                ],
-            )
-            .with_elevation(false)),
-            Self::Chocolatey => Some(Invocation::owned(
-                "powershell",
-                vec![
-                    "-NoProfile".to_string(),
-                    "-ExecutionPolicy".to_string(),
-                    "Bypass".to_string(),
-                    "-Command".to_string(),
-                    "Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))".to_string(),
-                ],
-            )
-            .with_elevation(cfg!(windows))),
+            Self::Scoop | Self::Chocolatey => None,
             Self::Npm => {
                 let mut args = vec![
                     "install".to_string(),
@@ -2431,7 +2482,11 @@ impl Backend {
                     args.push("--silent".to_string());
                     args.push("--disable-interactivity".to_string());
                 }
-                Some(Backend::Winget.base_invocation(args).with_elevation(cfg!(windows)))
+                Some(
+                    Backend::Winget
+                        .base_invocation(args)
+                        .with_elevation(cfg!(windows)),
+                )
             }
             Self::Pip => {
                 let mut args = vec![
@@ -2446,7 +2501,11 @@ impl Backend {
                     args.push("--silent".to_string());
                     args.push("--disable-interactivity".to_string());
                 }
-                Some(Backend::Winget.base_invocation(args).with_elevation(cfg!(windows)))
+                Some(
+                    Backend::Winget
+                        .base_invocation(args)
+                        .with_elevation(cfg!(windows)),
+                )
             }
         }
     }
@@ -4119,15 +4178,13 @@ fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
         capture.stdout_path.as_os_str(),
         capture.stderr_path.as_os_str(),
     );
-    write_powershell_script(&capture.script_path, &inner_command)?;
-    let wrapper_command = build_elevated_wrapper_command(
-        capture.script_path.as_os_str(),
-        capture.started_path.as_os_str(),
+    write_elevated_command_file(&capture.command_path, &inner_command)?;
+    let outcome = run_logged_elevated_command_file(
+        capture.command_path.as_os_str(),
+        &capture,
+        "elevated command batch",
         &working_directory,
-    );
-
-    let outcome =
-        run_logged_elevated_wrapper_command(&wrapper_command, &capture, "elevated command batch")?;
+    )?;
     if outcome.status.success() {
         Ok(())
     } else {
@@ -4162,14 +4219,13 @@ fn run_elevated_program(
         capture.stdout_path.as_os_str(),
         capture.stderr_path.as_os_str(),
     );
-    write_powershell_script(&capture.script_path, &inner_command)?;
-    let wrapper_command = build_elevated_wrapper_command(
-        capture.script_path.as_os_str(),
-        capture.started_path.as_os_str(),
+    write_elevated_command_file(&capture.command_path, &inner_command)?;
+    let outcome = run_logged_elevated_command_file(
+        capture.command_path.as_os_str(),
+        &capture,
+        label,
         &working_directory,
-    );
-
-    let outcome = run_logged_elevated_wrapper_command(&wrapper_command, &capture, label)?;
+    )?;
     let visible_stderr = visible_elevated_stderr(&outcome.stderr_log);
     if !outcome.status.success() {
         emit_command_logs(
@@ -4193,20 +4249,13 @@ struct ElevatedCommandOutcome {
     stderr_log: String,
 }
 
-fn run_logged_elevated_wrapper_command(
-    wrapper_command: &str,
+fn run_logged_elevated_command_file(
+    command_path: &OsStr,
     capture: &ElevationCapture,
     label: &str,
+    working_directory: &str,
 ) -> Result<ElevatedCommandOutcome, String> {
-    let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", wrapper_command])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!("failed to request administrator privileges for {label}: {error}",)
-        })?;
+    let mut process = launch_elevated_command_file(command_path, working_directory, label)?;
 
     let mut reporter = ProgressReporter::new();
     loop {
@@ -4214,39 +4263,22 @@ fn run_logged_elevated_wrapper_command(
             .unwrap_or_else(|| label.to_string());
         reporter.tick(&current_label)?;
 
-        if child
-            .try_wait()
-            .map_err(|error| format!("failed to monitor elevated process: {error}"))?
-            .is_some()
-        {
+        if process.wait(Duration::from_millis(150))?.is_some() {
             break;
         }
-
-        thread::sleep(Duration::from_millis(150));
     }
 
-    let output = child
-        .wait_with_output()
+    let status = process
+        .finish()
         .map_err(|error| format!("failed to collect elevated process result: {error}"))?;
     let stdout_log = read_capture_log(&capture.stdout_path);
     let stderr_log = read_capture_log(&capture.stderr_path);
     let final_label = latest_elevated_step(&stderr_log).unwrap_or_else(|| label.to_string());
-    reporter.finish(output.status.success(), &final_label)?;
-
-    if !capture.started_path.exists() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        capture.cleanup();
-        return Err(if stderr.is_empty() {
-            "administrator privileges were not granted. Confirm the Windows UAC prompt and try again."
-                .to_string()
-        } else {
-            format!("administrator privileges were not granted: {stderr}")
-        });
-    }
+    reporter.finish(status.success(), &final_label)?;
 
     capture.cleanup();
     Ok(ElevatedCommandOutcome {
-        status: output.status,
+        status,
         stdout_log,
         stderr_log,
     })
@@ -4258,6 +4290,164 @@ fn escape_powershell_single_quoted(value: &str) -> String {
 
 fn escape_powershell_single_quoted_os(value: &OsStr) -> String {
     escape_powershell_single_quoted(&value.to_string_lossy())
+}
+
+fn windows_arg_escape(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '"' || ch == '\\')
+    {
+        return value.to_string();
+    }
+
+    let mut escaped = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                escaped.push_str(&"\\".repeat(backslashes * 2 + 1));
+                escaped.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    escaped.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                escaped.push(ch);
+            }
+        }
+    }
+    if backslashes > 0 {
+        escaped.push_str(&"\\".repeat(backslashes * 2));
+    }
+    escaped.push('"');
+    escaped
+}
+
+fn build_elevated_loader_command(command_path: &OsStr) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'; [scriptblock]::Create([System.IO.File]::ReadAllText('{}', [System.Text.Encoding]::UTF8)).Invoke()",
+        escape_powershell_single_quoted_os(command_path),
+    )
+}
+
+#[cfg(windows)]
+fn os_str_to_wide_null(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+struct ElevatedProcessHandle {
+    handle: Handle,
+}
+
+#[cfg(windows)]
+impl ElevatedProcessHandle {
+    fn wait(&mut self, timeout: Duration) -> Result<Option<()>, String> {
+        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        match unsafe { WaitForSingleObject(self.handle, timeout_ms) } {
+            WAIT_OBJECT_0 => Ok(Some(())),
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_FAILED => Err(std::io::Error::last_os_error().to_string()),
+            code => Err(format!(
+                "unexpected wait status while monitoring elevated process: {code}"
+            )),
+        }
+    }
+
+    fn finish(self) -> Result<std::process::ExitStatus, String> {
+        let mut exit_code = 1u32;
+        let ok = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) };
+        let close_result = unsafe { CloseHandle(self.handle) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if close_result == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(std::process::ExitStatus::from_raw(exit_code))
+    }
+}
+
+#[cfg(not(windows))]
+struct ElevatedProcessHandle;
+
+#[cfg(not(windows))]
+impl ElevatedProcessHandle {
+    fn wait(&mut self, _timeout: Duration) -> Result<Option<()>, String> {
+        Err("native elevation is only available on Windows".to_string())
+    }
+
+    fn finish(self) -> Result<std::process::ExitStatus, String> {
+        Err("native elevation is only available on Windows".to_string())
+    }
+}
+
+fn launch_elevated_command_file(
+    command_path: &OsStr,
+    working_directory: &str,
+    label: &str,
+) -> Result<ElevatedProcessHandle, String> {
+    #[cfg(windows)]
+    {
+        let loader_command = build_elevated_loader_command(command_path);
+        let parameters = [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            loader_command.as_str(),
+        ]
+        .into_iter()
+        .map(windows_arg_escape)
+        .collect::<Vec<_>>()
+        .join(" ");
+        let file = os_str_to_wide_null(OsStr::new("powershell.exe"));
+        let verb = os_str_to_wide_null(OsStr::new("runas"));
+        let parameters = os_str_to_wide_null(OsStr::new(&parameters));
+        let directory = os_str_to_wide_null(OsStr::new(working_directory));
+        let mut execute_info = ShellExecuteInfoW {
+            cbSize: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            hwnd: std::ptr::null_mut(),
+            lpVerb: verb.as_ptr(),
+            lpFile: file.as_ptr(),
+            lpParameters: parameters.as_ptr(),
+            lpDirectory: directory.as_ptr(),
+            nShow: 1,
+            hInstApp: std::ptr::null_mut(),
+            lpIDList: std::ptr::null_mut(),
+            lpClass: std::ptr::null(),
+            hkeyClass: std::ptr::null_mut(),
+            dwHotKey: 0,
+            Anonymous: unsafe { std::mem::zeroed() },
+            hProcess: std::ptr::null_mut(),
+        };
+        let ok = unsafe { ShellExecuteExW(&mut execute_info) };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_CANCELLED) {
+                return Err(
+                    "administrator privileges were not granted. Confirm the Windows UAC prompt and try again."
+                        .to_string(),
+                );
+            }
+            return Err(format!(
+                "failed to request administrator privileges for {label}: {error}"
+            ));
+        }
+        Ok(ElevatedProcessHandle {
+            handle: execute_info.hProcess,
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (command_path, working_directory, label);
+        Err("native elevation is only available on Windows".to_string())
+    }
 }
 
 fn unique_capture_base(prefix: &str) -> Result<PathBuf, String> {
@@ -4274,8 +4464,7 @@ fn unique_capture_base(prefix: &str) -> Result<PathBuf, String> {
 struct ElevationCapture {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
-    started_path: PathBuf,
-    script_path: PathBuf,
+    command_path: PathBuf,
 }
 
 impl ElevationCapture {
@@ -4284,16 +4473,14 @@ impl ElevationCapture {
         Ok(Self {
             stdout_path: base.with_extension("stdout.log"),
             stderr_path: base.with_extension("stderr.log"),
-            started_path: base.with_extension("started"),
-            script_path: base.with_extension("ps1"),
+            command_path: base.with_extension("command.txt"),
         })
     }
 
     fn cleanup(&self) {
         let _ = fs::remove_file(&self.stdout_path);
         let _ = fs::remove_file(&self.stderr_path);
-        let _ = fs::remove_file(&self.started_path);
-        let _ = fs::remove_file(&self.script_path);
+        let _ = fs::remove_file(&self.command_path);
     }
 }
 
@@ -4310,7 +4497,7 @@ fn build_elevated_child_command(
         .join(", ");
     let tolerated_exit_snippet = tolerated_elevated_exit_snippet_os(program, args);
     format!(
-        "{}$proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput '{}' -RedirectStandardError '{}'; $stdoutText = if (Test-Path -LiteralPath '{}') {{ Get-Content -LiteralPath '{}' -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath '{}') {{ Get-Content -LiteralPath '{}' -Raw }} else {{ '' }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} exit $code",
+        "{}$proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -RedirectStandardOutput '{}' -RedirectStandardError '{}'; $stdoutText = if (Test-Path -LiteralPath '{}') {{ Get-Content -LiteralPath '{}' -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath '{}') {{ Get-Content -LiteralPath '{}' -Raw }} else {{ '' }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} exit $code",
         powershell_utf8_setup(),
         escape_powershell_single_quoted_os(program),
         argument_list,
@@ -4355,7 +4542,7 @@ fn build_elevated_invocation_command(invocation: &Invocation, batch_stderr_path:
         tolerated_elevated_exit_snippet(&invocation.program, &invocation.args);
     let batch_stderr_path = escape_powershell_single_quoted_os(batch_stderr_path);
     format!(
-        "Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -eq 0) {{ Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}') }} else {{ Add-Content -LiteralPath '{}' -Value ('{}{}:' + $code) -Encoding utf8; [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
+        "Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -eq 0) {{ Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}') }} else {{ Add-Content -LiteralPath '{}' -Value ('{}{}:' + $code) -Encoding utf8; [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
         batch_stderr_path,
         ELEVATED_STEP_MARKER,
         escape_powershell_single_quoted(&progress_label),
@@ -4438,33 +4625,11 @@ fn winget_no_applicable_upgrade_message(output: &str) -> bool {
         || output.contains("较新的包在配置的源中可用")
 }
 
-fn write_powershell_script(path: &Path, content: &str) -> Result<(), String> {
+fn write_elevated_command_file(path: &Path, content: &str) -> Result<(), String> {
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
     bytes.extend_from_slice(content.as_bytes());
     fs::write(path, bytes)
-        .map_err(|error| format!("failed to write elevated PowerShell script: {error}"))
-}
-
-fn build_elevated_wrapper_command(
-    script_path: &OsStr,
-    started_path: &OsStr,
-    working_directory: &str,
-) -> String {
-    format!(
-        concat!(
-            "$ErrorActionPreference = 'Stop'; ",
-            "$proc = Start-Process -FilePath 'powershell' ",
-            "-ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', '{}') ",
-            "-WorkingDirectory '{}' -Verb RunAs -WindowStyle Hidden -PassThru; ",
-            "Set-Content -LiteralPath '{}' -Value 'started' -NoNewline; ",
-            "$proc.WaitForExit(); ",
-            "$proc.Refresh(); ",
-            "exit $proc.ExitCode"
-        ),
-        escape_powershell_single_quoted_os(script_path),
-        escape_powershell_single_quoted(working_directory),
-        escape_powershell_single_quoted_os(started_path),
-    )
+        .map_err(|error| format!("failed to write elevated command file: {error}"))
 }
 
 fn powershell_utf8_setup() -> &'static str {
@@ -6535,7 +6700,7 @@ pip_user = true
     }
 
     #[test]
-    fn backend_bootstrap_install_reports_when_elevation_is_needed() {
+    fn backend_bootstrap_install_reports_when_automatic_execution_exists() {
         let config = Config::default();
         let runtime = RuntimeSettings {
             assume_yes: true,
@@ -6555,7 +6720,7 @@ pip_user = true
         )
         .expect("elevation check should succeed");
 
-        assert_eq!(requires, cfg!(windows));
+        assert!(!requires);
     }
 
     #[test]
@@ -6571,12 +6736,9 @@ pip_user = true
     }
 
     #[test]
-    fn scoop_bootstrap_does_not_require_elevation() {
-        let invocation = Backend::Scoop
-            .install_invocation(true)
-            .expect("scoop bootstrap should be available on windows hosts");
-
-        assert!(!invocation.requires_elevation);
+    fn scoop_bootstrap_is_manual_only() {
+        assert!(Backend::Scoop.install_invocation(true).is_none());
+        assert!(Backend::Scoop.install_hint().contains("https://scoop.sh/"));
     }
 
     #[test]
@@ -6632,33 +6794,26 @@ pip_user = true
     }
 
     #[test]
-    fn elevated_wrapper_command_launches_hidden_admin_powershell() {
-        let command = build_elevated_wrapper_command(
-            OsStr::new(r"C:\Temp\elevated-script.ps1"),
-            OsStr::new(r"C:\Temp\waw.started"),
-            r"C:\Users\fallingstar\claudecode\waw",
-        );
+    fn elevated_loader_command_reads_command_file() {
+        let command = build_elevated_loader_command(OsStr::new(r"C:\Temp\elevated-command.txt"));
 
-        assert!(command.contains("Start-Process -FilePath 'powershell'"));
-        assert!(
-            command
-                .contains("-ExecutionPolicy', 'Bypass', '-File', 'C:\\Temp\\elevated-script.ps1'")
-        );
-        assert!(command.contains("-Verb RunAs"));
-        assert!(command.contains("-WindowStyle Hidden"));
-        assert!(command.contains("Set-Content -LiteralPath 'C:\\Temp\\waw.started'"));
-        assert!(command.contains("$proc.WaitForExit()"));
+        assert!(command.contains("$ErrorActionPreference = 'Stop'"));
+        assert!(command.contains(
+            "ReadAllText('C:\\Temp\\elevated-command.txt', [System.Text.Encoding]::UTF8)"
+        ));
+        assert!(command.contains("[scriptblock]::Create("));
     }
 
     #[test]
-    fn write_powershell_script_writes_utf8_bom() {
+    fn write_elevated_command_file_writes_utf8_bom() {
         let path = env::temp_dir().join(format!(
-            "waw-elevated-script-test-{}-{}.ps1",
+            "waw-elevated-command-test-{}-{}.txt",
             std::process::id(),
             APP_VERSION
         ));
 
-        write_powershell_script(&path, "Write-Host 'hello'").expect("script should be written");
+        write_elevated_command_file(&path, "Write-Host 'hello'")
+            .expect("command file should be written");
         let bytes = fs::read(&path).expect("script should be readable");
 
         assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
@@ -6688,6 +6843,7 @@ pip_user = true
         assert!(command.contains("-ArgumentList @('update', '--global')"));
         assert!(command.contains("-RedirectStandardOutput $wawStdout"));
         assert!(command.contains("-RedirectStandardError $wawStderr"));
+        assert!(!command.contains("-WindowStyle Hidden"));
         assert!(command.contains("chcp.com 65001 > $null"));
         assert!(
             command.contains(

@@ -448,13 +448,9 @@ fn backend_commands_update_config_and_print_bootstrap_plan() {
     assert!(
         install_output
             .stdout
-            .contains("Bootstrap command for scoop:")
+            .contains("Automatic install is not implemented for scoop.")
     );
-    assert!(
-        install_output
-            .stdout
-            .contains("iwr -useb get.scoop.sh | iex")
-    );
+    assert!(install_output.stdout.contains("https://scoop.sh/"));
 }
 
 struct CommandOutput {
