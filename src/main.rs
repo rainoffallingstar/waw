@@ -23,6 +23,7 @@ const ELEVATED_STEP_MARKER: &str = "WAW_ELEVATED_STEP:";
 const ELEVATED_SUCCESS_MARKER: &str = "WAW_ELEVATED_SUCCESS:";
 const ELEVATED_FAILURE_MARKER: &str = "WAW_ELEVATED_FAILURE:";
 const ELEVATED_BOOTSTRAP_FAILURE_MARKER: &str = "WAW_ELEVATED_BOOTSTRAP_FAILURE:";
+const WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE: i32 = -1978335189;
 
 #[cfg(windows)]
 type Handle = *mut c_void;
@@ -4585,7 +4586,7 @@ fn tolerated_elevated_exit_snippet(program: &str, args: &[String]) -> &'static s
     if is_winget_uninstall_command(program, args) {
         "if ($code -ne 0 -and [uint32]$code -eq 0x800401F5) { $code = 0 }; "
     } else if is_winget_upgrade_command(program, args) {
-        "if ($code -ne 0 -and (($stdoutText + \"`n\" + $stderrText) -match 'No applicable upgrade found' -or ($stdoutText + \"`n\" + $stderrText) -match 'does not apply to your system or requirements' -or ($stdoutText + \"`n\" + $stderrText) -match '找不到适用的升级' -or ($stdoutText + \"`n\" + $stderrText) -match '较新的包在配置的源中可用')) { $code = 0 }; "
+        "if ($code -ne 0 -and ([int]$code -eq -1978335189 -or [uint32]$code -eq 0x8A15002B -or ($stdoutText + \"`n\" + $stderrText) -match 'No applicable upgrade found' -or ($stdoutText + \"`n\" + $stderrText) -match 'does not apply to your system or requirements' -or ($stdoutText + \"`n\" + $stderrText) -match '找不到适用的升级' -or ($stdoutText + \"`n\" + $stderrText) -match '较新的包在配置的源中可用')) { $code = 0 }; "
     } else {
         ""
     }
@@ -4600,7 +4601,7 @@ fn tolerated_elevated_exit_snippet_os(program: &OsStr, args: &[OsString]) -> &'s
     if is_winget_uninstall_command_os(&program, &args) {
         "if ($code -ne 0 -and [uint32]$code -eq 0x800401F5) { $code = 0 }; "
     } else if is_winget_upgrade_command_os(&program, &args) {
-        "if ($code -ne 0 -and (($stdoutText + \"`n\" + $stderrText) -match 'No applicable upgrade found' -or ($stdoutText + \"`n\" + $stderrText) -match 'does not apply to your system or requirements' -or ($stdoutText + \"`n\" + $stderrText) -match '找不到适用的升级' -or ($stdoutText + \"`n\" + $stderrText) -match '较新的包在配置的源中可用')) { $code = 0 }; "
+        "if ($code -ne 0 -and ([int]$code -eq -1978335189 -or [uint32]$code -eq 0x8A15002B -or ($stdoutText + \"`n\" + $stderrText) -match 'No applicable upgrade found' -or ($stdoutText + \"`n\" + $stderrText) -match 'does not apply to your system or requirements' -or ($stdoutText + \"`n\" + $stderrText) -match '找不到适用的升级' -or ($stdoutText + \"`n\" + $stderrText) -match '较新的包在配置的源中可用')) { $code = 0 }; "
     } else {
         ""
     }
@@ -4628,6 +4629,9 @@ fn is_winget_upgrade_command_os(program: &str, args: &[String]) -> bool {
 
 fn is_tolerable_command_failure(invocation: &Invocation, capture: &CommandCapture) -> bool {
     if is_winget_upgrade_command(&invocation.program, &invocation.args) {
+        if capture.status_code == WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE {
+            return true;
+        }
         let output = format!("{}\n{}", capture.stdout, capture.stderr);
         return winget_no_applicable_upgrade_message(&output);
     }
@@ -7080,6 +7084,42 @@ pip_user = true
         };
 
         assert!(is_tolerable_command_failure(&invocation, &capture));
+    }
+
+    #[test]
+    fn tolerable_command_failure_recognizes_winget_upgrade_exit_code() {
+        let invocation = Invocation::owned(
+            "winget",
+            vec![
+                "upgrade".to_string(),
+                "--id".to_string(),
+                "Microsoft.Edge".to_string(),
+                "--exact".to_string(),
+            ],
+        );
+        let capture = CommandCapture {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            status_code: WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE,
+        };
+
+        assert!(is_tolerable_command_failure(&invocation, &capture));
+    }
+
+    #[test]
+    fn winget_upgrade_elevated_snippet_tolerates_known_exit_code() {
+        let snippet = tolerated_elevated_exit_snippet(
+            "winget",
+            &[
+                "upgrade".to_string(),
+                "--id".to_string(),
+                "Microsoft.Edge".to_string(),
+            ],
+        );
+
+        assert!(snippet.contains("[int]$code -eq -1978335189"));
+        assert!(snippet.contains("[uint32]$code -eq 0x8A15002B"));
     }
 
     #[test]
