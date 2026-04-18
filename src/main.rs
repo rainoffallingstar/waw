@@ -4178,6 +4178,7 @@ fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
         invocations,
         capture.stdout_path.as_os_str(),
         capture.stderr_path.as_os_str(),
+        capture.status_path.as_os_str(),
     );
     write_elevated_command_file(&capture.command_path, &inner_command)?;
     let outcome = run_logged_elevated_command_file(
@@ -4189,7 +4190,7 @@ fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
     if outcome.status.success() {
         Ok(())
     } else {
-        if let Some(summary) = render_elevated_batch_summary(invocations, &outcome.stderr_log) {
+        if let Some(summary) = render_elevated_batch_summary(invocations, &outcome.status_log) {
             eprintln!("{summary}");
         }
         emit_command_logs(
@@ -4199,7 +4200,7 @@ fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
         );
         Err(format_elevated_batch_failure(
             outcome.status.code().unwrap_or(1),
-            &outcome.stderr_log,
+            &outcome.status_log,
         ))
     }
 }
@@ -4248,6 +4249,7 @@ struct ElevatedCommandOutcome {
     status: std::process::ExitStatus,
     stdout_log: String,
     stderr_log: String,
+    status_log: String,
 }
 
 fn run_logged_elevated_command_file(
@@ -4258,14 +4260,14 @@ fn run_logged_elevated_command_file(
 ) -> Result<ElevatedCommandOutcome, String> {
     let mut process = launch_elevated_command_file(
         command_path,
-        capture.stderr_path.as_os_str(),
+        capture.status_path.as_os_str(),
         working_directory,
         label,
     )?;
 
     let mut reporter = ProgressReporter::new();
     loop {
-        let current_label = latest_elevated_step(&read_capture_log(&capture.stderr_path))
+        let current_label = latest_elevated_step(&read_capture_log(&capture.status_path))
             .unwrap_or_else(|| label.to_string());
         reporter.tick(&current_label)?;
 
@@ -4279,7 +4281,8 @@ fn run_logged_elevated_command_file(
         .map_err(|error| format!("failed to collect elevated process result: {error}"))?;
     let stdout_log = read_capture_log(&capture.stdout_path);
     let stderr_log = read_capture_log(&capture.stderr_path);
-    let final_label = latest_elevated_step(&stderr_log).unwrap_or_else(|| label.to_string());
+    let status_log = read_capture_log(&capture.status_path);
+    let final_label = latest_elevated_step(&status_log).unwrap_or_else(|| label.to_string());
     reporter.finish(status.success(), &final_label)?;
 
     capture.cleanup();
@@ -4287,6 +4290,7 @@ fn run_logged_elevated_command_file(
         status,
         stdout_log,
         stderr_log,
+        status_log,
     })
 }
 
@@ -4333,11 +4337,11 @@ fn windows_arg_escape(value: &str) -> String {
     escaped
 }
 
-fn build_elevated_loader_command(command_path: &OsStr, stderr_path: &OsStr) -> String {
+fn build_elevated_loader_command(command_path: &OsStr, status_path: &OsStr) -> String {
     format!(
         "$ErrorActionPreference = 'Stop'; try {{ [scriptblock]::Create([System.IO.File]::ReadAllText('{}', [System.Text.Encoding]::UTF8)).Invoke() }} catch {{ $wawMessage = ($_.Exception.Message | Out-String).Trim(); if ([string]::IsNullOrWhiteSpace($wawMessage)) {{ $wawMessage = ($_ | Out-String).Trim() }}; Add-Content -LiteralPath '{}' -Value ('{}' + $wawMessage) -Encoding utf8; throw }}",
         escape_powershell_single_quoted_os(command_path),
-        escape_powershell_single_quoted_os(stderr_path),
+        escape_powershell_single_quoted_os(status_path),
         ELEVATED_BOOTSTRAP_FAILURE_MARKER,
     )
 }
@@ -4396,13 +4400,13 @@ impl ElevatedProcessHandle {
 
 fn launch_elevated_command_file(
     command_path: &OsStr,
-    stderr_path: &OsStr,
+    status_path: &OsStr,
     working_directory: &str,
     label: &str,
 ) -> Result<ElevatedProcessHandle, String> {
     #[cfg(windows)]
     {
-        let loader_command = build_elevated_loader_command(command_path, stderr_path);
+        let loader_command = build_elevated_loader_command(command_path, status_path);
         let parameters = [
             "-NoProfile",
             "-NonInteractive",
@@ -4454,7 +4458,7 @@ fn launch_elevated_command_file(
 
     #[cfg(not(windows))]
     {
-        let _ = (command_path, stderr_path, working_directory, label);
+        let _ = (command_path, status_path, working_directory, label);
         Err("native elevation is only available on Windows".to_string())
     }
 }
@@ -4473,6 +4477,7 @@ fn unique_capture_base(prefix: &str) -> Result<PathBuf, String> {
 struct ElevationCapture {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    status_path: PathBuf,
     command_path: PathBuf,
 }
 
@@ -4482,6 +4487,7 @@ impl ElevationCapture {
         Ok(Self {
             stdout_path: base.with_extension("stdout.log"),
             stderr_path: base.with_extension("stderr.log"),
+            status_path: base.with_extension("status.log"),
             command_path: base.with_extension("command.txt"),
         })
     }
@@ -4489,6 +4495,7 @@ impl ElevationCapture {
     fn cleanup(&self) {
         let _ = fs::remove_file(&self.stdout_path);
         let _ = fs::remove_file(&self.stderr_path);
+        let _ = fs::remove_file(&self.status_path);
         let _ = fs::remove_file(&self.command_path);
     }
 }
@@ -4524,11 +4531,12 @@ fn build_elevated_batch_command(
     invocations: &[Invocation],
     stdout_path: &OsStr,
     stderr_path: &OsStr,
+    status_path: &OsStr,
 ) -> String {
     let commands = invocations
         .iter()
         .filter(|invocation| !invocation.program.is_empty())
-        .map(|invocation| build_elevated_invocation_command(invocation, stderr_path))
+        .map(|invocation| build_elevated_invocation_command(invocation, status_path))
         .collect::<Vec<_>>()
         .join("; ");
     format!(
@@ -6820,7 +6828,7 @@ pip_user = true
     fn elevated_loader_command_reads_command_file() {
         let command = build_elevated_loader_command(
             OsStr::new(r"C:\Temp\elevated-command.txt"),
-            OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
         );
 
         assert!(command.contains("$ErrorActionPreference = 'Stop'"));
@@ -6829,7 +6837,7 @@ pip_user = true
         ));
         assert!(command.contains("[scriptblock]::Create("));
         assert!(command.contains(
-            "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value ('WAW_ELEVATED_BOOTSTRAP_FAILURE:' + $wawMessage) -Encoding utf8"
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value ('WAW_ELEVATED_BOOTSTRAP_FAILURE:' + $wawMessage) -Encoding utf8"
         ));
     }
 
@@ -6863,6 +6871,7 @@ pip_user = true
             ],
             OsStr::new(r"C:\Temp\waw.stdout.log"),
             OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
         );
 
         assert!(command.contains("& {"));
@@ -6880,7 +6889,7 @@ pip_user = true
             )
         );
         assert!(command.contains(
-            "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value 'WAW_ELEVATED_STEP:Upgrading winget packages' -Encoding utf8"
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value 'WAW_ELEVATED_STEP:Upgrading winget packages' -Encoding utf8"
         ));
         assert!(command.contains(
             "[Console]::Error.WriteLine('WAW_ELEVATED_SUCCESS:Upgrading winget packages')"
@@ -6889,10 +6898,10 @@ pip_user = true
             "[Console]::Error.WriteLine('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code)"
         ));
         assert!(command.contains(
-            "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value 'WAW_ELEVATED_SUCCESS:Upgrading winget packages' -Encoding utf8"
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value 'WAW_ELEVATED_SUCCESS:Upgrading winget packages' -Encoding utf8"
         ));
         assert!(command.contains(
-            "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value ('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code) -Encoding utf8"
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value ('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code) -Encoding utf8"
         ));
         assert!(command.contains("1>> 'C:\\Temp\\waw.stdout.log'"));
         assert!(command.contains("2>> 'C:\\Temp\\waw.stderr.log'"));
@@ -6948,6 +6957,7 @@ pip_user = true
             )],
             OsStr::new(r"C:\Temp\waw.stdout.log"),
             OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
         );
 
         assert!(command.contains("[uint32]$code -eq 0x800401F5"));
@@ -6967,6 +6977,7 @@ pip_user = true
             )],
             OsStr::new(r"C:\Temp\waw.stdout.log"),
             OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
         );
 
         assert!(command.contains("No applicable upgrade found"));
