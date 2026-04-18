@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ELEVATED_STEP_MARKER: &str = "WAW_ELEVATED_STEP:";
+const ELEVATED_SUCCESS_MARKER: &str = "WAW_ELEVATED_SUCCESS:";
 const ELEVATED_FAILURE_MARKER: &str = "WAW_ELEVATED_FAILURE:";
 
 fn main() -> ExitCode {
@@ -1310,6 +1311,12 @@ fn invocation_progress_label(invocation: &Invocation) -> String {
     }
     if matches!(args, [action, target] if action == "update" && target == "--global") {
         return "Upgrading npm global packages".to_string();
+    }
+    if args.first().map(String::as_str) == Some("update") {
+        return match target {
+            Some(target) => format!("Upgrading {backend}: {target}"),
+            None => format!("Updating {backend} package"),
+        };
     }
     if args.len() >= 2 && args[0] == "source" && args[1] == "update" {
         return format!("Updating {backend} sources");
@@ -4124,6 +4131,9 @@ fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
     if outcome.status.success() {
         Ok(())
     } else {
+        if let Some(summary) = render_elevated_batch_summary(invocations, &outcome.stderr_log) {
+            eprintln!("{summary}");
+        }
         emit_command_logs(
             "elevated command batch",
             &outcome.stdout_log,
@@ -4344,12 +4354,14 @@ fn build_elevated_invocation_command(invocation: &Invocation) -> String {
     let tolerated_exit_snippet =
         tolerated_elevated_exit_snippet(&invocation.program, &invocation.args);
     format!(
-        "[Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -ne 0) {{ [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
+        "[Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -eq 0) {{ [Console]::Error.WriteLine('{}{}') }} else {{ [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
         ELEVATED_STEP_MARKER,
         escape_powershell_single_quoted(&progress_label),
         escape_powershell_single_quoted(&invocation.program),
         argument_list,
         tolerated_exit_snippet,
+        ELEVATED_SUCCESS_MARKER,
+        escape_powershell_single_quoted(&progress_label),
         ELEVATED_FAILURE_MARKER,
         escape_powershell_single_quoted(&progress_label),
     )
@@ -4469,12 +4481,135 @@ fn latest_elevated_step(stderr_log: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ElevatedBatchStepStatus {
+    NotStarted,
+    Started,
+    Succeeded,
+    Failed(i32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ElevatedBatchStepSummary {
+    label: String,
+    status: ElevatedBatchStepStatus,
+}
+
+fn summarize_elevated_batch(
+    invocations: &[Invocation],
+    stderr_log: &str,
+) -> Vec<ElevatedBatchStepSummary> {
+    let mut steps = invocations
+        .iter()
+        .filter(|invocation| !invocation.program.is_empty())
+        .map(|invocation| ElevatedBatchStepSummary {
+            label: invocation_progress_label(invocation),
+            status: ElevatedBatchStepStatus::NotStarted,
+        })
+        .collect::<Vec<_>>();
+
+    for line in stderr_log.lines() {
+        let trimmed = line.trim();
+        if let Some(label) = trimmed.strip_prefix(ELEVATED_STEP_MARKER) {
+            if let Some(step) = steps.iter_mut().find(|step| {
+                step.label == label && step.status == ElevatedBatchStepStatus::NotStarted
+            }) {
+                step.status = ElevatedBatchStepStatus::Started;
+            }
+            continue;
+        }
+
+        if let Some(label) = trimmed.strip_prefix(ELEVATED_SUCCESS_MARKER) {
+            if let Some(step) = steps
+                .iter_mut()
+                .rev()
+                .find(|step| step.label == label && step.status == ElevatedBatchStepStatus::Started)
+            {
+                step.status = ElevatedBatchStepStatus::Succeeded;
+            }
+            continue;
+        }
+
+        if let Some((label, exit_code)) = parse_elevated_failure_line(trimmed) {
+            if let Some(step) = steps
+                .iter_mut()
+                .rev()
+                .find(|step| step.label == label && step.status == ElevatedBatchStepStatus::Started)
+            {
+                step.status = ElevatedBatchStepStatus::Failed(exit_code);
+            }
+        }
+    }
+
+    steps
+}
+
+fn render_elevated_batch_summary(invocations: &[Invocation], stderr_log: &str) -> Option<String> {
+    let steps = summarize_elevated_batch(invocations, stderr_log);
+    if steps.is_empty() {
+        return None;
+    }
+
+    let succeeded = steps
+        .iter()
+        .filter(|step| step.status == ElevatedBatchStepStatus::Succeeded)
+        .map(|step| step.label.clone())
+        .collect::<Vec<_>>();
+    let failed = steps
+        .iter()
+        .filter_map(|step| match step.status {
+            ElevatedBatchStepStatus::Failed(code) => Some((step.label.clone(), code)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let not_started = steps
+        .iter()
+        .filter(|step| step.status == ElevatedBatchStepStatus::NotStarted)
+        .map(|step| step.label.clone())
+        .collect::<Vec<_>>();
+    let interrupted = steps
+        .iter()
+        .filter(|step| step.status == ElevatedBatchStepStatus::Started)
+        .map(|step| step.label.clone())
+        .collect::<Vec<_>>();
+
+    if succeeded.is_empty() && failed.is_empty() && not_started.is_empty() && interrupted.is_empty()
+    {
+        return None;
+    }
+
+    let mut lines = vec!["Batch summary:".to_string()];
+    if !succeeded.is_empty() {
+        lines.push(format!("Succeeded ({}):", succeeded.len()));
+        lines.extend(succeeded.into_iter().map(|label| format!("- {label}")));
+    }
+    if !failed.is_empty() {
+        lines.push(format!("Failed ({}):", failed.len()));
+        lines.extend(
+            failed
+                .into_iter()
+                .map(|(label, code)| format!("- {label} (exit code {code})")),
+        );
+    }
+    if !not_started.is_empty() {
+        lines.push(format!("Not started ({}):", not_started.len()));
+        lines.extend(not_started.into_iter().map(|label| format!("- {label}")));
+    }
+    if !interrupted.is_empty() {
+        lines.push(format!("Interrupted ({}):", interrupted.len()));
+        lines.extend(interrupted.into_iter().map(|label| format!("- {label}")));
+    }
+
+    Some(lines.join("\n"))
+}
+
 fn visible_elevated_stderr(stderr_log: &str) -> String {
     let lines = stderr_log
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
             !trimmed.starts_with(ELEVATED_STEP_MARKER)
+                && !trimmed.starts_with(ELEVATED_SUCCESS_MARKER)
                 && !trimmed.starts_with(ELEVATED_FAILURE_MARKER)
         })
         .collect::<Vec<_>>();
@@ -6551,6 +6686,9 @@ pip_user = true
             )
         );
         assert!(command.contains(
+            "[Console]::Error.WriteLine('WAW_ELEVATED_SUCCESS:Upgrading winget packages')"
+        ));
+        assert!(command.contains(
             "[Console]::Error.WriteLine('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code)"
         ));
         assert!(command.contains("1>> 'C:\\Temp\\waw.stdout.log'"));
@@ -6734,11 +6872,106 @@ pip_user = true
     fn visible_elevated_stderr_strips_internal_markers() {
         let stderr_log = concat!(
             "WAW_ELEVATED_STEP:Upgrading winget packages\r\n",
+            "WAW_ELEVATED_SUCCESS:Upgrading winget packages\r\n",
             "real stderr line\r\n",
             "WAW_ELEVATED_FAILURE:Upgrading winget packages:9\r\n"
         );
 
         assert_eq!(visible_elevated_stderr(stderr_log), "real stderr line\n");
+    }
+
+    #[test]
+    fn summarize_elevated_batch_distinguishes_success_failure_and_not_started() {
+        let invocations = vec![
+            Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "code-server@latest".to_string()],
+            ),
+            Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "opencode-ai@latest".to_string()],
+            ),
+            Invocation::owned(
+                "python",
+                vec![
+                    "-m".to_string(),
+                    "pip".to_string(),
+                    "install".to_string(),
+                    "--upgrade".to_string(),
+                    "pydantic".to_string(),
+                ],
+            ),
+        ];
+        let stderr_log = concat!(
+            "WAW_ELEVATED_STEP:Upgrading npm: code-server@latest\r\n",
+            "WAW_ELEVATED_SUCCESS:Upgrading npm: code-server@latest\r\n",
+            "WAW_ELEVATED_STEP:Upgrading npm: opencode-ai@latest\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading npm: opencode-ai@latest:1\r\n",
+        );
+
+        assert_eq!(
+            summarize_elevated_batch(&invocations, stderr_log),
+            vec![
+                ElevatedBatchStepSummary {
+                    label: "Upgrading npm: code-server@latest".to_string(),
+                    status: ElevatedBatchStepStatus::Succeeded,
+                },
+                ElevatedBatchStepSummary {
+                    label: "Upgrading npm: opencode-ai@latest".to_string(),
+                    status: ElevatedBatchStepStatus::Failed(1),
+                },
+                ElevatedBatchStepSummary {
+                    label: "Upgrading pip: pydantic".to_string(),
+                    status: ElevatedBatchStepStatus::NotStarted,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_elevated_batch_summary_lists_succeeded_failed_and_not_started() {
+        let invocations = vec![
+            Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "code-server@latest".to_string()],
+            ),
+            Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "opencode-ai@latest".to_string()],
+            ),
+            Invocation::owned(
+                "python",
+                vec![
+                    "-m".to_string(),
+                    "pip".to_string(),
+                    "install".to_string(),
+                    "--upgrade".to_string(),
+                    "pydantic".to_string(),
+                ],
+            ),
+        ];
+        let stderr_log = concat!(
+            "WAW_ELEVATED_STEP:Upgrading npm: code-server@latest\r\n",
+            "WAW_ELEVATED_SUCCESS:Upgrading npm: code-server@latest\r\n",
+            "WAW_ELEVATED_STEP:Upgrading npm: opencode-ai@latest\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading npm: opencode-ai@latest:1\r\n",
+        );
+
+        assert_eq!(
+            render_elevated_batch_summary(&invocations, stderr_log),
+            Some(
+                [
+                    "Batch summary:",
+                    "Succeeded (1):",
+                    "- Upgrading npm: code-server@latest",
+                    "Failed (1):",
+                    "- Upgrading npm: opencode-ai@latest (exit code 1)",
+                    "Not started (1):",
+                    "- Upgrading pip: pydantic",
+                ]
+                .join("\n")
+            )
+        );
     }
 
     #[test]
