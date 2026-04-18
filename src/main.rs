@@ -212,7 +212,12 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let invocations = backend.plan(&cli.command, &runtime)?;
-    execute_invocations(invocations, cli.dry_run, &runtime)
+    execute_invocations(
+        invocations,
+        cli.dry_run,
+        matches!(cli.command, Subcommand::Upgrade { .. }),
+        &runtime,
+    )
 }
 
 fn handle_backend_command(
@@ -349,6 +354,7 @@ fn handle_backend_command(
                 execute_invocations(
                     vec![invocation],
                     dry_run,
+                    false,
                     &RuntimeSettings {
                         assume_yes,
                         auto_elevate,
@@ -588,6 +594,7 @@ fn enabled_available_backends(config: &Config) -> Vec<Backend> {
 fn execute_invocations(
     invocations: Vec<Invocation>,
     dry_run: bool,
+    continue_on_error: bool,
     runtime: &RuntimeSettings<'_>,
 ) -> Result<ExitCode, String> {
     let process_is_elevated = runtime.auto_elevate && is_process_elevated();
@@ -618,9 +625,12 @@ fn execute_invocations(
     }
 
     if should_batch_elevate {
-        run_elevated_invocations(&invocations)?;
+        run_elevated_invocations(&invocations, continue_on_error)?;
         return Ok(ExitCode::SUCCESS);
     }
+
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
 
     for invocation in invocations {
         if invocation.program.is_empty() {
@@ -637,16 +647,38 @@ fn execute_invocations(
             println!("requesting administrator privileges...");
             run_elevated_invocation(&invocation, &progress_label)?
         } else {
-            run_logged_command_capture_with_label(&invocation, &progress_label, true)?
+            run_logged_command_capture_with_label(&invocation, &progress_label, true, |_| false)?
         };
 
         if !capture.success {
             if is_tolerable_command_failure(&invocation, &capture) {
+                if continue_on_error {
+                    succeeded.push(progress_label);
+                }
                 continue;
             }
             emit_command_logs(&display_command, &capture.stdout, &capture.stderr);
-            return Err(render_command_failure(&invocation, &capture));
+            let error = render_command_failure(&invocation, &capture);
+            if continue_on_error {
+                failed.push((progress_label, error));
+                continue;
+            }
+            return Err(error);
         }
+
+        if continue_on_error {
+            succeeded.push(progress_label);
+        }
+    }
+
+    if continue_on_error && !failed.is_empty() {
+        if let Some(summary) = render_invocation_batch_summary(&succeeded, &failed) {
+            eprintln!("{summary}");
+        }
+        return Err(format!(
+            "{} command(s) failed during execution",
+            failed.len()
+        ));
     }
 
     Ok(ExitCode::SUCCESS)
@@ -690,7 +722,7 @@ fn run_interactive_install(
         }
     }
 
-    execute_invocations(invocations, dry_run, runtime)
+    execute_invocations(invocations, dry_run, false, runtime)
 }
 
 fn run_interactive_remove(
@@ -731,7 +763,7 @@ fn run_interactive_remove(
         }
     }
 
-    execute_invocations(invocations, dry_run, runtime)
+    execute_invocations(invocations, dry_run, false, runtime)
 }
 
 fn run_interactive_upgrade(
@@ -771,7 +803,7 @@ fn run_interactive_upgrade(
         }
     }
 
-    execute_invocations(invocations, dry_run, runtime)
+    execute_invocations(invocations, dry_run, true, runtime)
 }
 
 fn run_update_all(
@@ -786,7 +818,9 @@ fn run_update_all(
         if !dry_run {
             println!("{}", update_backend_summary(backend));
         }
-        if let Err(error) = execute_invocations(backend.plan_update(runtime), dry_run, runtime) {
+        if let Err(error) =
+            execute_invocations(backend.plan_update(runtime), dry_run, false, runtime)
+        {
             eprintln!("warning: failed to update {backend}: {error}");
             failures.push(format!("{backend}: {error}"));
         }
@@ -844,9 +878,11 @@ fn run_list(
             continue;
         }
 
-        let capture = match run_capture_detailed_with_label(
+        let capture = match run_capture_detailed_with_label_when(
             &invocation,
             &format!("Listing {noun} from {backend}"),
+            false,
+            |capture| backend.accepts_list_capture(upgradable, capture),
         ) {
             Ok(capture) => capture,
             Err(error) => {
@@ -1188,7 +1224,19 @@ fn run_capture_detailed_with_label(
     invocation: &Invocation,
     label: &str,
 ) -> Result<CommandCapture, String> {
-    run_logged_command_capture_with_label(invocation, label, false)
+    run_capture_detailed_with_label_when(invocation, label, false, |_| false)
+}
+
+fn run_capture_detailed_with_label_when<F>(
+    invocation: &Invocation,
+    label: &str,
+    inherit_stdin: bool,
+    accept_capture: F,
+) -> Result<CommandCapture, String>
+where
+    F: FnOnce(&CommandCapture) -> bool,
+{
+    run_logged_command_capture_with_label(invocation, label, inherit_stdin, accept_capture)
 }
 
 fn render_command_failure(invocation: &Invocation, capture: &CommandCapture) -> String {
@@ -1221,6 +1269,7 @@ fn run_logged_command_capture_with_label(
     invocation: &Invocation,
     label: &str,
     inherit_stdin: bool,
+    accept_capture: impl FnOnce(&CommandCapture) -> bool,
 ) -> Result<CommandCapture, String> {
     let capture = CommandLogCapture::new()?;
     let stdout_file = fs::File::create(&capture.stdout_path)
@@ -1257,18 +1306,48 @@ fn run_logged_command_capture_with_label(
     let status = child
         .wait()
         .map_err(|error| format!("failed to collect {} result: {error}", invocation.program))?;
-    reporter.finish(status.success(), &progress_label)?;
 
     let stdout = read_capture_log(&capture.stdout_path);
     let stderr = read_capture_log(&capture.stderr_path);
     capture.cleanup();
 
-    Ok(CommandCapture {
+    let command_capture = CommandCapture {
         stdout,
         stderr,
         success: status.success(),
         status_code: status.code().unwrap_or(1),
-    })
+    };
+    reporter.finish(
+        command_capture.success || accept_capture(&command_capture),
+        &progress_label,
+    )?;
+
+    Ok(command_capture)
+}
+
+fn render_invocation_batch_summary(
+    succeeded: &[String],
+    failed: &[(String, String)],
+) -> Option<String> {
+    if succeeded.is_empty() && failed.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec!["Batch summary:".to_string()];
+    if !succeeded.is_empty() {
+        lines.push(format!("Succeeded ({}):", succeeded.len()));
+        lines.extend(succeeded.iter().map(|label| format!("- {label}")));
+    }
+    if !failed.is_empty() {
+        lines.push(format!("Failed ({}):", failed.len()));
+        lines.extend(
+            failed
+                .iter()
+                .map(|(label, reason)| format!("- {label}: {reason}")),
+        );
+    }
+
+    Some(lines.join("\n"))
 }
 
 fn emit_command_logs(command: &str, stdout: &str, stderr: &str) {
@@ -1327,8 +1406,12 @@ fn collect_upgradable_rows(
         .into_iter()
         .next()
         .expect("upgradable list should always produce one invocation");
-    let capture =
-        run_capture_detailed_with_label(&invocation, &format!("Checking updates for {backend}"))?;
+    let capture = run_capture_detailed_with_label_when(
+        &invocation,
+        &format!("Checking updates for {backend}"),
+        false,
+        |capture| backend.accepts_list_capture(true, capture),
+    )?;
     if !backend.accepts_list_capture(true, &capture) {
         return Err(render_command_failure(&invocation, &capture));
     }
@@ -4169,7 +4252,10 @@ fn run_elevated_invocation(invocation: &Invocation, label: &str) -> Result<Comma
     run_elevated_program(OsStr::new(&invocation.program), &args, label)
 }
 
-fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
+fn run_elevated_invocations(
+    invocations: &[Invocation],
+    continue_on_error: bool,
+) -> Result<(), String> {
     let capture = ElevationCapture::new()?;
     let working_directory = env::current_dir()
         .ok()
@@ -4180,6 +4266,7 @@ fn run_elevated_invocations(invocations: &[Invocation]) -> Result<(), String> {
         capture.stdout_path.as_os_str(),
         capture.stderr_path.as_os_str(),
         capture.status_path.as_os_str(),
+        continue_on_error,
     );
     write_elevated_command_file(&capture.command_path, &inner_command)?;
     let outcome = run_logged_elevated_command_file(
@@ -4533,22 +4620,34 @@ fn build_elevated_batch_command(
     stdout_path: &OsStr,
     stderr_path: &OsStr,
     status_path: &OsStr,
+    continue_on_error: bool,
 ) -> String {
     let commands = invocations
         .iter()
         .filter(|invocation| !invocation.program.is_empty())
-        .map(|invocation| build_elevated_invocation_command(invocation, status_path))
+        .map(|invocation| {
+            build_elevated_invocation_command(invocation, status_path, continue_on_error)
+        })
         .collect::<Vec<_>>()
         .join("; ");
+    let batch_exit = if continue_on_error {
+        "if ($script:wawBatchExitCode -ne 0) { exit $script:wawBatchExitCode } else { exit 0 }"
+    } else {
+        "exit 0"
+    };
     format!(
-        "{}$ErrorActionPreference = 'Stop'; & {{ {commands}; exit 0 }} 1>> '{}' 2>> '{}'",
+        "{}$ErrorActionPreference = 'Stop'; $script:wawBatchExitCode = 0; & {{ {commands}; {batch_exit} }} 1>> '{}' 2>> '{}'",
         powershell_utf8_setup(),
         escape_powershell_single_quoted_os(stdout_path),
         escape_powershell_single_quoted_os(stderr_path),
     )
 }
 
-fn build_elevated_invocation_command(invocation: &Invocation, batch_stderr_path: &OsStr) -> String {
+fn build_elevated_invocation_command(
+    invocation: &Invocation,
+    batch_stderr_path: &OsStr,
+    continue_on_error: bool,
+) -> String {
     let argument_list = invocation
         .args
         .iter()
@@ -4559,8 +4658,13 @@ fn build_elevated_invocation_command(invocation: &Invocation, batch_stderr_path:
     let tolerated_exit_snippet =
         tolerated_elevated_exit_snippet(&invocation.program, &invocation.args);
     let batch_stderr_path = escape_powershell_single_quoted_os(batch_stderr_path);
+    let failure_tail = if continue_on_error {
+        "if ($script:wawBatchExitCode -eq 0) { $script:wawBatchExitCode = $code }"
+    } else {
+        "exit $code"
+    };
     format!(
-        "Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -eq 0) {{ Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}') }} else {{ Add-Content -LiteralPath '{}' -Value ('{}{}:' + $code) -Encoding utf8; [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
+        "Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -eq 0) {{ Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}') }} else {{ Add-Content -LiteralPath '{}' -Value ('{}{}:' + $code) -Encoding utf8; [Console]::Error.WriteLine('{}{}:' + $code); {} }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
         batch_stderr_path,
         ELEVATED_STEP_MARKER,
         escape_powershell_single_quoted(&progress_label),
@@ -4579,6 +4683,7 @@ fn build_elevated_invocation_command(invocation: &Invocation, batch_stderr_path:
         escape_powershell_single_quoted(&progress_label),
         ELEVATED_FAILURE_MARKER,
         escape_powershell_single_quoted(&progress_label),
+        failure_tail,
     )
 }
 
@@ -4961,13 +5066,23 @@ fn decode_utf16_capture(bytes: &[u8], final_chunk: bool, little_endian: bool) ->
 }
 
 fn format_elevated_batch_failure(exit_code: i32, stderr_log: &str) -> String {
-    if let Some((command, command_exit_code)) = parse_elevated_failure(stderr_log) {
-        format!("backend command failed with exit code {command_exit_code}: {command}")
-    } else if let Some(message) = parse_elevated_bootstrap_failure(stderr_log) {
+    let failure_count = count_elevated_failures(stderr_log);
+    if let Some(message) = parse_elevated_bootstrap_failure(stderr_log) {
         format!("elevated bootstrap failed: {message}")
+    } else if failure_count > 1 {
+        format!("{failure_count} backend commands failed; see batch summary above")
+    } else if let Some((command, command_exit_code)) = parse_elevated_failure(stderr_log) {
+        format!("backend command failed with exit code {command_exit_code}: {command}")
     } else {
         format!("one or more elevated backend commands failed with exit code {exit_code}")
     }
+}
+
+fn count_elevated_failures(stderr_log: &str) -> usize {
+    stderr_log
+        .lines()
+        .filter(|line| parse_elevated_failure_line(line).is_some())
+        .count()
 }
 
 fn parse_elevated_failure(stderr_log: &str) -> Option<(String, i32)> {
@@ -6876,6 +6991,7 @@ pip_user = true
             OsStr::new(r"C:\Temp\waw.stdout.log"),
             OsStr::new(r"C:\Temp\waw.stderr.log"),
             OsStr::new(r"C:\Temp\waw.status.log"),
+            false,
         );
 
         assert!(command.contains("& {"));
@@ -6962,6 +7078,7 @@ pip_user = true
             OsStr::new(r"C:\Temp\waw.stdout.log"),
             OsStr::new(r"C:\Temp\waw.stderr.log"),
             OsStr::new(r"C:\Temp\waw.status.log"),
+            false,
         );
 
         assert!(command.contains("[uint32]$code -eq 0x800401F5"));
@@ -6982,10 +7099,35 @@ pip_user = true
             OsStr::new(r"C:\Temp\waw.stdout.log"),
             OsStr::new(r"C:\Temp\waw.stderr.log"),
             OsStr::new(r"C:\Temp\waw.status.log"),
+            false,
         );
 
         assert!(command.contains("No applicable upgrade found"));
         assert!(command.contains("找不到适用的升级"));
+    }
+
+    #[test]
+    fn elevated_batch_command_can_continue_after_failure() {
+        let command = build_elevated_batch_command(
+            &[Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "code-server@latest".to_string()],
+            )],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
+            true,
+        );
+
+        assert!(command.contains("$script:wawBatchExitCode = 0;"));
+        assert!(
+            command.contains(
+                "if ($script:wawBatchExitCode -eq 0) { $script:wawBatchExitCode = $code }"
+            )
+        );
+        assert!(command.contains(
+            "if ($script:wawBatchExitCode -ne 0) { exit $script:wawBatchExitCode } else { exit 0 }"
+        ));
     }
 
     #[test]
@@ -7230,6 +7372,34 @@ pip_user = true
     }
 
     #[test]
+    fn render_invocation_batch_summary_lists_succeeded_and_failed() {
+        let succeeded = vec![
+            "Upgrading winget: KaringX.Karing".to_string(),
+            "Upgrading pip: pydantic".to_string(),
+        ];
+        let failed = vec![(
+            "Installing npm: code-server@latest".to_string(),
+            "backend command failed with exit code 1: npm update --global code-server@latest"
+                .to_string(),
+        )];
+
+        assert_eq!(
+            render_invocation_batch_summary(&succeeded, &failed),
+            Some(
+                [
+                    "Batch summary:",
+                    "Succeeded (2):",
+                    "- Upgrading winget: KaringX.Karing",
+                    "- Upgrading pip: pydantic",
+                    "Failed (1):",
+                    "- Installing npm: code-server@latest: backend command failed with exit code 1: npm update --global code-server@latest",
+                ]
+                .join("\n")
+            )
+        );
+    }
+
+    #[test]
     fn format_elevated_batch_failure_prefers_precise_failure_marker() {
         let stderr_log = "WAW_ELEVATED_FAILURE:Upgrading winget packages:9\r\n";
 
@@ -7255,6 +7425,19 @@ pip_user = true
                 "WAW_ELEVATED_BOOTSTRAP_FAILURE:The system cannot find the file specified.\r\n"
             ),
             "elevated bootstrap failed: The system cannot find the file specified."
+        );
+    }
+
+    #[test]
+    fn format_elevated_batch_failure_reports_multiple_failures() {
+        let stderr_log = concat!(
+            "WAW_ELEVATED_FAILURE:Installing npm: code-server@latest:1\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading pip: pydantic:1\r\n",
+        );
+
+        assert_eq!(
+            format_elevated_batch_failure(1, stderr_log),
+            "2 backend commands failed; see batch summary above"
         );
     }
 
