@@ -4530,14 +4530,13 @@ fn summarize_elevated_batch(
             continue;
         }
 
-        if let Some((label, exit_code)) = parse_elevated_failure_line(trimmed) {
-            if let Some(step) = steps
+        if let Some((label, exit_code)) = parse_elevated_failure_line(trimmed)
+            && let Some(step) = steps
                 .iter_mut()
                 .rev()
                 .find(|step| step.label == label && step.status == ElevatedBatchStepStatus::Started)
-            {
-                step.status = ElevatedBatchStepStatus::Failed(exit_code);
-            }
+        {
+            step.status = ElevatedBatchStepStatus::Failed(exit_code);
         }
     }
 
