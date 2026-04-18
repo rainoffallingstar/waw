@@ -1300,6 +1300,7 @@ fn compact_progress_label(label: &str) -> String {
 fn invocation_progress_label(invocation: &Invocation) -> String {
     let backend = invocation_backend_name(invocation);
     let args = invocation.args.as_slice();
+    let target = invocation_target_label(invocation);
 
     if matches!(args, [action] if action == "update") && backend == "scoop" {
         return "Updating scoop buckets".to_string();
@@ -1317,13 +1318,22 @@ fn invocation_progress_label(invocation: &Invocation) -> String {
         return format!("Upgrading {backend} packages");
     }
     if args.first().map(String::as_str) == Some("upgrade") {
-        return format!("Upgrading {backend} package");
+        return match target {
+            Some(target) => format!("Upgrading {backend}: {target}"),
+            None => format!("Upgrading {backend} package"),
+        };
     }
     if args.first().map(String::as_str) == Some("install") {
-        return format!("Installing {backend} package");
+        return match target {
+            Some(target) => format!("Installing {backend}: {target}"),
+            None => format!("Installing {backend} package"),
+        };
     }
     if args.first().map(String::as_str) == Some("uninstall") {
-        return format!("Removing {backend} package");
+        return match target {
+            Some(target) => format!("Removing {backend}: {target}"),
+            None => format!("Removing {backend} package"),
+        };
     }
     if args.first().map(String::as_str) == Some("search") && args.len() >= 2 {
         return format!("Searching {backend} for {}", args[1]);
@@ -1335,10 +1345,16 @@ fn invocation_progress_label(invocation: &Invocation) -> String {
         return "Listing pip packages".to_string();
     }
     if args.len() >= 3 && args[0] == "-m" && args[1] == "pip" && args[2] == "install" {
-        if args.iter().any(|arg| arg == "--upgrade") {
-            return "Upgrading pip packages".to_string();
-        }
-        return "Installing pip packages".to_string();
+        return match target {
+            Some(target) if args.iter().any(|arg| arg == "--upgrade") => {
+                format!("Upgrading pip: {target}")
+            }
+            Some(target) => format!("Installing pip: {target}"),
+            None if args.iter().any(|arg| arg == "--upgrade") => {
+                "Upgrading pip packages".to_string()
+            }
+            None => "Installing pip packages".to_string(),
+        };
     }
     if args.len() >= 3 && args[0] == "-m" && args[1] == "pip" && args[2] == "show" {
         return "Showing pip package details".to_string();
@@ -1363,6 +1379,41 @@ fn invocation_progress_label(invocation: &Invocation) -> String {
     }
 
     format!("Running {backend}")
+}
+
+fn invocation_target_label(invocation: &Invocation) -> Option<String> {
+    let backend = invocation_backend_name(invocation);
+    let args = invocation.args.as_slice();
+
+    match backend {
+        "winget" => argument_value_after(args, "--id")
+            .or_else(|| argument_value_after(args, "--name"))
+            .or_else(|| positional_argument(args, 1)),
+        "scoop" | "choco" | "npm" => positional_argument(args, 1),
+        "pip" => pip_invocation_target(args),
+        _ => positional_argument(args, 1),
+    }
+}
+
+fn argument_value_after(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+}
+
+fn positional_argument(args: &[String], start: usize) -> Option<String> {
+    args.iter()
+        .skip(start)
+        .find(|arg| !arg.starts_with('-'))
+        .cloned()
+}
+
+fn pip_invocation_target(args: &[String]) -> Option<String> {
+    if args.len() < 4 || args[0] != "-m" || args[1] != "pip" {
+        return None;
+    }
+
+    positional_argument(args, 3)
 }
 
 fn invocation_backend_name(invocation: &Invocation) -> &'static str {
@@ -4289,18 +4340,18 @@ fn build_elevated_invocation_command(invocation: &Invocation) -> String {
         .map(|arg| format!("'{}'", escape_powershell_single_quoted(arg)))
         .collect::<Vec<_>>()
         .join(", ");
-    let rendered_command = invocation.render_for_display();
+    let progress_label = invocation_progress_label(invocation);
     let tolerated_exit_snippet =
         tolerated_elevated_exit_snippet(&invocation.program, &invocation.args);
     format!(
         "[Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -ne 0) {{ [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
         ELEVATED_STEP_MARKER,
-        escape_powershell_single_quoted(&rendered_command),
+        escape_powershell_single_quoted(&progress_label),
         escape_powershell_single_quoted(&invocation.program),
         argument_list,
         tolerated_exit_snippet,
         ELEVATED_FAILURE_MARKER,
-        escape_powershell_single_quoted(&rendered_command),
+        escape_powershell_single_quoted(&progress_label),
     )
 }
 
@@ -6495,14 +6546,51 @@ pip_user = true
         assert!(command.contains("-RedirectStandardError $wawStderr"));
         assert!(command.contains("chcp.com 65001 > $null"));
         assert!(
-            command
-                .contains("[Console]::Error.WriteLine('WAW_ELEVATED_STEP:winget upgrade --all')")
+            command.contains(
+                "[Console]::Error.WriteLine('WAW_ELEVATED_STEP:Upgrading winget packages')"
+            )
         );
         assert!(command.contains(
-            "[Console]::Error.WriteLine('WAW_ELEVATED_FAILURE:winget upgrade --all:' + $code)"
+            "[Console]::Error.WriteLine('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code)"
         ));
         assert!(command.contains("1>> 'C:\\Temp\\waw.stdout.log'"));
         assert!(command.contains("2>> 'C:\\Temp\\waw.stderr.log'"));
+    }
+
+    #[test]
+    fn invocation_progress_label_includes_winget_target_package() {
+        let invocation = Invocation::owned(
+            "winget",
+            vec![
+                "upgrade".to_string(),
+                "--id".to_string(),
+                "Posit.Quarto".to_string(),
+                "--exact".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            invocation_progress_label(&invocation),
+            "Upgrading winget: Posit.Quarto"
+        );
+    }
+
+    #[test]
+    fn invocation_progress_label_includes_pip_target_package() {
+        let invocation = Invocation::owned(
+            "python",
+            vec![
+                "-m".to_string(),
+                "pip".to_string(),
+                "install".to_string(),
+                "requests".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            invocation_progress_label(&invocation),
+            "Installing pip: requests"
+        );
     }
 
     #[test]
@@ -6573,15 +6661,15 @@ pip_user = true
     fn parse_elevated_failure_extracts_latest_failure_marker() {
         let stderr_log = concat!(
             "warning output\r\n",
-            "WAW_ELEVATED_STEP:winget upgrade --all\r\n",
-            "WAW_ELEVATED_FAILURE:winget upgrade --all:5\r\n",
-            "WAW_ELEVATED_STEP:npm.cmd update --global\r\n",
-            "WAW_ELEVATED_FAILURE:npm.cmd update --global:17\r\n"
+            "WAW_ELEVATED_STEP:Upgrading winget packages\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading winget packages:5\r\n",
+            "WAW_ELEVATED_STEP:Upgrading npm global packages\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading npm global packages:17\r\n"
         );
 
         assert_eq!(
             parse_elevated_failure(stderr_log),
-            Some(("npm.cmd update --global".to_string(), 17))
+            Some(("Upgrading npm global packages".to_string(), 17))
         );
     }
 
@@ -6589,13 +6677,13 @@ pip_user = true
     fn parse_elevated_failure_handles_utf16le_capture_logs() {
         let mut bytes = vec![0xFF, 0xFE];
         bytes.extend(utf16le_bytes(
-            "WAW_ELEVATED_FAILURE:winget upgrade --all:7\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading winget packages:7\r\n",
         ));
         let stderr_log = decode_capture_text(&bytes, true);
 
         assert_eq!(
             parse_elevated_failure(&stderr_log),
-            Some(("winget upgrade --all".to_string(), 7))
+            Some(("Upgrading winget packages".to_string(), 7))
         );
     }
 
@@ -6603,9 +6691,9 @@ pip_user = true
     fn parse_elevated_failure_accepts_unsigned_windows_exit_code() {
         assert_eq!(
             parse_elevated_failure(
-                "WAW_ELEVATED_FAILURE:winget uninstall --id ProxyPilot:2147746293\r\n"
+                "WAW_ELEVATED_FAILURE:Removing winget: ProxyPilot:2147746293\r\n"
             ),
-            Some(("winget uninstall --id ProxyPilot".to_string(), -2147221003))
+            Some(("Removing winget: ProxyPilot".to_string(), -2147221003))
         );
     }
 
@@ -6645,9 +6733,9 @@ pip_user = true
     #[test]
     fn visible_elevated_stderr_strips_internal_markers() {
         let stderr_log = concat!(
-            "WAW_ELEVATED_STEP:winget upgrade --all\r\n",
+            "WAW_ELEVATED_STEP:Upgrading winget packages\r\n",
             "real stderr line\r\n",
-            "WAW_ELEVATED_FAILURE:winget upgrade --all:9\r\n"
+            "WAW_ELEVATED_FAILURE:Upgrading winget packages:9\r\n"
         );
 
         assert_eq!(visible_elevated_stderr(stderr_log), "real stderr line\n");
@@ -6655,11 +6743,11 @@ pip_user = true
 
     #[test]
     fn format_elevated_batch_failure_prefers_precise_failure_marker() {
-        let stderr_log = "WAW_ELEVATED_FAILURE:winget upgrade --all:9\r\n";
+        let stderr_log = "WAW_ELEVATED_FAILURE:Upgrading winget packages:9\r\n";
 
         assert_eq!(
             format_elevated_batch_failure(1, stderr_log),
-            "backend command failed with exit code 9: winget upgrade --all"
+            "backend command failed with exit code 9: Upgrading winget packages"
         );
     }
 
