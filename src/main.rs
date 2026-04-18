@@ -4332,7 +4332,7 @@ fn build_elevated_batch_command(
     let commands = invocations
         .iter()
         .filter(|invocation| !invocation.program.is_empty())
-        .map(build_elevated_invocation_command)
+        .map(|invocation| build_elevated_invocation_command(invocation, stderr_path))
         .collect::<Vec<_>>()
         .join("; ");
     format!(
@@ -4343,7 +4343,7 @@ fn build_elevated_batch_command(
     )
 }
 
-fn build_elevated_invocation_command(invocation: &Invocation) -> String {
+fn build_elevated_invocation_command(invocation: &Invocation, batch_stderr_path: &OsStr) -> String {
     let argument_list = invocation
         .args
         .iter()
@@ -4353,14 +4353,24 @@ fn build_elevated_invocation_command(invocation: &Invocation) -> String {
     let progress_label = invocation_progress_label(invocation);
     let tolerated_exit_snippet =
         tolerated_elevated_exit_snippet(&invocation.program, &invocation.args);
+    let batch_stderr_path = escape_powershell_single_quoted_os(batch_stderr_path);
     format!(
-        "[Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -eq 0) {{ [Console]::Error.WriteLine('{}{}') }} else {{ [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
+        "Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -eq 0) {{ Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}') }} else {{ Add-Content -LiteralPath '{}' -Value ('{}{}:' + $code) -Encoding utf8; [Console]::Error.WriteLine('{}{}:' + $code); exit $code }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
+        batch_stderr_path,
+        ELEVATED_STEP_MARKER,
+        escape_powershell_single_quoted(&progress_label),
         ELEVATED_STEP_MARKER,
         escape_powershell_single_quoted(&progress_label),
         escape_powershell_single_quoted(&invocation.program),
         argument_list,
         tolerated_exit_snippet,
+        batch_stderr_path,
         ELEVATED_SUCCESS_MARKER,
+        escape_powershell_single_quoted(&progress_label),
+        ELEVATED_SUCCESS_MARKER,
+        escape_powershell_single_quoted(&progress_label),
+        batch_stderr_path,
+        ELEVATED_FAILURE_MARKER,
         escape_powershell_single_quoted(&progress_label),
         ELEVATED_FAILURE_MARKER,
         escape_powershell_single_quoted(&progress_label),
@@ -6685,10 +6695,19 @@ pip_user = true
             )
         );
         assert!(command.contains(
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value 'WAW_ELEVATED_STEP:Upgrading winget packages' -Encoding utf8"
+        ));
+        assert!(command.contains(
             "[Console]::Error.WriteLine('WAW_ELEVATED_SUCCESS:Upgrading winget packages')"
         ));
         assert!(command.contains(
             "[Console]::Error.WriteLine('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code)"
+        ));
+        assert!(command.contains(
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value 'WAW_ELEVATED_SUCCESS:Upgrading winget packages' -Encoding utf8"
+        ));
+        assert!(command.contains(
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value ('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code) -Encoding utf8"
         ));
         assert!(command.contains("1>> 'C:\\Temp\\waw.stdout.log'"));
         assert!(command.contains("2>> 'C:\\Temp\\waw.stderr.log'"));
