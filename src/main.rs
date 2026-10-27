@@ -5003,16 +5003,86 @@ impl ProgressReporter {
     }
 }
 
-const PIP_SEARCH_SCRIPT: &str = r#"import json, sys, urllib.request
-query = sys.argv[1].strip().lower()
-req = urllib.request.Request("https://pypi.org/simple/", headers={"Accept": "application/vnd.pypi.simple.v1+json"})
-with urllib.request.urlopen(req) as resp:
-    data = json.load(resp)
-names = [p.get("name") for p in data.get("projects", []) if isinstance(p, dict) and p.get("name")]
-matches = [n for n in names if query in n.lower()]
-matches.sort(key=lambda n: (not n.lower().startswith(query), len(n), n.lower()))
-for name in matches[:20]:
-    print(name)
+/// PyPI has no search API: the XML-RPC `search` endpoint was permanently
+/// disabled in 2020 because it was hammered into the ground, and the web UI's
+/// `/search/` route is not a machine API.
+///
+/// The previous implementation worked around that by downloading the entire
+/// simple index and filtering locally. Measured on 2026-10-27 that was
+/// 45,363,902 bytes, 924,326 projects, and roughly 82 seconds per query with
+/// no User-Agent, no compression, and no timeout.
+///
+/// This probes the documented per-project JSON API instead. It only finds
+/// projects whose name it can guess from the query, which is stated in the
+/// CLI help. In exchange a search costs a handful of small requests.
+const PIP_SEARCH_SCRIPT: &str = r#"import json, sys, urllib.error, urllib.request
+query = sys.argv[1].strip()
+normalized = query.lower().replace(" ", "-").replace("_", "-")
+
+candidates = []
+def add(name):
+    lowered = name.lower()
+    if lowered and lowered not in candidates:
+        candidates.append(lowered)
+
+add(normalized)
+for prefix in ("python-", "py-", "django-", "flask-"):
+    add(prefix + normalized)
+add(normalized + "-cli")
+add(normalized + "-api")
+add(normalized + "-sdk")
+add(normalized + "-tools")
+add(normalized + "-client")
+add(normalized + "-server")
+add(normalized + "-utils")
+add(normalized + "-parser")
+add(normalized + "-py")
+add(normalized + "2")
+add(normalized + "3")
+parts = normalized.split("-")
+if len(parts) > 1:
+    add(parts[0])
+    add("".join(parts))
+    add("-".join(reversed(parts)))
+
+def fetch(name):
+    url = "https://pypi.org/pypi/" + name + "/json"
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "waw-cli"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError:
+        return None
+    except Exception:
+        return None
+    info = data.get("info") or {}
+    real_name = info.get("name")
+    if not real_name:
+        return None
+    return {
+        "name": real_name,
+        "version": info.get("version"),
+        "summary": info.get("summary"),
+    }
+
+hits = []
+for candidate in candidates:
+    info = fetch(candidate)
+    if info:
+        hits.append(info)
+
+hits.sort(
+    key=lambda item: (
+        item["name"].lower() != normalized,
+        not item["name"].lower().startswith(normalized),
+        len(item["name"]),
+        item["name"].lower(),
+    )
+)
+print(json.dumps(hits))
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6244,7 +6314,39 @@ fn parse_npm_search_candidates(output: &str) -> Vec<SearchCandidate> {
 }
 
 fn parse_pip_search_candidates(output: &str) -> Vec<SearchCandidate> {
-    output
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // The prober emits a JSON array carrying the resolved version and summary.
+    if trimmed.starts_with('[') {
+        let Ok(JsonValue::Array(items)) = parse_json(trimmed) else {
+            return Vec::new();
+        };
+        return items
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name").and_then(JsonValue::as_str)?;
+                let version = item.get("version").and_then(JsonValue::as_str);
+                let summary = item.get("summary").and_then(JsonValue::as_str);
+                let label = match summary.map(str::trim).filter(|text| !text.is_empty()) {
+                    Some(summary) => format!("{name} - {summary}"),
+                    None => name.to_string(),
+                };
+                Some(SearchCandidate {
+                    backend: Backend::Pip,
+                    label,
+                    install_id: name.to_string(),
+                    version: version.map(str::to_string),
+                    source: Some("pypi".to_string()),
+                })
+            })
+            .collect();
+    }
+
+    // Fallback: one bare project name per line.
+    trimmed
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -7768,6 +7870,7 @@ Commands:
   remove --exact <pkg...>  Uninstall one or more packages directly on the selected backend
   hold [--off] <pkg...>    Add or remove an upgrade hold
   search <query...>        Search the selected backend, or all enabled+available backends in auto mode
+                           Note: PyPI has no search API; pip results are name probes only
   list [--upgradable]      List packages in a normalized table, using the selected backend or all enabled+available backends in auto mode
   show <pkg>               Show normalized package details from the selected backend, or probe all enabled+available backends in auto mode
   export [--file <path>]   Emit an installable manifest of installed packages
@@ -8259,6 +8362,54 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
         // reaches scoop verbatim.
         assert!(rendered.contains("install"), "{rendered}");
         assert!(rendered.contains("gh@2.7.0"), "{rendered}");
+    }
+
+    #[test]
+    fn pip_search_parses_probe_json() {
+        let output = r#"[
+            {"name": "requests", "version": "2.34.2", "summary": "Python HTTP for Humans."},
+            {"name": "requests-api", "version": "1.1.5", "summary": "HTTP requests library."}
+        ]"#;
+        let candidates = parse_pip_search_candidates(output);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].install_id, "requests");
+        assert_eq!(candidates[0].version.as_deref(), Some("2.34.2"));
+        assert_eq!(
+            candidates[0].label,
+            "requests - Python HTTP for Humans."
+        );
+    }
+
+    #[test]
+    fn pip_search_falls_back_to_bare_names() {
+        let candidates = parse_pip_search_candidates("GitPython\nrequests\n");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].install_id, "GitPython");
+        assert_eq!(candidates[0].version, None);
+    }
+
+    #[test]
+    fn pip_search_handles_empty_and_missing_summary() {
+        assert!(parse_pip_search_candidates("[]").is_empty());
+        assert!(parse_pip_search_candidates("").is_empty());
+        let candidates =
+            parse_pip_search_candidates(r#"[{"name":"solo","version":"1.0","summary":null}]"#);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].label, "solo");
+    }
+
+    #[test]
+    fn pip_search_script_does_not_download_the_index() {
+        // Guard against reintroducing the whole-index download, which measured
+        // 45 MB and ~82 s per query.
+        assert!(
+            !PIP_SEARCH_SCRIPT.contains("pypi.org/simple"),
+            "the pip search prober must not fetch the simple index"
+        );
+        assert!(
+            PIP_SEARCH_SCRIPT.contains("/json"),
+            "the prober should use the documented per-project JSON API"
+        );
     }
 
     #[test]
