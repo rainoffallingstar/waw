@@ -106,6 +106,125 @@ unsafe extern "system" {
     fn CloseHandle(handle: Handle) -> i32;
 }
 
+#[cfg(windows)]
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+#[cfg(windows)]
+const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+#[cfg(windows)]
+const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: isize = -1;
+#[cfg(windows)]
+const PROCESS_TERMINATE: u32 = 0x0001;
+#[cfg(windows)]
+const PROCESS_SET_QUOTA: u32 = 0x0100;
+
+#[cfg(windows)]
+#[repr(C)]
+struct ThreadEntry32 {
+    dw_size: u32,
+    cnt_usage: u32,
+    th32_thread_id: u32,
+    th32_owner_process_id: u32,
+    tp_base_pri: i32,
+    tp_priority_delta: i32,
+    dw_flags: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> Handle;
+    fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+    fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+    fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+    fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+    fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> Handle;
+    fn ResumeThread(thread: Handle) -> u32;
+    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
+    fn TerminateProcess(handle: Handle, exit_code: u32) -> i32;
+}
+
+/// Owns a Windows job object so that a timed-out backend command can be
+/// terminated together with every process it spawned.
+///
+/// The process is started suspended and attached to the job before any of its
+/// threads run, which closes the race where a wrapper such as `scoop.cmd`
+/// could spawn a grandchild before the assignment happened.
+#[cfg(windows)]
+struct ProcessJob {
+    handle: Handle,
+}
+
+#[cfg(windows)]
+impl ProcessJob {
+    fn create() -> Option<Self> {
+        let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self { handle })
+        }
+    }
+
+    fn assign(&self, process: Handle) -> bool {
+        unsafe { AssignProcessToJobObject(self.handle, process) != 0 }
+    }
+
+    fn terminate(&self, exit_code: u32) {
+        if !self.handle.is_null() {
+            unsafe {
+                TerminateJobObject(self.handle, exit_code);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessJob {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resume_process_threads(process_id: u32) -> usize {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot as isize == INVALID_HANDLE_VALUE || snapshot.is_null() {
+        return 0;
+    }
+
+    let mut entry: ThreadEntry32 = unsafe { std::mem::zeroed() };
+    entry.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;
+
+    let mut resumed = 0usize;
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if entry.th32_owner_process_id == process_id {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32_thread_id) };
+            if !thread.is_null() {
+                unsafe {
+                    ResumeThread(thread);
+                    CloseHandle(thread);
+                }
+                resumed += 1;
+            }
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    resumed
+}
+
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -1416,6 +1535,25 @@ fn run_quiet_command_capture(invocation: &Invocation) -> Result<CommandCapture, 
     run_logged_command_capture_inner(invocation, "", false, |_| false, true)
 }
 
+/// Terminates a timed-out child and everything it spawned.
+///
+/// On Windows the child is attached to a job object at spawn time, so the whole
+/// tree can be torn down in one call. `Child::kill` alone only reaches the
+/// wrapper (`scoop.cmd`, `npm.cmd`, ...) and leaves grandchildren running.
+fn kill_process_tree(child: &mut std::process::Child, job: Option<&ProcessJobHandle>) {
+    #[cfg(windows)]
+    if let Some(job) = job {
+        job.terminate(1);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+type ProcessJobHandle = ProcessJob;
+#[cfg(not(windows))]
+type ProcessJobHandle = ();
+
 fn run_logged_command_capture_inner(
     invocation: &Invocation,
     label: &str,
@@ -1430,7 +1568,8 @@ fn run_logged_command_capture_inner(
         .map_err(|error| format!("failed to open stderr capture file: {error}"))?;
     let progress_label = compact_progress_label(label);
 
-    let mut child = Command::new(&invocation.program)
+    let mut command = Command::new(&invocation.program);
+    command
         .args(&invocation.args)
         .stdin(if inherit_stdin {
             Stdio::inherit()
@@ -1438,9 +1577,46 @@ fn run_logged_command_capture_inner(
             Stdio::null()
         })
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
+        .stderr(Stdio::from(stderr_file));
+
+    // On Windows the child is started suspended so that it can be attached to
+    // a job object before any of its threads run. That way a timed-out backend
+    // takes down the wrapper script's grandchildren too, not just the wrapper.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to launch {}: {error}", invocation.program))?;
+
+    #[cfg(windows)]
+    let job = {
+        let job = ProcessJob::create();
+        let pid = child.id();
+        if let Some(active_job) = job.as_ref() {
+            let process_handle = unsafe {
+                OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid)
+            };
+            if !process_handle.is_null() {
+                let assigned = active_job.assign(process_handle);
+                unsafe {
+                    CloseHandle(process_handle);
+                }
+                if !assigned {
+                    // Assignment can fail when the process already belongs to a
+                    // job with a conflicting limit; fall back to a plain kill.
+                }
+            }
+        }
+        resume_process_threads(pid);
+        job
+    };
+
+    #[cfg(not(windows))]
+    let job: Option<()> = None;
 
     let mut reporter = ProgressReporter::new_with_enabled(!quiet);
     let timeout = command_timeout();
@@ -1457,8 +1633,7 @@ fn run_logged_command_capture_inner(
             break;
         }
         if timeout.is_some_and(|limit| started_at.elapsed() >= limit) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_process_tree(&mut child, job.as_ref());
             timed_out = true;
             break;
         }
@@ -4611,6 +4786,8 @@ fn run_logged_elevated_command_file(
     )?;
 
     let mut reporter = ProgressReporter::new();
+    let timeout = command_timeout();
+    let started_at = Instant::now();
     loop {
         let current_label = latest_elevated_step(&read_capture_log(&capture.status_path))
             .unwrap_or_else(|| label.to_string());
@@ -4618,6 +4795,14 @@ fn run_logged_elevated_command_file(
 
         if process.wait(Duration::from_millis(150))?.is_some() {
             break;
+        }
+        if timeout.is_some_and(|limit| started_at.elapsed() >= limit) {
+            process.terminate();
+            reporter.finish(false, &current_label)?;
+            return Err(format!(
+                "elevated command timed out after {}s: {current_label}",
+                COMMAND_TIMEOUT_SECONDS.load(std::sync::atomic::Ordering::Relaxed)
+            ));
         }
     }
 
@@ -4715,6 +4900,10 @@ impl ElevatedProcessHandle {
         }
     }
 
+    fn terminate(&self) -> bool {
+        unsafe { TerminateProcess(self.handle, 1) != 0 }
+    }
+
     fn finish(self) -> Result<std::process::ExitStatus, String> {
         let mut exit_code = 1u32;
         let ok = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) };
@@ -4808,14 +4997,21 @@ fn launch_elevated_command_file(
     }
 }
 
+static CAPTURE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn unique_capture_base(prefix: &str) -> Result<PathBuf, String> {
+    // The wall clock alone is not enough: `SystemTime` granularity on Windows is
+    // about 15 ms, so parallel backend threads would produce identical names and
+    // clobber each other's capture files. The atomic counter makes every call
+    // unique within the process.
+    let sequence = CAPTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("failed to build capture timestamp: {error}"))?
+        .as_nanos();
     Ok(env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("failed to build capture timestamp: {error}"))?
-            .as_nanos()
+        "{prefix}-{}-{nanos}-{sequence}",
+        std::process::id()
     )))
 }
 
@@ -7092,6 +7288,35 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
         let json = render_search_results_json(&candidates);
         assert!(json.contains("\"version\":null"));
         assert!(json.contains("\"source\":null"));
+    }
+
+    #[test]
+    fn command_timeout_none_when_disabled() {
+        configure_command_timeout(0);
+        assert!(command_timeout().is_none());
+        configure_command_timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS);
+        assert_eq!(
+            command_timeout(),
+            Some(Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECONDS))
+        );
+    }
+
+    #[test]
+    fn timeout_failure_message_is_distinct_from_exit_code_failure() {
+        let invocation = Invocation::owned("tool", vec!["list".to_string()]);
+        let capture = CommandCapture {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            status_code: 1,
+            timed_out: true,
+        };
+        let message = render_command_failure(&invocation, &capture);
+        assert!(
+            message.contains("timed out"),
+            "timed-out command should say so, got: {message}"
+        );
+        assert!(!message.contains("exit code"));
     }
 
     #[test]
