@@ -1,0 +1,2627 @@
+//! Unit tests for the crate root. Kept out of `main.rs` so the module
+//! files stay readable.
+
+use crate::*;
+
+    #[test]
+    fn parses_winget_localized_show_fields() {
+        let output = concat!(
+            "已找到 Git [Git.Git]\r\n",
+            "版本: 2.56.0.3\r\n",
+            "发布者: The Git Development Community\r\n",
+            "主页: https://gitforwindows.org/\r\n",
+            "许可证: GPL-2.0\r\n",
+            "描述:\r\n",
+            "  Git is a distributed version control system.\r\n",
+            "标记：\r\n",
+            "  git\r\n",
+            "  版本控制系统\r\n",
+        );
+
+        let details = parse_key_value_show_details(output).expect("should parse");
+        assert_eq!(details.name, "Git");
+        assert_eq!(details.version, "2.56.0.3");
+        assert_eq!(details.license.as_deref(), Some("GPL-2.0"));
+        assert_eq!(details.author.as_deref(), Some("The Git Development Community"));
+        assert_eq!(details.homepage.as_deref(), Some("https://gitforwindows.org/"));
+        assert!(
+            details.summary.as_deref().unwrap_or_default().contains("version control"),
+            "summary should absorb indented continuation: {:?}",
+            details.summary
+        );
+    }
+
+    #[test]
+    fn parses_full_width_colon_fields() {
+        let output = "名称：demo\n版本：1.2.3\n";
+        let fields = parse_colon_fields(output);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(find_field_value(&fields, NAME_ALIASES).as_deref(), Some("demo"));
+        assert_eq!(find_field_value(&fields, VERSION_ALIASES).as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn parses_english_show_fields_without_regression() {
+        let output = "\
+Name: git\n\
+Version: 2.53.0.3\n\
+Source: main\n\
+License: GPL-2.0-only\n";
+        let details = parse_key_value_show_details(output).expect("should parse");
+        assert_eq!(details.name, "git");
+        assert_eq!(details.version, "2.53.0.3");
+        assert_eq!(details.license.as_deref(), Some("GPL-2.0-only"));
+    }
+
+    #[test]
+    fn parses_choco_show_details() {
+        let output = "\
+Chocolatey v2.4.3\r\n\
+rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
+ Title: rustup (Install) | Published: 2024/8/30\r\n\
+ Package url https://community.chocolatey.org/packages/rustup.install/1.27.1\r\n\
+  Chocolatey Package Source: https://github.com/camilohe/rustup.install\r\n\
+ Tags: rustup rust\r\n\
+ Software Site: https://rustup.rs/\r\n\
+ Summary: rustup: the Rust toolchain installer\r\n";
+
+        let details = parse_choco_show_details(output).expect("should parse");
+        assert_eq!(details.name, "rustup");
+        assert_eq!(details.version, "1.27.1");
+        assert_eq!(details.homepage.as_deref(), Some("https://rustup.rs/"));
+        assert_eq!(
+            details.summary.as_deref(),
+            Some("rustup: the Rust toolchain installer")
+        );
+        assert_eq!(details.keywords, vec!["rustup", "rust"]);
+    }
+
+    #[test]
+    fn winget_found_header_supplies_name() {
+        let output = "已找到 7-Zip [7zip.7zip]\n版本: 26.00\n";
+        let details = parse_key_value_show_details(output).expect("should parse");
+        assert_eq!(details.name, "7-Zip");
+        assert_eq!(details.version, "26.00");
+    }
+
+    #[test]
+    fn list_json_is_valid_and_complete() {
+        let rows = vec![PackageListEntry {
+            backend: Backend::Winget,
+            name: "123云盘".to_string(),
+            package_id: "123.123pan".to_string(),
+            current_version: "3.1.5.0".to_string(),
+            available_version: Some("3.2.8.0".to_string()),
+        }];
+        let json = render_list_results_json(&rows, true);
+        assert!(json.contains("\"backend\":\"winget\""));
+        assert!(json.contains("123云盘"));
+        assert!(json.contains("\"available_version\":\"3.2.8.0\""));
+        assert!(json.starts_with("[\n"));
+    }
+
+    #[test]
+    fn search_json_renders_nulls() {
+        let candidates = vec![SearchCandidate {
+            backend: Backend::Npm,
+            label: "typescript".to_string(),
+            install_id: "typescript".to_string(),
+            version: None,
+            source: None,
+        }];
+        let json = render_search_results_json(&candidates);
+        assert!(json.contains("\"version\":null"));
+        assert!(json.contains("\"source\":null"));
+    }
+
+    #[test]
+    fn timeout_from_seconds_treats_zero_as_unlimited() {
+        assert!(timeout_from_seconds(0).is_none());
+        assert_eq!(
+            timeout_from_seconds(DEFAULT_COMMAND_TIMEOUT_SECONDS),
+            Some(Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECONDS))
+        );
+        assert_eq!(timeout_from_seconds(5), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn timeout_failure_message_is_distinct_from_exit_code_failure() {
+        let invocation = Invocation::owned("tool", vec!["list".to_string()]);
+        let capture = CommandCapture {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            status_code: 1,
+            timed_out: true,
+            timeout_seconds: None,
+        };
+        let message = render_command_failure(&invocation, &capture);
+        assert!(
+            message.contains("timed out"),
+            "timed-out command should say so, got: {message}"
+        );
+        assert!(!message.contains("exit code"));
+    }
+
+    // Only the capture-file tests below create files in the temp directory, and
+    // they assert on that directory's contents. Running them concurrently makes
+    // those assertions observe each other's files, so they take this lock.
+    static CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CAPTURE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn count_capture_files(prefix: &str) -> usize {
+        fs::read_dir(env::temp_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(prefix)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn command_capture_files_are_removable_by_drop() {
+        let _guard = capture_test_guard();
+        let capture = CommandLogCapture::new().expect("capture should be created");
+        let stdout_path = capture.stdout_path.clone();
+        let stderr_path = capture.stderr_path.clone();
+
+        fs::write(&stdout_path, b"out").expect("stdout should be writable");
+        fs::write(&stderr_path, b"err").expect("stderr should be writable");
+        assert!(stdout_path.exists());
+        assert!(stderr_path.exists());
+
+        drop(capture);
+
+        assert!(!stdout_path.exists(), "stdout capture should be removed on drop");
+        assert!(!stderr_path.exists(), "stderr capture should be removed on drop");
+    }
+
+    #[test]
+    fn elevation_capture_files_are_removable_by_drop() {
+        let _guard = capture_test_guard();
+        let capture = ElevationCapture::new().expect("capture should be created");
+        let paths = [
+            capture.stdout_path.clone(),
+            capture.stderr_path.clone(),
+            capture.status_path.clone(),
+            capture.command_path.clone(),
+        ];
+        for path in &paths {
+            fs::write(path, b"x").expect("capture file should be writable");
+            assert!(path.exists());
+        }
+
+        drop(capture);
+
+        for path in &paths {
+            assert!(!path.exists(), "{} should be removed on drop", path.display());
+        }
+    }
+
+    #[test]
+    fn capture_names_are_unique_under_rapid_creation() {
+        let _guard = capture_test_guard();
+        // Windows SystemTime granularity is roughly 15 ms, so this guards the
+        // parallel backend path against capture files clobbering each other.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let base = unique_capture_base("waw-uniqueness").expect("base should build");
+            assert!(
+                seen.insert(base.clone()),
+                "duplicate capture base generated: {}",
+                base.display()
+            );
+        }
+    }
+
+    #[test]
+    fn failing_command_still_removes_capture_files() {
+        let _guard = capture_test_guard();
+        let before = count_capture_files("waw-command-");
+        let invocation = Invocation::owned(
+            "waw-definitely-not-a-real-program-7f3a",
+            vec!["list".to_string()],
+        );
+
+        let result =
+            run_logged_command_capture_with_label(&invocation, "probe", false, None, |_| false);
+        assert!(result.is_err(), "launching a missing program must fail");
+
+        let after = count_capture_files("waw-command-");
+        assert_eq!(
+            before, after,
+            "a failed launch must not leave capture files behind (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    fn parses_minimal_json_values() {
+        let value = parse_json(r#"{"a":1,"b":[true,false,null],"c":"x","d":{"e":2}}"#)
+            .expect("json should parse");
+        assert_eq!(value.get("c").and_then(JsonValue::as_str), Some("x"));
+        assert_eq!(value.get("b").and_then(JsonValue::as_array).map(<[_]>::len), Some(3));
+        assert_eq!(
+            value.get("d").and_then(|inner| inner.get("e")),
+            Some(&JsonValue::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn json_parser_rejects_trailing_garbage() {
+        assert!(parse_json(r#"{"a":1} trailing"#).is_err());
+        assert!(parse_json(r#"{"a":}"#).is_err());
+        assert!(parse_json("").is_err());
+    }
+
+    #[test]
+    fn json_parser_handles_escapes_and_unicode() {
+        let value = parse_json(r#"{"k":"a\"b\\c\u4e91"}"#).expect("json should parse");
+        assert_eq!(value.get("k").and_then(JsonValue::as_str), Some("a\"b\\c云"));
+    }
+
+    #[test]
+    fn winget_resource_ids_are_not_installable() {
+        assert!(!is_installable_package_id(
+            Backend::Winget,
+            r"ARP\Machine\X64\74402CAB-65A4-4F40-8D63-02A6DB3FB923_is1"
+        ));
+        assert!(!is_installable_package_id(
+            Backend::Winget,
+            r"MSIX\MFSyncCloudShell_1.0.0.0_x64__f7bd3qkyghp9r"
+        ));
+        assert!(is_installable_package_id(Backend::Winget, "123.123pan"));
+        assert!(is_installable_package_id(Backend::Scoop, "git"));
+        assert!(is_installable_package_id(Backend::Npm, "@scope/pkg"));
+    }
+
+    #[test]
+    fn manifest_round_trips_through_render_and_parse() {
+        let packages = vec![
+            ManifestPackage {
+                backend: Backend::Winget,
+                id: "123.123pan".to_string(),
+                name: "123云盘".to_string(),
+                version: Some("3.1.5.0".to_string()),
+            },
+            ManifestPackage {
+                backend: Backend::Scoop,
+                id: "git".to_string(),
+                name: "git".to_string(),
+                version: Some("2.53.0.3".to_string()),
+            },
+        ];
+
+        let rendered = render_manifest_json(&packages);
+        let parsed = parse_manifest(&rendered).expect("manifest should parse");
+        assert_eq!(parsed, packages);
+    }
+
+    #[test]
+    fn manifest_accepts_winget_export_format() {
+        let winget_export = r#"{
+  "$schema": "https://aka.ms/winget-packages.schema.2.0.json",
+  "CreationDate": "2026-10-27T17:28:06.559-00:00",
+  "Sources": [
+    {"Packages": [
+      {"PackageIdentifier": "7zip.7zip"},
+      {"PackageIdentifier": "Git.Git"}
+    ], "SourceDetails": {"Name": "winget"}}
+  ]
+}"#;
+
+        let parsed = parse_manifest(winget_export).expect("winget export should parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].backend, Backend::Winget);
+        assert_eq!(parsed[0].id, "7zip.7zip");
+        assert_eq!(parsed[1].id, "Git.Git");
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_format() {
+        assert!(parse_manifest(r#"{"unexpected": true}"#).is_err());
+        assert!(parse_manifest("not json").is_err());
+    }
+
+    #[test]
+    fn parses_package_spec_forms() {
+        let plain = PackageSpec::parse("git");
+        assert_eq!(plain.name, "git");
+        assert_eq!(plain.version, None);
+
+        let at = PackageSpec::parse("git@2.43.0");
+        assert_eq!(at.name, "git");
+        assert_eq!(at.version.as_deref(), Some("2.43.0"));
+
+        let pip = PackageSpec::parse("requests==2.31.0");
+        assert_eq!(pip.name, "requests");
+        assert_eq!(pip.version.as_deref(), Some("2.31.0"));
+
+        let scoped = PackageSpec::parse("@scope/name");
+        assert_eq!(scoped.name, "@scope/name");
+        assert_eq!(scoped.version, None);
+
+        let scoped_versioned = PackageSpec::parse("@scope/name@1.2.3");
+        assert_eq!(scoped_versioned.name, "@scope/name");
+        assert_eq!(scoped_versioned.version.as_deref(), Some("1.2.3"));
+
+        // A version containing a dot-less scope separator must not be split
+        // into garbage.
+        let pip_extras = PackageSpec::parse("pkg[extra]==1.0");
+        assert_eq!(pip_extras.name, "pkg[extra]");
+        assert_eq!(pip_extras.version.as_deref(), Some("1.0"));
+    }
+
+    #[test]
+    fn winget_install_pins_version_with_flag() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            command_timeout: None,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("Git.Git@2.43.0")];
+        let invocations = Backend::Winget.plan_install(&specs, &runtime);
+        assert_eq!(invocations.len(), 1);
+        let rendered = invocations[0].render_for_display();
+        assert!(rendered.contains("--id Git.Git"), "{rendered}");
+        assert!(rendered.contains("--version 2.43.0"), "{rendered}");
+        assert!(rendered.contains("--exact"), "{rendered}");
+    }
+
+    #[test]
+    fn npm_install_pins_version_in_argument() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            command_timeout: None,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("@types/node@20.11.0")];
+        let invocations = Backend::Npm.plan_install(&specs, &runtime);
+        assert_eq!(invocations.len(), 1);
+        let rendered = invocations[0].render_for_display();
+        assert!(rendered.contains("@types/node@20.11.0"), "{rendered}");
+    }
+
+    #[test]
+    fn pip_install_pins_version_with_double_equals() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            command_timeout: None,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("requests@2.31.0")];
+        let invocations = Backend::Pip.plan_install(&specs, &runtime);
+        let rendered = invocations[0].render_for_display();
+        assert!(rendered.contains("requests==2.31.0"), "{rendered}");
+    }
+
+    #[test]
+    fn choco_install_pins_version_with_flag() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            command_timeout: None,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("nodejs.install@0.10.35")];
+        let invocations = Backend::Chocolatey.plan_install(&specs, &runtime);
+        let rendered = invocations[0].render_for_display();
+        assert!(rendered.contains("--version 0.10.35"), "{rendered}");
+    }
+
+    #[test]
+    fn scoop_install_pins_version_in_argument() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            command_timeout: None,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("gh@2.7.0")];
+        let invocations = Backend::Scoop.plan_install(&specs, &runtime);
+        let rendered = invocations[0].render_for_display();
+        // The `@` makes the renderer quote the argument; the target still
+        // reaches scoop verbatim.
+        assert!(rendered.contains("install"), "{rendered}");
+        assert!(rendered.contains("gh@2.7.0"), "{rendered}");
+    }
+
+    #[test]
+    fn pip_search_parses_probe_json() {
+        let output = r#"[
+            {"name": "requests", "version": "2.34.2", "summary": "Python HTTP for Humans."},
+            {"name": "requests-api", "version": "1.1.5", "summary": "HTTP requests library."}
+        ]"#;
+        let candidates = parse_pip_search_candidates(output);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].install_id, "requests");
+        assert_eq!(candidates[0].version.as_deref(), Some("2.34.2"));
+        assert_eq!(
+            candidates[0].label,
+            "requests - Python HTTP for Humans."
+        );
+    }
+
+    #[test]
+    fn pip_search_falls_back_to_bare_names() {
+        let candidates = parse_pip_search_candidates("GitPython\nrequests\n");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].install_id, "GitPython");
+        assert_eq!(candidates[0].version, None);
+    }
+
+    #[test]
+    fn pip_search_handles_empty_and_missing_summary() {
+        assert!(parse_pip_search_candidates("[]").is_empty());
+        assert!(parse_pip_search_candidates("").is_empty());
+        let candidates =
+            parse_pip_search_candidates(r#"[{"name":"solo","version":"1.0","summary":null}]"#);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].label, "solo");
+    }
+
+    #[test]
+    fn pip_search_script_does_not_download_the_index() {
+        // Guard against reintroducing the whole-index download, which measured
+        // 45 MB and ~82 s per query.
+        assert!(
+            !PIP_SEARCH_SCRIPT.contains("pypi.org/simple"),
+            "the pip search prober must not fetch the simple index"
+        );
+        assert!(
+            PIP_SEARCH_SCRIPT.contains("/json"),
+            "the prober should use the documented per-project JSON API"
+        );
+    }
+
+    #[test]
+    fn global_flags_split_before_and_after_subcommand() {
+        let parse = |args: &[&str]| {
+            Cli::parse(args.iter().map(|value| value.to_string()))
+                .unwrap_or_else(|error| panic!("{args:?} should parse: {error}"))
+        };
+
+        let before = parse(&["--json", "list"]);
+        assert!(before.json);
+
+        let after = parse(&["list", "--json"]);
+        assert!(after.json, "global flag after the command must be honoured");
+
+        let mixed = parse(&["list", "--upgradable", "--json"]);
+        assert!(mixed.json);
+        assert_eq!(mixed.command, Subcommand::List { upgradable: true });
+
+        let dry = parse(&["install", "--exact", "git", "--dry-run"]);
+        assert!(dry.dry_run);
+    }
+
+    #[test]
+    fn global_flag_split_respects_value_taking_options() {
+        // `--file` takes a value; the flag after it is a path, not a global.
+        let (remaining, globals) = split_global_flags(&[
+            "--file".to_string(),
+            "--json".to_string(),
+            "--dry-run".to_string(),
+        ]);
+        assert_eq!(remaining, vec!["--file".to_string(), "--json".to_string()]);
+        assert_eq!(globals, vec!["--dry-run".to_string()]);
+    }
+
+    #[test]
+    fn unknown_subcommand_option_is_still_rejected() {
+        let result = Cli::parse(
+            ["list", "--nope"]
+                .iter()
+                .map(|value| value.to_string()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_hold_disable() {
+        let cli = Cli::parse(["hold", "--off", "Git.Git"].into_iter().map(str::to_string))
+            .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Hold {
+                packages: vec!["Git.Git".to_string()],
+                enable: false
+            }
+        );
+    }
+
+    #[test]
+    fn parses_search_query() {
+        let cli = Cli::parse(["search", "power", "toys"].into_iter().map(str::to_string))
+            .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Search {
+                query: "power toys".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_global_backend() {
+        let cli = Cli::parse(
+            ["--backend", "scoop", "install", "git"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(cli.backend, Some(Backend::Scoop));
+        assert_eq!(
+            cli.command,
+            Subcommand::Install {
+                mode: InstallMode::Search("git".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_backend_enable_command() {
+        let cli = Cli::parse(["backend", "enable", "pip"].into_iter().map(str::to_string))
+            .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Backend {
+                action: BackendAction::Enable {
+                    backend: Backend::Pip,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parses_backend_install_with_enable_flag() {
+        let cli = Cli::parse(
+            ["backend", "install", "npm", "--enable"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Backend {
+                action: BackendAction::Install {
+                    backend: Backend::Npm,
+                    enable: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parses_backend_default_auto() {
+        let cli = Cli::parse(
+            ["--json", "backend", "default", "auto"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert!(cli.json);
+        assert_eq!(
+            cli.command,
+            Subcommand::Backend {
+                action: BackendAction::Default { backend: None }
+            }
+        );
+    }
+
+    #[test]
+    fn parses_json_show_command() {
+        let cli = Cli::parse(
+            ["--json", "show", "requests"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert!(cli.json);
+        assert_eq!(
+            cli.command,
+            Subcommand::Show {
+                package: "requests".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_interactive_and_no_elevate_globals() {
+        let cli = Cli::parse(
+            ["--interactive", "--no-elevate", "upgrade"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(cli.assume_yes, Some(false));
+        assert_eq!(cli.auto_elevate, Some(false));
+        assert_eq!(cli.command, Subcommand::Upgrade { packages: vec![] });
+    }
+
+    #[test]
+    fn json_support_covers_show_list_and_search() {
+        assert!(command_supports_json(&Subcommand::Show {
+            package: "requests".to_string(),
+        }));
+        assert!(command_supports_json(&Subcommand::List {
+            upgradable: false
+        }));
+        assert!(command_supports_json(&Subcommand::Search {
+            query: "git".to_string()
+        }));
+        assert!(!command_supports_json(&Subcommand::Backends));
+        assert!(!command_supports_json(&Subcommand::Help));
+    }
+
+    #[test]
+    fn parses_install_search_by_default() {
+        let cli = Cli::parse(
+            ["install", "visual", "studio"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Install {
+                mode: InstallMode::Search("visual studio".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_install_pick_alias() {
+        let cli = Cli::parse(
+            ["install", "--pick", "visual", "studio"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Install {
+                mode: InstallMode::Search("visual studio".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_install_exact_mode() {
+        let cli = Cli::parse(
+            ["install", "--exact", "Git.Git", "Microsoft.PowerToys"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Install {
+                mode: InstallMode::Exact(vec![
+                    PackageSpec::without_version("Git.Git"),
+                    PackageSpec::without_version("Microsoft.PowerToys")
+                ])
+            }
+        );
+    }
+
+    #[test]
+    fn parses_remove_search_by_default() {
+        let cli = Cli::parse(
+            ["remove", "visual", "studio"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Remove {
+                mode: RemoveMode::Search("visual studio".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_remove_exact_mode() {
+        let cli = Cli::parse(
+            ["remove", "--exact", "Git.Git", "Microsoft.PowerToys"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(
+            cli.command,
+            Subcommand::Remove {
+                mode: RemoveMode::Exact(vec![
+                    "Git.Git".to_string(),
+                    "Microsoft.PowerToys".to_string()
+                ])
+            }
+        );
+    }
+
+    #[test]
+    fn parses_config_file() {
+        let config = Config::parse(
+            r#"
+backend = "winget"
+assume_yes = true
+winget_source = "winget"
+choco_source = "https://community.chocolatey.org/api/v2/"
+scoop_bucket = "extras"
+pip_user = true
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.backend, Some(Backend::Winget));
+        assert!(config.assume_yes);
+        assert_eq!(config.winget_source(), Some("winget"));
+        assert_eq!(
+            config.choco_source(),
+            Some("https://community.chocolatey.org/api/v2/")
+        );
+        assert_eq!(config.qualify_scoop_package("git"), "extras/git");
+        assert!(config.pip_user);
+        assert!(config.auto_elevate);
+        assert!(config.enable_winget);
+        assert!(config.enable_pip);
+    }
+
+    #[test]
+    fn config_defaults_to_non_interactive_and_auto_elevate() {
+        let config = Config::default();
+
+        assert!(config.assume_yes);
+        assert!(config.auto_elevate);
+    }
+
+    #[test]
+    fn process_elevation_is_skipped_for_upgrade_preview_before_selection() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+
+        let requires = command_requires_process_elevation(
+            &Subcommand::Upgrade { packages: vec![] },
+            Some(Backend::Winget),
+            &runtime,
+        )
+        .expect("elevation check should succeed");
+
+        assert!(!requires);
+    }
+
+    #[test]
+    fn process_elevation_is_skipped_for_install_search_before_selection() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+
+        let requires = command_requires_process_elevation(
+            &Subcommand::Install {
+                mode: InstallMode::Search("git".to_string()),
+            },
+            None,
+            &runtime,
+        )
+        .expect("elevation check should succeed");
+
+        assert!(!requires);
+    }
+
+    #[test]
+    fn process_elevation_is_skipped_for_user_pip_installs() {
+        let config = Config {
+            pip_user: true,
+            ..Config::default()
+        };
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+
+        let requires = command_requires_process_elevation(
+            &Subcommand::Install {
+                mode: InstallMode::Exact(vec![PackageSpec::without_version("requests")]),
+            },
+            Some(Backend::Pip),
+            &runtime,
+        )
+        .expect("elevation check should succeed");
+
+        assert!(!requires);
+    }
+
+    #[test]
+    fn backend_bootstrap_install_reports_when_automatic_execution_exists() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+
+        let requires = command_requires_process_elevation(
+            &Subcommand::Backend {
+                action: BackendAction::Install {
+                    backend: Backend::Chocolatey,
+                    enable: false,
+                },
+            },
+            None,
+            &runtime,
+        )
+        .expect("elevation check should succeed");
+
+        assert!(!requires);
+    }
+
+    #[test]
+    fn npm_and_pip_bootstrap_only_exist_on_windows_hosts() {
+        assert_eq!(
+            Backend::Npm.install_invocation(true).is_some(),
+            cfg!(windows)
+        );
+        assert_eq!(
+            Backend::Pip.install_invocation(true).is_some(),
+            cfg!(windows)
+        );
+    }
+
+    #[test]
+    fn scoop_bootstrap_is_manual_only() {
+        assert!(Backend::Scoop.install_invocation(true).is_none());
+        assert!(Backend::Scoop.install_hint().contains("https://scoop.sh/"));
+    }
+
+    #[test]
+    fn elevated_child_command_redirects_stdout_and_stderr() {
+        let command = build_elevated_child_command(
+            OsStr::new(r"C:\Tools\waw.exe"),
+            &[OsString::from("upgrade"), OsString::from("--all")],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("Start-Process -FilePath 'C:\\Tools\\waw.exe'"));
+        assert!(command.contains("@('upgrade', '--all')"));
+        assert!(command.contains("-RedirectStandardOutput 'C:\\Temp\\waw.stdout.log'"));
+        assert!(command.contains("-RedirectStandardError 'C:\\Temp\\waw.stderr.log'"));
+        assert!(command.contains("chcp.com 65001 > $null"));
+        assert!(command.contains("exit $code"));
+    }
+
+    #[test]
+    fn elevated_child_command_tolerates_winget_uninstall_not_found() {
+        let command = build_elevated_child_command(
+            OsStr::new(r"C:\Users\fallingstar\AppData\Local\Microsoft\WindowsApps\winget.exe"),
+            &[
+                OsString::from("uninstall"),
+                OsString::from("--id"),
+                OsString::from("ARP\\User\\X64\\ProxyPilot"),
+                OsString::from("--exact"),
+            ],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("[uint32]$code -eq 0x800401F5"));
+    }
+
+    #[test]
+    fn elevated_child_command_tolerates_winget_no_applicable_upgrade() {
+        let command = build_elevated_child_command(
+            OsStr::new(r"C:\Users\fallingstar\AppData\Local\Microsoft\WindowsApps\winget.exe"),
+            &[
+                OsString::from("upgrade"),
+                OsString::from("--id"),
+                OsString::from("Posit.Quarto"),
+                OsString::from("--exact"),
+            ],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+        );
+
+        assert!(command.contains("No applicable upgrade found"));
+        assert!(command.contains("找不到适用的升级"));
+    }
+
+    #[test]
+    fn elevated_loader_command_reads_command_file() {
+        let command = build_elevated_loader_command(
+            OsStr::new(r"C:\Temp\elevated-command.txt"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
+        );
+
+        assert!(command.contains("$ErrorActionPreference = 'Stop'"));
+        assert!(command.contains(
+            "ReadAllText('C:\\Temp\\elevated-command.txt', [System.Text.Encoding]::UTF8)"
+        ));
+        assert!(command.contains("[scriptblock]::Create("));
+        assert!(command.contains(
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value ('WAW_ELEVATED_BOOTSTRAP_FAILURE:' + $wawMessage) -Encoding utf8"
+        ));
+    }
+
+    #[test]
+    fn write_elevated_command_file_writes_utf8_bom() {
+        let path = env::temp_dir().join(format!(
+            "waw-elevated-command-test-{}-{}.txt",
+            std::process::id(),
+            APP_VERSION
+        ));
+
+        write_elevated_command_file(&path, "Write-Host 'hello'")
+            .expect("command file should be written");
+        let bytes = fs::read(&path).expect("script should be readable");
+
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert!(String::from_utf8_lossy(&bytes[3..]).contains("Write-Host 'hello'"));
+
+        fs::remove_file(&path).expect("script should be removed");
+    }
+
+    #[test]
+    fn elevated_batch_command_runs_each_invocation_and_redirects_logs() {
+        let command = build_elevated_batch_command(
+            &[
+                Invocation::owned("winget", vec!["upgrade".to_string(), "--all".to_string()]),
+                Invocation::owned(
+                    "npm.cmd",
+                    vec!["update".to_string(), "--global".to_string()],
+                ),
+            ],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
+            false,
+        );
+
+        assert!(command.contains("& {"));
+        assert!(command.contains("Start-Process -FilePath 'winget'"));
+        assert!(command.contains("Start-Process -FilePath 'npm.cmd'"));
+        assert!(command.contains("-ArgumentList @('upgrade', '--all')"));
+        assert!(command.contains("-ArgumentList @('update', '--global')"));
+        assert!(command.contains("-RedirectStandardOutput $wawStdout"));
+        assert!(command.contains("-RedirectStandardError $wawStderr"));
+        assert!(!command.contains("-WindowStyle Hidden"));
+        assert!(command.contains("chcp.com 65001 > $null"));
+        assert!(
+            command.contains(
+                "[Console]::Error.WriteLine('WAW_ELEVATED_STEP:Upgrading winget packages')"
+            )
+        );
+        assert!(command.contains(
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value 'WAW_ELEVATED_STEP:Upgrading winget packages' -Encoding utf8"
+        ));
+        assert!(command.contains(
+            "[Console]::Error.WriteLine('WAW_ELEVATED_SUCCESS:Upgrading winget packages')"
+        ));
+        assert!(command.contains(
+            "[Console]::Error.WriteLine('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code)"
+        ));
+        assert!(command.contains(
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value 'WAW_ELEVATED_SUCCESS:Upgrading winget packages' -Encoding utf8"
+        ));
+        assert!(command.contains(
+            "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value ('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code) -Encoding utf8"
+        ));
+        assert!(command.contains("1>> 'C:\\Temp\\waw.stdout.log'"));
+        assert!(command.contains("2>> 'C:\\Temp\\waw.stderr.log'"));
+    }
+
+    #[test]
+    fn invocation_progress_label_includes_winget_target_package() {
+        let invocation = Invocation::owned(
+            "winget",
+            vec![
+                "upgrade".to_string(),
+                "--id".to_string(),
+                "Posit.Quarto".to_string(),
+                "--exact".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            invocation_progress_label(&invocation),
+            "Upgrading winget: Posit.Quarto"
+        );
+    }
+
+    #[test]
+    fn invocation_progress_label_includes_pip_target_package() {
+        let invocation = Invocation::owned(
+            "python",
+            vec![
+                "-m".to_string(),
+                "pip".to_string(),
+                "install".to_string(),
+                "requests".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            invocation_progress_label(&invocation),
+            "Installing pip: requests"
+        );
+    }
+
+    #[test]
+    fn elevated_batch_command_tolerates_winget_uninstall_not_found() {
+        let command = build_elevated_batch_command(
+            &[Invocation::owned(
+                "winget",
+                vec![
+                    "uninstall".to_string(),
+                    "--id".to_string(),
+                    "ARP\\User\\X64\\ProxyPilot".to_string(),
+                    "--exact".to_string(),
+                ],
+            )],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
+            false,
+        );
+
+        assert!(command.contains("[uint32]$code -eq 0x800401F5"));
+    }
+
+    #[test]
+    fn elevated_batch_command_tolerates_winget_no_applicable_upgrade() {
+        let command = build_elevated_batch_command(
+            &[Invocation::owned(
+                "winget",
+                vec![
+                    "upgrade".to_string(),
+                    "--id".to_string(),
+                    "Posit.Quarto".to_string(),
+                    "--exact".to_string(),
+                ],
+            )],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
+            false,
+        );
+
+        assert!(command.contains("No applicable upgrade found"));
+        assert!(command.contains("找不到适用的升级"));
+    }
+
+    #[test]
+    fn elevated_batch_command_can_continue_after_failure() {
+        let command = build_elevated_batch_command(
+            &[Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "code-server@latest".to_string()],
+            )],
+            OsStr::new(r"C:\Temp\waw.stdout.log"),
+            OsStr::new(r"C:\Temp\waw.stderr.log"),
+            OsStr::new(r"C:\Temp\waw.status.log"),
+            true,
+        );
+
+        assert!(command.contains("$script:wawBatchExitCode = 0;"));
+        assert!(
+            command.contains(
+                "if ($script:wawBatchExitCode -eq 0) { $script:wawBatchExitCode = $code }"
+            )
+        );
+        assert!(command.contains(
+            "if ($script:wawBatchExitCode -ne 0) { exit $script:wawBatchExitCode } else { exit 0 }"
+        ));
+    }
+
+    #[test]
+    fn decode_capture_text_handles_utf16le_with_bom() {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(utf16le_bytes("winget upgrade\r\n"));
+
+        assert_eq!(decode_capture_text(&bytes, false), "winget upgrade\r\n");
+        assert_eq!(decode_capture_text(&bytes, true), "winget upgrade\r\n");
+    }
+
+    #[test]
+    fn decode_capture_text_handles_utf16le_without_bom() {
+        let bytes = utf16le_bytes("source update\r\n");
+
+        assert_eq!(decode_capture_text(&bytes, false), "source update\r\n");
+        assert_eq!(decode_capture_text(&bytes, true), "source update\r\n");
+    }
+
+    #[test]
+    fn decode_capture_text_defers_incomplete_utf8_until_final_chunk() {
+        let bytes = vec![b'o', b'k', b' ', 0xE4, 0xB8];
+
+        assert_eq!(decode_capture_text(&bytes, false), "ok ");
+        assert_eq!(decode_capture_text(&bytes, true), "ok �");
+    }
+
+    #[test]
+    fn parse_elevated_failure_extracts_latest_failure_marker() {
+        let stderr_log = concat!(
+            "warning output\r\n",
+            "WAW_ELEVATED_STEP:Upgrading winget packages\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading winget packages:5\r\n",
+            "WAW_ELEVATED_STEP:Upgrading npm global packages\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading npm global packages:17\r\n"
+        );
+
+        assert_eq!(
+            parse_elevated_failure(stderr_log),
+            Some(("Upgrading npm global packages".to_string(), 17))
+        );
+    }
+
+    #[test]
+    fn parse_elevated_failure_handles_utf16le_capture_logs() {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(utf16le_bytes(
+            "WAW_ELEVATED_FAILURE:Upgrading winget packages:7\r\n",
+        ));
+        let stderr_log = decode_capture_text(&bytes, true);
+
+        assert_eq!(
+            parse_elevated_failure(&stderr_log),
+            Some(("Upgrading winget packages".to_string(), 7))
+        );
+    }
+
+    #[test]
+    fn parse_elevated_failure_accepts_unsigned_windows_exit_code() {
+        assert_eq!(
+            parse_elevated_failure(
+                "WAW_ELEVATED_FAILURE:Removing winget: ProxyPilot:2147746293\r\n"
+            ),
+            Some(("Removing winget: ProxyPilot".to_string(), -2147221003))
+        );
+    }
+
+    #[test]
+    fn winget_no_applicable_upgrade_message_matches_english_and_chinese() {
+        assert!(winget_no_applicable_upgrade_message(
+            "No applicable upgrade found; a newer package version is available in the configured sources, but it does not apply to your system or requirements."
+        ));
+        assert!(winget_no_applicable_upgrade_message(
+            "找不到适用的升级，较新的包在配置的源中可用，但不适用于你的系统或要求"
+        ));
+        assert!(!winget_no_applicable_upgrade_message("generic failure"));
+    }
+
+    #[test]
+    fn tolerable_command_failure_recognizes_winget_upgrade_skip() {
+        let invocation = Invocation::owned(
+            "winget",
+            vec![
+                "upgrade".to_string(),
+                "--id".to_string(),
+                "Posit.Quarto".to_string(),
+                "--exact".to_string(),
+            ],
+        );
+        let capture = CommandCapture {
+            stdout: String::new(),
+            stderr: "找不到适用的升级，较新的包在配置的源中可用，但不适用于你的系统或要求"
+                .to_string(),
+            success: false,
+            status_code: 1,
+            timed_out: false,
+            timeout_seconds: None,
+        };
+
+        assert!(is_tolerable_command_failure(&invocation, &capture));
+    }
+
+    #[test]
+    fn tolerable_command_failure_recognizes_winget_upgrade_exit_code() {
+        let invocation = Invocation::owned(
+            "winget",
+            vec![
+                "upgrade".to_string(),
+                "--id".to_string(),
+                "Microsoft.Edge".to_string(),
+                "--exact".to_string(),
+            ],
+        );
+        let capture = CommandCapture {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            status_code: WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE,
+            timed_out: false,
+            timeout_seconds: None,
+        };
+
+        assert!(is_tolerable_command_failure(&invocation, &capture));
+    }
+
+    #[test]
+    fn winget_upgrade_elevated_snippet_tolerates_known_exit_code() {
+        let snippet = tolerated_elevated_exit_snippet(
+            "winget",
+            &[
+                "upgrade".to_string(),
+                "--id".to_string(),
+                "Microsoft.Edge".to_string(),
+            ],
+        );
+
+        assert!(snippet.contains("[int]$code -eq -1978335189"));
+        assert!(snippet.contains("[uint32]$code -eq 0x8A15002B"));
+    }
+
+    #[test]
+    fn visible_elevated_stderr_strips_internal_markers() {
+        let stderr_log = concat!(
+            "WAW_ELEVATED_STEP:Upgrading winget packages\r\n",
+            "WAW_ELEVATED_SUCCESS:Upgrading winget packages\r\n",
+            "WAW_ELEVATED_BOOTSTRAP_FAILURE:loader failed\r\n",
+            "real stderr line\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading winget packages:9\r\n"
+        );
+
+        assert_eq!(visible_elevated_stderr(stderr_log), "real stderr line\n");
+    }
+
+    #[test]
+    fn summarize_elevated_batch_distinguishes_success_failure_and_not_started() {
+        let invocations = vec![
+            Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "code-server@latest".to_string()],
+            ),
+            Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "opencode-ai@latest".to_string()],
+            ),
+            Invocation::owned(
+                "python",
+                vec![
+                    "-m".to_string(),
+                    "pip".to_string(),
+                    "install".to_string(),
+                    "--upgrade".to_string(),
+                    "pydantic".to_string(),
+                ],
+            ),
+        ];
+        let stderr_log = concat!(
+            "WAW_ELEVATED_STEP:Upgrading npm: code-server@latest\r\n",
+            "WAW_ELEVATED_SUCCESS:Upgrading npm: code-server@latest\r\n",
+            "WAW_ELEVATED_STEP:Upgrading npm: opencode-ai@latest\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading npm: opencode-ai@latest:1\r\n",
+        );
+
+        assert_eq!(
+            summarize_elevated_batch(&invocations, stderr_log),
+            vec![
+                ElevatedBatchStepSummary {
+                    label: "Upgrading npm: code-server@latest".to_string(),
+                    status: ElevatedBatchStepStatus::Succeeded,
+                },
+                ElevatedBatchStepSummary {
+                    label: "Upgrading npm: opencode-ai@latest".to_string(),
+                    status: ElevatedBatchStepStatus::Failed(1),
+                },
+                ElevatedBatchStepSummary {
+                    label: "Upgrading pip: pydantic".to_string(),
+                    status: ElevatedBatchStepStatus::NotStarted,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_elevated_batch_summary_lists_succeeded_failed_and_not_started() {
+        let invocations = vec![
+            Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "code-server@latest".to_string()],
+            ),
+            Invocation::owned(
+                "npm.cmd",
+                vec!["update".to_string(), "opencode-ai@latest".to_string()],
+            ),
+            Invocation::owned(
+                "python",
+                vec![
+                    "-m".to_string(),
+                    "pip".to_string(),
+                    "install".to_string(),
+                    "--upgrade".to_string(),
+                    "pydantic".to_string(),
+                ],
+            ),
+        ];
+        let stderr_log = concat!(
+            "WAW_ELEVATED_STEP:Upgrading npm: code-server@latest\r\n",
+            "WAW_ELEVATED_SUCCESS:Upgrading npm: code-server@latest\r\n",
+            "WAW_ELEVATED_STEP:Upgrading npm: opencode-ai@latest\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading npm: opencode-ai@latest:1\r\n",
+        );
+
+        assert_eq!(
+            render_elevated_batch_summary(&invocations, stderr_log),
+            Some(
+                [
+                    "Batch summary:",
+                    "Succeeded (1):",
+                    "- Upgrading npm: code-server@latest",
+                    "Failed (1):",
+                    "- Upgrading npm: opencode-ai@latest (exit code 1)",
+                    "Not started (1):",
+                    "- Upgrading pip: pydantic",
+                ]
+                .join("\n")
+            )
+        );
+    }
+
+    #[test]
+    fn render_invocation_batch_summary_lists_succeeded_and_failed() {
+        let succeeded = vec![
+            "Upgrading winget: KaringX.Karing".to_string(),
+            "Upgrading pip: pydantic".to_string(),
+        ];
+        let failed = vec![(
+            "Installing npm: code-server@latest".to_string(),
+            "backend command failed with exit code 1: npm update --global code-server@latest"
+                .to_string(),
+        )];
+
+        assert_eq!(
+            render_invocation_batch_summary(&succeeded, &failed),
+            Some(
+                [
+                    "Batch summary:",
+                    "Succeeded (2):",
+                    "- Upgrading winget: KaringX.Karing",
+                    "- Upgrading pip: pydantic",
+                    "Failed (1):",
+                    "- Installing npm: code-server@latest: backend command failed with exit code 1: npm update --global code-server@latest",
+                ]
+                .join("\n")
+            )
+        );
+    }
+
+    #[test]
+    fn format_elevated_batch_failure_prefers_precise_failure_marker() {
+        let stderr_log = "WAW_ELEVATED_FAILURE:Upgrading winget packages:9\r\n";
+
+        assert_eq!(
+            format_elevated_batch_failure(1, stderr_log),
+            "backend command failed with exit code 9: Upgrading winget packages"
+        );
+    }
+
+    #[test]
+    fn format_elevated_batch_failure_falls_back_without_marker() {
+        assert_eq!(
+            format_elevated_batch_failure(13, "plain stderr output"),
+            "one or more elevated backend commands failed with exit code 13"
+        );
+    }
+
+    #[test]
+    fn format_elevated_batch_failure_reports_bootstrap_reason() {
+        assert_eq!(
+            format_elevated_batch_failure(
+                1,
+                "WAW_ELEVATED_BOOTSTRAP_FAILURE:The system cannot find the file specified.\r\n"
+            ),
+            "elevated bootstrap failed: The system cannot find the file specified."
+        );
+    }
+
+    #[test]
+    fn format_elevated_batch_failure_reports_multiple_failures() {
+        let stderr_log = concat!(
+            "WAW_ELEVATED_FAILURE:Installing npm: code-server@latest:1\r\n",
+            "WAW_ELEVATED_FAILURE:Upgrading pip: pydantic:1\r\n",
+        );
+
+        assert_eq!(
+            format_elevated_batch_failure(1, stderr_log),
+            "2 backend commands failed; see batch summary above"
+        );
+    }
+
+    #[test]
+    fn winget_upgrade_all_plan_matches_expectation() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: false,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+        let plan = Backend::Winget
+            .plan(&Subcommand::Upgrade { packages: vec![] }, &runtime)
+            .expect("plan should build");
+
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
+        assert_eq!(plan[0].requires_elevation, cfg!(windows));
+        assert_eq!(
+            plan[0].args,
+            vec![
+                "upgrade".to_string(),
+                "--all".to_string(),
+                "--include-unknown".to_string(),
+                "--accept-source-agreements".to_string(),
+                "--accept-package-agreements".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn winget_upgrade_all_with_yes_is_non_interactive() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+        let plan = Backend::Winget
+            .plan(&Subcommand::Upgrade { packages: vec![] }, &runtime)
+            .expect("plan should build");
+
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
+        assert!(plan[0].args.contains(&"--silent".to_string()));
+        assert!(
+            plan[0]
+                .args
+                .contains(&"--disable-interactivity".to_string())
+        );
+    }
+
+    #[test]
+    fn winget_remove_target_with_version_uses_version_flag() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+        let plan = Backend::Winget.plan_remove(
+            &[RemoveTarget {
+                package: "Posit.Quarto".to_string(),
+                version: Some("1.8.26".to_string()),
+            }],
+            &runtime,
+        );
+
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
+        assert_eq!(
+            plan[0].args,
+            vec![
+                "uninstall".to_string(),
+                "--id".to_string(),
+                "Posit.Quarto".to_string(),
+                "--exact".to_string(),
+                "--version".to_string(),
+                "1.8.26".to_string(),
+                "--silent".to_string(),
+                "--disable-interactivity".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn winget_search_uses_configured_source() {
+        let config = Config {
+            winget_source: Some("winget".to_string()),
+            ..Config::default()
+        };
+        let runtime = RuntimeSettings {
+            assume_yes: false,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+        let plan = Backend::Winget
+            .plan(
+                &Subcommand::Search {
+                    query: "git".to_string(),
+                },
+                &runtime,
+            )
+            .expect("plan should build");
+
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
+        assert_eq!(
+            plan[0].args,
+            vec![
+                "search".to_string(),
+                "git".to_string(),
+                "--source".to_string(),
+                "winget".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scoop_install_uses_bucket_prefix() {
+        let config = Config {
+            scoop_bucket: Some("extras".to_string()),
+            ..Config::default()
+        };
+        let runtime = RuntimeSettings {
+            assume_yes: false,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+        let plan = Backend::Scoop
+            .plan(
+                &Subcommand::Install {
+                    mode: InstallMode::Exact(vec![PackageSpec::without_version("git")]),
+                },
+                &runtime,
+            )
+            .expect("plan should build");
+
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["scoop", "scoop.cmd", "scoop.ps1"]);
+        assert_eq!(
+            plan[0].args,
+            vec!["install".to_string(), "extras/git".to_string()]
+        );
+    }
+
+    #[test]
+    fn chocolatey_hold_plan_uses_pin_add() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: false,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+        let plan = Backend::Chocolatey
+            .plan(
+                &Subcommand::Hold {
+                    packages: vec!["git".to_string()],
+                    enable: true,
+                },
+                &runtime,
+            )
+            .expect("plan should build");
+
+        assert_eq!(plan.len(), 1);
+        assert_program_matches(&plan[0].program, &["choco", "choco.exe", "choco.bat"]);
+        assert_eq!(
+            plan[0].args,
+            vec![
+                "pin".to_string(),
+                "add".to_string(),
+                "--name".to_string(),
+                "git".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_selection_ranges_and_deduplicates() {
+        let selected = parse_selection("1 3-4 4,2", 5).expect("selection should parse");
+        assert_eq!(selected, vec![1, 3, 4, 2]);
+    }
+
+    #[test]
+    fn package_list_query_matches_across_multiple_fields() {
+        let entry = PackageListEntry {
+            backend: Backend::Scoop,
+            name: "QQ NT".to_string(),
+            package_id: "qq-nt".to_string(),
+            current_version: "9.9.29".to_string(),
+            available_version: Some("9.9.30".to_string()),
+        };
+
+        assert!(package_list_entry_matches_query(&entry, "qq"));
+        assert!(package_list_entry_matches_query(&entry, "qq nt"));
+        assert!(package_list_entry_matches_query(&entry, "qqnt"));
+        assert!(package_list_entry_matches_query(&entry, "scoop qq"));
+        assert!(package_list_entry_matches_query(&entry, "9.9.29"));
+        assert!(package_list_entry_matches_query(&entry, "9.9.30"));
+        assert!(!package_list_entry_matches_query(&entry, "winget"));
+        assert!(!package_list_entry_matches_query(&entry, "telegram"));
+    }
+
+    #[test]
+    fn compact_search_rank_matches_separator_insensitive_queries() {
+        assert_eq!(search_match_rank("qq nt", "qq-nt", "qqnt"), 0);
+        assert_eq!(search_match_rank("qq music", "qq-music", "qqmu"), 1);
+        assert_eq!(
+            search_match_rank("lite loader", "liteloader-qqnt", "qqnt"),
+            2
+        );
+    }
+
+    #[test]
+    fn parses_scoop_search_candidates_from_bucket_sections() {
+        let candidates = Backend::Scoop.parse_search_candidates(
+            "'main' bucket:\n7zip 24.09\nWARN ignored\n'versions' bucket:\npython310 3.10.11\nNo Matches Found\n",
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                SearchCandidate {
+                    backend: Backend::Scoop,
+                    label: "7zip".to_string(),
+                    install_id: "main/7zip".to_string(),
+                    version: Some("24.09".to_string()),
+                    source: Some("main".to_string()),
+                },
+                SearchCandidate {
+                    backend: Backend::Scoop,
+                    label: "python310".to_string(),
+                    install_id: "versions/python310".to_string(),
+                    version: Some("3.10.11".to_string()),
+                    source: Some("versions".to_string()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_choco_search_candidates_with_limit_output() {
+        let candidates =
+            Backend::Chocolatey.parse_search_candidates("git|2.48.1\nripgrep|14.1.1\n");
+
+        assert_eq!(
+            candidates,
+            vec![
+                SearchCandidate {
+                    backend: Backend::Chocolatey,
+                    label: "git".to_string(),
+                    install_id: "git".to_string(),
+                    version: Some("2.48.1".to_string()),
+                    source: None,
+                },
+                SearchCandidate {
+                    backend: Backend::Chocolatey,
+                    label: "ripgrep".to_string(),
+                    install_id: "ripgrep".to_string(),
+                    version: Some("14.1.1".to_string()),
+                    source: None,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_winget_search_candidates_from_table_output() {
+        let output = "\
+Name                         Id                           Version Source\n\
+-----------------------------------------------------------------------\n\
+Git                          Git.Git                      2.47.1  winget\n\
+Microsoft PowerToys          Microsoft.PowerToys          0.90.1  winget\n";
+
+        let candidates = Backend::Winget.parse_search_candidates(output);
+
+        assert_eq!(
+            candidates,
+            vec![
+                SearchCandidate {
+                    backend: Backend::Winget,
+                    label: "Git".to_string(),
+                    install_id: "Git.Git".to_string(),
+                    version: Some("2.47.1".to_string()),
+                    source: Some("winget".to_string()),
+                },
+                SearchCandidate {
+                    backend: Backend::Winget,
+                    label: "Microsoft PowerToys".to_string(),
+                    install_id: "Microsoft.PowerToys".to_string(),
+                    version: Some("0.90.1".to_string()),
+                    source: Some("winget".to_string()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_winget_search_candidates_from_single_spaced_rows() {
+        let output = "\
+Name Id Version Source\n\
+----------------------\n\
+Git Git.Git 2.45 winget\n\
+";
+
+        let candidates = Backend::Winget.parse_search_candidates(output);
+
+        assert_eq!(
+            candidates,
+            vec![SearchCandidate {
+                backend: Backend::Winget,
+                label: "Git".to_string(),
+                install_id: "Git.Git".to_string(),
+                version: Some("2.45".to_string()),
+                source: Some("winget".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_winget_search_candidates_with_match_column() {
+        let output = "\
+Name                         Id                           Version Match        Source\n\
+-----------------------------------------------------------------------------------\n\
+Git                          Git.Git                      2.47.1  Moniker: git winget\n\
+";
+
+        let candidates = Backend::Winget.parse_search_candidates(output);
+
+        assert_eq!(
+            candidates,
+            vec![SearchCandidate {
+                backend: Backend::Winget,
+                label: "Git".to_string(),
+                install_id: "Git.Git".to_string(),
+                version: Some("2.47.1".to_string()),
+                source: Some("winget".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_winget_installed_list_with_localized_headers() {
+        let output = "\
+名称                         标识符                         版本     源\n\
+-----------------------------------------------------------------------\n\
+Git                          Git.Git                        2.47.1   winget\n\
+Microsoft PowerToys          Microsoft.PowerToys            0.90.1   winget\n\
+";
+
+        assert_eq!(
+            Backend::Winget.parse_list_entries(false, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Winget,
+                    name: "Git".to_string(),
+                    package_id: "Git.Git".to_string(),
+                    current_version: "2.47.1".to_string(),
+                    available_version: None,
+                },
+                PackageListEntry {
+                    backend: Backend::Winget,
+                    name: "Microsoft PowerToys".to_string(),
+                    package_id: "Microsoft.PowerToys".to_string(),
+                    current_version: "0.90.1".to_string(),
+                    available_version: None,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_winget_upgrade_list_with_localized_headers() {
+        let output = "\
+名称                         标识符                         版本     可用     源\n\
+--------------------------------------------------------------------------------\n\
+Git                          Git.Git                        2.47.1   2.48.0   winget\n\
+";
+
+        assert_eq!(
+            Backend::Winget.parse_list_entries(true, output),
+            Some(vec![PackageListEntry {
+                backend: Backend::Winget,
+                name: "Git".to_string(),
+                package_id: "Git.Git".to_string(),
+                current_version: "2.47.1".to_string(),
+                available_version: Some("2.48.0".to_string()),
+            }])
+        );
+    }
+
+    #[test]
+    fn parses_npm_search_candidates_from_warning_prefixed_array() {
+        let output = r#"npm warn config global
+[
+  { "name": "left-pad", "version": "1.3.0" },
+  { "name": "@types/node", "version": "24.0.0" }
+]"#;
+
+        let candidates = Backend::Npm.parse_search_candidates(output);
+
+        assert_eq!(
+            candidates,
+            vec![
+                SearchCandidate {
+                    backend: Backend::Npm,
+                    label: "left-pad".to_string(),
+                    install_id: "left-pad".to_string(),
+                    version: Some("1.3.0".to_string()),
+                    source: Some("npm".to_string()),
+                },
+                SearchCandidate {
+                    backend: Backend::Npm,
+                    label: "@types/node".to_string(),
+                    install_id: "@types/node".to_string(),
+                    version: Some("24.0.0".to_string()),
+                    source: Some("npm".to_string()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_pip_search_candidates_from_python_script_output() {
+        let candidates = Backend::Pip.parse_search_candidates("requests\nrequests-cache\n");
+
+        assert_eq!(
+            candidates,
+            vec![
+                SearchCandidate {
+                    backend: Backend::Pip,
+                    label: "requests".to_string(),
+                    install_id: "requests".to_string(),
+                    version: None,
+                    source: Some("pypi".to_string()),
+                },
+                SearchCandidate {
+                    backend: Backend::Pip,
+                    label: "requests-cache".to_string(),
+                    install_id: "requests-cache".to_string(),
+                    version: None,
+                    source: Some("pypi".to_string()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_npm_installed_list_from_json() {
+        let output = r#"{
+  "name": "lib",
+  "dependencies": {
+    "@openai/codex": {
+      "version": "0.121.0",
+      "overridden": false
+    },
+    "npm": {
+      "version": "11.12.1",
+      "overridden": false
+    }
+  }
+}"#;
+
+        assert_eq!(
+            Backend::Npm.parse_list_entries(false, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Npm,
+                    name: "@openai/codex".to_string(),
+                    package_id: "@openai/codex".to_string(),
+                    current_version: "0.121.0".to_string(),
+                    available_version: None,
+                },
+                PackageListEntry {
+                    backend: Backend::Npm,
+                    name: "npm".to_string(),
+                    package_id: "npm".to_string(),
+                    current_version: "11.12.1".to_string(),
+                    available_version: None,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_npm_upgradable_list_from_json() {
+        let output = r#"{
+  "@openai/codex": {
+    "current": "0.118.0",
+    "wanted": "0.121.0",
+    "latest": "0.121.0"
+  },
+  "happy-coder": {
+    "current": "0.13.0",
+    "wanted": "0.13.1",
+    "latest": "0.13.1"
+  }
+}"#;
+
+        assert_eq!(
+            Backend::Npm.parse_list_entries(true, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Npm,
+                    name: "@openai/codex".to_string(),
+                    package_id: "@openai/codex".to_string(),
+                    current_version: "0.118.0".to_string(),
+                    available_version: Some("0.121.0".to_string()),
+                },
+                PackageListEntry {
+                    backend: Backend::Npm,
+                    name: "happy-coder".to_string(),
+                    package_id: "happy-coder".to_string(),
+                    current_version: "0.13.0".to_string(),
+                    available_version: Some("0.13.1".to_string()),
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_pip_installed_list_from_json() {
+        let output = r#"[
+  {"name": "certifi", "version": "2026.2.25"},
+  {"name": "pip", "version": "26.0"}
+]"#;
+
+        assert_eq!(
+            Backend::Pip.parse_list_entries(false, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Pip,
+                    name: "certifi".to_string(),
+                    package_id: "certifi".to_string(),
+                    current_version: "2026.2.25".to_string(),
+                    available_version: None,
+                },
+                PackageListEntry {
+                    backend: Backend::Pip,
+                    name: "pip".to_string(),
+                    package_id: "pip".to_string(),
+                    current_version: "26.0".to_string(),
+                    available_version: None,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_scoop_installed_list_with_source_column() {
+        let output = "\
+Installed apps:
+
+Name    Version  Source  Updated             Info
+----    -------  ------  -------             ----
+git     2.49.0   main    2026-04-17 13:00:00
+neovim  0.10.4   extras  2026-04-16 10:30:00
+";
+
+        assert_eq!(
+            Backend::Scoop.parse_list_entries(false, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: "git".to_string(),
+                    package_id: "git".to_string(),
+                    current_version: "2.49.0".to_string(),
+                    available_version: None,
+                },
+                PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: "neovim".to_string(),
+                    package_id: "neovim".to_string(),
+                    current_version: "0.10.4".to_string(),
+                    available_version: None,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_scoop_installed_list_ignoring_failed_rows() {
+        let output = "\
+Installed apps:
+
+Name         Version      Source Updated             Info
+----         -------      ------ -------             ----
+7zip         26.00        main   2026-04-16 10:54:56
+flclash                          2025-03-19 21:36:37 Install failed
+git          2.53.0.3     main   2026-04-16 12:13:01
+telegram                         2025-02-18 15:42:10 Install failed
+";
+
+        assert_eq!(
+            Backend::Scoop.parse_list_entries(false, output),
+            Some(vec![
+                PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: "7zip".to_string(),
+                    package_id: "7zip".to_string(),
+                    current_version: "26.00".to_string(),
+                    available_version: None,
+                },
+                PackageListEntry {
+                    backend: Backend::Scoop,
+                    name: "git".to_string(),
+                    package_id: "git".to_string(),
+                    current_version: "2.53.0.3".to_string(),
+                    available_version: None,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_pip_upgradable_list_from_json() {
+        let output = r#"[
+  {
+    "name": "pip",
+    "version": "26.0",
+    "latest_version": "26.0.1",
+    "latest_filetype": "wheel"
+  }
+]"#;
+
+        assert_eq!(
+            Backend::Pip.parse_list_entries(true, output),
+            Some(vec![PackageListEntry {
+                backend: Backend::Pip,
+                name: "pip".to_string(),
+                package_id: "pip".to_string(),
+                current_version: "26.0".to_string(),
+                available_version: Some("26.0.1".to_string()),
+            }])
+        );
+    }
+
+    #[test]
+    fn parses_pip_show_details_from_key_value_output() {
+        let output = "\
+Name: pip
+Version: 26.0
+Summary: The PyPA recommended tool for installing Python packages.
+Home-page: https://pip.pypa.io/
+Author-email: The pip developers <distutils-sig@python.org>
+License-Expression: MIT
+Location: /opt/homebrew/lib/python3.14/site-packages
+Requires: setuptools, wheel
+Required-by:
+";
+
+        assert_eq!(
+            Backend::Pip.parse_show_details(output),
+            Some(PackageDetails {
+                backend: Backend::Pip,
+                name: "pip".to_string(),
+                version: "26.0".to_string(),
+                summary: Some(
+                    "The PyPA recommended tool for installing Python packages.".to_string()
+                ),
+                homepage: Some("https://pip.pypa.io/".to_string()),
+                license: Some("MIT".to_string()),
+                author: Some("The pip developers <distutils-sig@python.org>".to_string()),
+                repository: None,
+                keywords: vec![],
+                dependencies: vec!["setuptools".to_string(), "wheel".to_string()],
+                extra_fields: vec![(
+                    "Location".to_string(),
+                    "/opt/homebrew/lib/python3.14/site-packages".to_string(),
+                )],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_npm_show_details_from_plain_output() {
+        let output = "\
+requests@0.3.0 | MIT | deps: 7 | versions: 13
+An streaming XHR abstraction that works in browsers and node.js
+https://github.com/unshiftio/requests
+
+keywords: request, xhr, requests
+published over a year ago by swaagie <martijn@swaagman.online>
+";
+
+        assert_eq!(
+            Backend::Npm.parse_show_details(output),
+            Some(PackageDetails {
+                backend: Backend::Npm,
+                name: "requests".to_string(),
+                version: "0.3.0".to_string(),
+                summary: Some(
+                    "An streaming XHR abstraction that works in browsers and node.js".to_string()
+                ),
+                homepage: Some("https://github.com/unshiftio/requests".to_string()),
+                license: Some("MIT".to_string()),
+                author: Some("swaagie <martijn@swaagman.online>".to_string()),
+                repository: None,
+                keywords: vec![
+                    "request".to_string(),
+                    "xhr".to_string(),
+                    "requests".to_string(),
+                ],
+                dependencies: vec![],
+                extra_fields: vec![(
+                    "Published".to_string(),
+                    "over a year ago by swaagie <martijn@swaagman.online>".to_string(),
+                )],
+            })
+        );
+    }
+
+    #[test]
+    fn dedupes_search_candidates_per_backend() {
+        let candidates = dedupe_search_candidates(vec![
+            SearchCandidate {
+                backend: Backend::Npm,
+                label: "requests".to_string(),
+                install_id: "requests".to_string(),
+                version: Some("1.0.0".to_string()),
+                source: Some("npm".to_string()),
+            },
+            SearchCandidate {
+                backend: Backend::Npm,
+                label: "requests".to_string(),
+                install_id: "requests".to_string(),
+                version: Some("1.0.1".to_string()),
+                source: Some("npm".to_string()),
+            },
+            SearchCandidate {
+                backend: Backend::Pip,
+                label: "requests".to_string(),
+                install_id: "requests".to_string(),
+                version: None,
+                source: Some("pypi".to_string()),
+            },
+        ]);
+
+        assert_eq!(
+            candidates,
+            vec![
+                SearchCandidate {
+                    backend: Backend::Npm,
+                    label: "requests".to_string(),
+                    install_id: "requests".to_string(),
+                    version: Some("1.0.0".to_string()),
+                    source: Some("npm".to_string()),
+                },
+                SearchCandidate {
+                    backend: Backend::Pip,
+                    label: "requests".to_string(),
+                    install_id: "requests".to_string(),
+                    version: None,
+                    source: Some("pypi".to_string()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn installed_candidate_deduping_preserves_distinct_versions() {
+        let candidates = dedupe_installed_candidates(vec![
+            SearchCandidate {
+                backend: Backend::Winget,
+                label: "Quarto".to_string(),
+                install_id: "Posit.Quarto".to_string(),
+                version: Some("1.8.0".to_string()),
+                source: None,
+            },
+            SearchCandidate {
+                backend: Backend::Winget,
+                label: "Quarto".to_string(),
+                install_id: "Posit.Quarto".to_string(),
+                version: Some("1.9.37".to_string()),
+                source: None,
+            },
+            SearchCandidate {
+                backend: Backend::Winget,
+                label: "Quarto".to_string(),
+                install_id: "Posit.Quarto".to_string(),
+                version: Some("1.9.37".to_string()),
+                source: None,
+            },
+        ]);
+
+        assert_eq!(
+            candidates,
+            vec![
+                SearchCandidate {
+                    backend: Backend::Winget,
+                    label: "Quarto".to_string(),
+                    install_id: "Posit.Quarto".to_string(),
+                    version: Some("1.8.0".to_string()),
+                    source: None,
+                },
+                SearchCandidate {
+                    backend: Backend::Winget,
+                    label: "Quarto".to_string(),
+                    install_id: "Posit.Quarto".to_string(),
+                    version: Some("1.9.37".to_string()),
+                    source: None,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn sorts_search_candidates_by_match_quality_then_backend_order() {
+        let candidates = sort_search_candidates(
+            vec![
+                SearchCandidate {
+                    backend: Backend::Pip,
+                    label: "requests".to_string(),
+                    install_id: "requests".to_string(),
+                    version: None,
+                    source: Some("pypi".to_string()),
+                },
+                SearchCandidate {
+                    backend: Backend::Npm,
+                    label: "requests".to_string(),
+                    install_id: "requests".to_string(),
+                    version: Some("1.0.0".to_string()),
+                    source: Some("npm".to_string()),
+                },
+                SearchCandidate {
+                    backend: Backend::Npm,
+                    label: "requests-cache".to_string(),
+                    install_id: "requests-cache".to_string(),
+                    version: Some("1.0.0".to_string()),
+                    source: Some("npm".to_string()),
+                },
+                SearchCandidate {
+                    backend: Backend::Pip,
+                    label: "python-requests-tools".to_string(),
+                    install_id: "python-requests-tools".to_string(),
+                    version: None,
+                    source: Some("pypi".to_string()),
+                },
+            ],
+            "requests",
+            &[Backend::Npm, Backend::Pip],
+        );
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| format!("{}:{}", candidate.backend, candidate.install_id))
+                .collect::<Vec<_>>(),
+            vec![
+                "npm:requests".to_string(),
+                "pip:requests".to_string(),
+                "npm:requests-cache".to_string(),
+                "pip:python-requests-tools".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_backend_output_section_with_header() {
+        assert_eq!(
+            render_backend_output_section(Backend::Pip, "\nName: requests\nVersion: 2.32.0\n"),
+            Some("== pip ==\nName: requests\nVersion: 2.32.0".to_string())
+        );
+    }
+
+    #[test]
+    fn renders_multi_backend_package_details_as_comparison() {
+        let rendered = render_package_details_sections(&[
+            PackageDetails {
+                backend: Backend::Npm,
+                name: "pip".to_string(),
+                version: "0.0.1".to_string(),
+                summary: Some("Freckle CLI tool using node.js".to_string()),
+                homepage: None,
+                license: Some("Proprietary".to_string()),
+                author: Some("sirkitree <sirkitree@gmail.com>".to_string()),
+                repository: None,
+                keywords: vec![],
+                dependencies: vec!["optimist".to_string(), "freckle".to_string()],
+                extra_fields: vec![(
+                    "Published".to_string(),
+                    "over a year ago by sirkitree <sirkitree@gmail.com>".to_string(),
+                )],
+            },
+            PackageDetails {
+                backend: Backend::Pip,
+                name: "pip".to_string(),
+                version: "26.0".to_string(),
+                summary: Some(
+                    "The PyPA recommended tool for installing Python packages.".to_string(),
+                ),
+                homepage: Some("https://pip.pypa.io/".to_string()),
+                license: Some("MIT".to_string()),
+                author: Some("The pip developers <distutils-sig@python.org>".to_string()),
+                repository: None,
+                keywords: vec![],
+                dependencies: vec![],
+                extra_fields: vec![(
+                    "Location".to_string(),
+                    "/opt/homebrew/lib/python3.14/site-packages".to_string(),
+                )],
+            },
+        ]);
+
+        assert_eq!(
+            rendered,
+            "\
+== comparison ==
+Name      : pip
+Version   :
+  npm      0.0.1
+  pip      26.0
+Summary   :
+  npm      Freckle CLI tool using node.js
+  pip      The PyPA recommended tool for installing Python packages.
+Homepage  :
+  pip      https://pip.pypa.io/
+License   :
+  npm      Proprietary
+  pip      MIT
+Author    :
+  npm      sirkitree <sirkitree@gmail.com>
+  pip      The pip developers <distutils-sig@python.org>
+Depends On:
+  npm      optimist, freckle
+
+== npm extras ==
+Published : over a year ago by sirkitree <sirkitree@gmail.com>
+
+== pip extras ==
+Location  : /opt/homebrew/lib/python3.14/site-packages"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn render_command_failure_prefers_stderr_details() {
+        let invocation = Invocation::owned("pip", vec!["show".to_string(), "requests".to_string()]);
+        let capture = CommandCapture {
+            stdout: String::new(),
+            stderr: "Package(s) not found".to_string(),
+            success: false,
+            status_code: 1,
+            timed_out: false,
+            timeout_seconds: None,
+        };
+
+        assert_eq!(
+            render_command_failure(&invocation, &capture),
+            "backend command failed with exit code 1: pip show requests (Package(s) not found)"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn npm_upgradable_list_accepts_exit_code_one() {
+        let capture = CommandCapture {
+            stdout: "{\"typescript\":{}}".to_string(),
+            stderr: String::new(),
+            success: false,
+            status_code: 1,
+            timed_out: false,
+            timeout_seconds: None,
+        };
+
+        assert!(Backend::Npm.accepts_list_capture(true, &capture));
+        assert!(!Backend::Npm.accepts_list_capture(false, &capture));
+        assert!(!Backend::Pip.accepts_list_capture(true, &capture));
+    }
+
+    #[test]
+    fn pip_hold_returns_informational_message() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: false,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+        let plan = Backend::Pip
+            .plan(
+                &Subcommand::Hold {
+                    packages: vec!["requests".to_string()],
+                    enable: true,
+                },
+                &runtime,
+            )
+            .expect("plan should build");
+
+        assert_eq!(
+            plan,
+            vec![Invocation::message(
+                "This backend does not support a native hold/pin operation.",
+            )]
+        );
+    }
+
+    #[test]
+    fn disabling_backend_clears_default_selection() {
+        let mut config = Config {
+            backend: Some(Backend::Npm),
+            ..Config::default()
+        };
+        config.set_backend_enabled(Backend::Npm, false);
+
+        assert!(!config.is_backend_enabled(Backend::Npm));
+        assert_eq!(config.backend, None);
+    }
+
+    #[test]
+    fn backend_status_json_contains_key_fields() {
+        let config = Config {
+            backend: Some(Backend::Pip),
+            enable_choco: false,
+            ..Config::default()
+        };
+
+        let json = render_backend_statuses_json(&config);
+
+        assert!(json.contains("\"backend\":\"pip\""));
+        assert!(json.contains("\"default_selected\":true"));
+        assert!(json.contains("\"backend\":\"choco\""));
+        assert!(json.contains("\"enabled\":false"));
+    }
+
+    #[test]
+    fn finds_programs_on_path_using_explicit_file_names() {
+        let base = env::temp_dir().join(format!(
+            "waw-path-discovery-{}-{}",
+            std::process::id(),
+            APP_VERSION
+        ));
+        fs::create_dir_all(&base).expect("temp directory should exist");
+        let program = base.join("winget.exe");
+        fs::write(&program, b"").expect("program marker should be written");
+
+        let joined = env::join_paths([base.as_path()]).expect("PATH should be buildable");
+        let found = find_programs_on_path(Some(joined.as_os_str()), &["winget.exe"]);
+
+        assert_eq!(found, vec![program.display().to_string()]);
+
+        fs::remove_dir_all(&base).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn windows_apps_alias_path_without_real_file_is_not_discovered() {
+        let base = env::temp_dir().join(format!(
+            "waw-windowsapps-alias-{}-{}",
+            std::process::id(),
+            APP_VERSION
+        ));
+        let alias_dir = base.join("Microsoft").join("WindowsApps");
+        fs::create_dir_all(&alias_dir).expect("alias directory should exist");
+
+        let joined = env::join_paths([alias_dir.as_path()]).expect("PATH should be buildable");
+        let found = find_programs_on_path(Some(joined.as_os_str()), &["winget.exe"]);
+
+        assert!(found.is_empty());
+
+        fs::remove_dir_all(&base).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn pip_probe_args_choose_python_module_mode_for_python_launchers() {
+        assert_eq!(
+            pip_probe_args(r"C:\Python313\python.exe"),
+            vec!["-m".to_string(), "pip".to_string(), "--version".to_string()]
+        );
+        assert_eq!(
+            pip_probe_args("py.exe"),
+            vec!["-m".to_string(), "pip".to_string(), "--version".to_string()]
+        );
+        assert_eq!(
+            pip_probe_args(r"C:\Python313\Scripts\pip.exe"),
+            vec!["--version"]
+        );
+    }
+
+    fn assert_program_matches(program: &str, expected_suffixes: &[&str]) {
+        let normalized = program.replace('\\', "/").to_ascii_lowercase();
+        assert!(
+            expected_suffixes.iter().any(|suffix| {
+                let suffix = suffix.replace('\\', "/").to_ascii_lowercase();
+                normalized == suffix || normalized.ends_with(&format!("/{suffix}"))
+            }),
+            "program `{program}` did not match any expected suffix: {expected_suffixes:?}"
+        );
+    }
+
+    fn utf16le_bytes(value: &str) -> Vec<u8> {
+        value
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn show_results_json_contains_detail_fields() {
+        let json = render_show_results_json(&[ShowBackendResult {
+            backend: Backend::Pip,
+            command: "python3 -m pip show pip".to_string(),
+            success: true,
+            dry_run: false,
+            details: Some(PackageDetails {
+                backend: Backend::Pip,
+                name: "pip".to_string(),
+                version: "26.0".to_string(),
+                summary: Some(
+                    "The PyPA recommended tool for installing Python packages.".to_string(),
+                ),
+                homepage: Some("https://pip.pypa.io/".to_string()),
+                license: Some("MIT".to_string()),
+                author: Some("The pip developers <distutils-sig@python.org>".to_string()),
+                repository: None,
+                keywords: vec![],
+                dependencies: vec!["setuptools".to_string()],
+                extra_fields: vec![(
+                    "Location".to_string(),
+                    "/opt/homebrew/lib/python3.14/site-packages".to_string(),
+                )],
+            }),
+            raw_output: None,
+            error: None,
+        }]);
+
+        assert!(json.contains("\"backend\":\"pip\""));
+        assert!(json.contains("\"command\":\"python3 -m pip show pip\""));
+        assert!(json.contains("\"details\":{"));
+        assert!(json.contains("\"name\":\"pip\""));
+        assert!(json.contains("\"dependencies\":[\"setuptools\"]"));
+        assert!(json.contains(
+            "\"extra_fields\":{\"Location\":\"/opt/homebrew/lib/python3.14/site-packages\"}"
+        ));
+        assert!(json.contains("\"error\":null"));
+    }
+
+    #[test]
+    fn show_results_json_can_encode_failures() {
+        let json = render_show_results_json(&[ShowBackendResult {
+            backend: Backend::Pip,
+            command: "python3 -m pip show missing".to_string(),
+            success: false,
+            dry_run: false,
+            details: None,
+            raw_output: None,
+            error: Some(
+                "backend command failed with exit code 1: python3 -m pip show missing".to_string(),
+            ),
+        }]);
+
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("\"details\":null"));
+        assert!(json.contains("\"raw_output\":null"));
+        assert!(json.contains(
+            "\"error\":\"backend command failed with exit code 1: python3 -m pip show missing\""
+        ));
+    }
