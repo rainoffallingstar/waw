@@ -867,7 +867,11 @@ fn run_interactive_install(
             .map(|candidate| candidate.install_id.clone())
             .collect();
         if !packages.is_empty() {
-            invocations.extend(backend.plan_install(&packages, runtime));
+            let specs: Vec<PackageSpec> = packages
+                .iter()
+                .map(|id| PackageSpec::without_version(id))
+                .collect();
+            invocations.extend(backend.plan_install(&specs, runtime));
         }
     }
 
@@ -1253,7 +1257,11 @@ fn run_import(
             "Importing {} package(s) with {backend}",
             ids.len()
         );
-        invocations.extend(backend.plan_install(ids, runtime));
+        let specs: Vec<PackageSpec> = ids
+            .iter()
+            .map(|id| PackageSpec::without_version(id))
+            .collect();
+        invocations.extend(backend.plan_install(&specs, runtime));
     }
 
     execute_invocations(invocations, dry_run, true, runtime)
@@ -2001,6 +2009,13 @@ fn format_elapsed(elapsed: Duration) -> String {
 }
 
 
+/// `upgrade` tracks installed packages, so a version pin there would mean
+/// "move to this exact version" rather than "install this exact version".
+/// Keep the user's spec text so `pkg@1.2.3` still upgrades to 1.2.3.
+fn upgrade_specs(packages: &[String]) -> Vec<PackageSpec> {
+    packages.iter().map(|raw| PackageSpec::parse(raw)).collect()
+}
+
 fn package_upgrade_candidate(entry: PackageListEntry) -> SearchCandidate {
     SearchCandidate {
         backend: entry.backend,
@@ -2731,10 +2746,74 @@ enum Subcommand {
     Help,
 }
 
+/// A package request that may or may not pin a version.
+///
+/// `raw` keeps exactly what the user typed so diagnostics echo it back, while
+/// `name`/`version` hold the split form the backends need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageSpec {
+    name: String,
+    version: Option<String>,
+    raw: String,
+}
+
+impl PackageSpec {
+    /// Splits `pkg@1.2.3` and `pkg==1.2.3` (pip style) into name and version.
+    ///
+    /// A leading `@` belongs to the scope of an npm package (`@scope/name`), so
+    /// the separator search starts after it. The `==` form is checked first
+    /// because pip uses it and a bare `@` inside a pip spec means something
+    /// else entirely.
+    fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+
+        if let Some(index) = trimmed.find("==") {
+            let (name, version) = trimmed.split_at(index);
+            let version = &version[2..];
+            if !name.is_empty() && !version.is_empty() {
+                return Self {
+                    name: name.to_string(),
+                    version: Some(version.to_string()),
+                    raw: trimmed.to_string(),
+                };
+            }
+        }
+
+        let search_from = usize::from(trimmed.starts_with('@'));
+        if let Some(offset) = trimmed[search_from..].rfind('@') {
+            let index = search_from + offset;
+            let name = &trimmed[..index];
+            let version = &trimmed[index + 1..];
+            if !name.is_empty() && !version.is_empty() {
+                return Self {
+                    name: name.to_string(),
+                    version: Some(version.to_string()),
+                    raw: trimmed.to_string(),
+                };
+            }
+        }
+
+        Self {
+            name: trimmed.to_string(),
+            version: None,
+            raw: trimmed.to_string(),
+        }
+    }
+
+    fn without_version(raw: &str) -> Self {
+        let parsed = Self::parse(raw);
+        Self {
+            name: parsed.name,
+            version: None,
+            raw: parsed.raw,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstallMode {
     Search(String),
-    Exact(Vec<String>),
+    Exact(Vec<PackageSpec>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2821,9 +2900,13 @@ impl Subcommand {
                     ParsedInstallMode::Search => {
                         InstallMode::Search(parser.take_required_text("install")?)
                     }
-                    ParsedInstallMode::Exact => {
-                        InstallMode::Exact(parser.take_required_packages("install --exact")?)
-                    }
+                    ParsedInstallMode::Exact => InstallMode::Exact(
+                        parser
+                            .take_required_packages("install --exact")?
+                            .into_iter()
+                            .map(|raw| PackageSpec::parse(&raw))
+                            .collect(),
+                    ),
                 };
 
                 Ok(Self::Install { mode })
@@ -3470,20 +3553,28 @@ impl Backend {
                         runtime,
                     )]
                 } else {
-                    self.plan_install_or_upgrade(packages, runtime, true)
+                    let specs = upgrade_specs(packages);
+                    self.plan_install_or_upgrade(&specs, runtime, true)
                 }
             }
-            Self::Pip => self.plan_install_or_upgrade(packages, runtime, true),
+            Self::Pip => {
+                let specs = upgrade_specs(packages);
+                self.plan_install_or_upgrade(&specs, runtime, true)
+            }
         }
     }
 
-    fn plan_install(self, packages: &[String], runtime: &RuntimeSettings<'_>) -> Vec<Invocation> {
+    fn plan_install(
+        self,
+        packages: &[PackageSpec],
+        runtime: &RuntimeSettings<'_>,
+    ) -> Vec<Invocation> {
         self.plan_install_or_upgrade(packages, runtime, false)
     }
 
     fn plan_install_or_upgrade(
         self,
-        packages: &[String],
+        packages: &[PackageSpec],
         runtime: &RuntimeSettings<'_>,
         upgrade: bool,
     ) -> Vec<Invocation> {
@@ -3492,13 +3583,21 @@ impl Backend {
                 .iter()
                 .map(|package| {
                     let mut args = vec![
-                        "install".to_string(),
+                        if upgrade {
+                            "upgrade".to_string()
+                        } else {
+                            "install".to_string()
+                        },
                         "--id".to_string(),
-                        package.clone(),
+                        package.name.clone(),
                         "--exact".to_string(),
                         "--accept-source-agreements".to_string(),
                         "--accept-package-agreements".to_string(),
                     ];
+                    if let Some(version) = package.version.as_deref() {
+                        args.push("--version".to_string());
+                        args.push(version.to_string());
+                    }
                     append_source_arg(&mut args, runtime.config.winget_source());
                     if runtime.assume_yes {
                         args.push("--silent".to_string());
@@ -3510,6 +3609,11 @@ impl Backend {
             Self::Scoop => packages
                 .iter()
                 .map(|package| {
+                    let qualified = runtime.config.qualify_scoop_package(&package.name);
+                    let target = match package.version.as_deref() {
+                        Some(version) => format!("{qualified}@{version}"),
+                        None => qualified,
+                    };
                     self.mutating_invocation(
                         vec![
                             if upgrade {
@@ -3517,7 +3621,7 @@ impl Backend {
                             } else {
                                 "install".to_string()
                             },
-                            runtime.config.qualify_scoop_package(package),
+                            target,
                         ],
                         runtime,
                     )
@@ -3532,8 +3636,12 @@ impl Backend {
                         } else {
                             "install".to_string()
                         },
-                        package.clone(),
+                        package.name.clone(),
                     ];
+                    if let Some(version) = package.version.as_deref() {
+                        args.push("--version".to_string());
+                        args.push(version.to_string());
+                    }
                     append_source_arg(&mut args, runtime.config.choco_source());
                     if runtime.assume_yes {
                         args.push("-y".to_string());
@@ -3544,10 +3652,10 @@ impl Backend {
             Self::Npm => packages
                 .iter()
                 .map(|package| {
-                    let versioned = if upgrade {
-                        format!("{package}@latest")
-                    } else {
-                        package.clone()
+                    let versioned = match (upgrade, package.version.as_deref()) {
+                        (_, Some(version)) => format!("{}@{version}", package.name),
+                        (true, None) => format!("{}@latest", package.name),
+                        (false, None) => package.name.clone(),
                     };
                     self.mutating_invocation(
                         vec!["install".to_string(), versioned, "--global".to_string()],
@@ -3558,9 +3666,13 @@ impl Backend {
             Self::Pip => packages
                 .iter()
                 .map(|package| {
+                    let spec = match package.version.as_deref() {
+                        Some(version) => format!("{}=={version}", package.name),
+                        None => package.name.clone(),
+                    };
                     let mut args = vec![
                         "install".to_string(),
-                        package.clone(),
+                        spec,
                         "--no-input".to_string(),
                     ];
                     if upgrade {
@@ -7651,6 +7763,7 @@ Commands:
   upgrade [pkg...]         Preview available upgrades and choose packages interactively, or upgrade only the named packages on the selected backend
   install <query...>       Search interactively across the selected/auto backends, then choose packages
   install --exact <pkg...> Install one or more packages directly on the selected backend
+                           Pin a version with pkg@1.2.3 or pkg==1.2.3 (pip)
   remove <query...>        Search installed packages across the selected/auto backends, then choose packages to uninstall
   remove --exact <pkg...>  Uninstall one or more packages directly on the selected backend
   hold [--off] <pkg...>    Add or remove an upgrade hold
@@ -7693,6 +7806,7 @@ Examples:
   {APP_NAME} --backend winget upgrade
   {APP_NAME} install git
   {APP_NAME} install --exact Git.Git
+  {APP_NAME} install --exact Git.Git@2.43.0
   {APP_NAME} remove git
   {APP_NAME} remove --exact Git.Git
   {APP_NAME} hold --off Git.Git
@@ -8047,6 +8161,107 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
     }
 
     #[test]
+    fn parses_package_spec_forms() {
+        let plain = PackageSpec::parse("git");
+        assert_eq!(plain.name, "git");
+        assert_eq!(plain.version, None);
+
+        let at = PackageSpec::parse("git@2.43.0");
+        assert_eq!(at.name, "git");
+        assert_eq!(at.version.as_deref(), Some("2.43.0"));
+
+        let pip = PackageSpec::parse("requests==2.31.0");
+        assert_eq!(pip.name, "requests");
+        assert_eq!(pip.version.as_deref(), Some("2.31.0"));
+
+        let scoped = PackageSpec::parse("@scope/name");
+        assert_eq!(scoped.name, "@scope/name");
+        assert_eq!(scoped.version, None);
+
+        let scoped_versioned = PackageSpec::parse("@scope/name@1.2.3");
+        assert_eq!(scoped_versioned.name, "@scope/name");
+        assert_eq!(scoped_versioned.version.as_deref(), Some("1.2.3"));
+
+        // A version containing a dot-less scope separator must not be split
+        // into garbage.
+        let pip_extras = PackageSpec::parse("pkg[extra]==1.0");
+        assert_eq!(pip_extras.name, "pkg[extra]");
+        assert_eq!(pip_extras.version.as_deref(), Some("1.0"));
+    }
+
+    #[test]
+    fn winget_install_pins_version_with_flag() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("Git.Git@2.43.0")];
+        let invocations = Backend::Winget.plan_install(&specs, &runtime);
+        assert_eq!(invocations.len(), 1);
+        let rendered = invocations[0].render_for_display();
+        assert!(rendered.contains("--id Git.Git"), "{rendered}");
+        assert!(rendered.contains("--version 2.43.0"), "{rendered}");
+        assert!(rendered.contains("--exact"), "{rendered}");
+    }
+
+    #[test]
+    fn npm_install_pins_version_in_argument() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("@types/node@20.11.0")];
+        let invocations = Backend::Npm.plan_install(&specs, &runtime);
+        assert_eq!(invocations.len(), 1);
+        let rendered = invocations[0].render_for_display();
+        assert!(rendered.contains("@types/node@20.11.0"), "{rendered}");
+    }
+
+    #[test]
+    fn pip_install_pins_version_with_double_equals() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("requests@2.31.0")];
+        let invocations = Backend::Pip.plan_install(&specs, &runtime);
+        let rendered = invocations[0].render_for_display();
+        assert!(rendered.contains("requests==2.31.0"), "{rendered}");
+    }
+
+    #[test]
+    fn choco_install_pins_version_with_flag() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("nodejs.install@0.10.35")];
+        let invocations = Backend::Chocolatey.plan_install(&specs, &runtime);
+        let rendered = invocations[0].render_for_display();
+        assert!(rendered.contains("--version 0.10.35"), "{rendered}");
+    }
+
+    #[test]
+    fn scoop_install_pins_version_in_argument() {
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: false,
+            config: &Config::default(),
+        };
+        let specs = vec![PackageSpec::parse("gh@2.7.0")];
+        let invocations = Backend::Scoop.plan_install(&specs, &runtime);
+        let rendered = invocations[0].render_for_display();
+        // The `@` makes the renderer quote the argument; the target still
+        // reaches scoop verbatim.
+        assert!(rendered.contains("install"), "{rendered}");
+        assert!(rendered.contains("gh@2.7.0"), "{rendered}");
+    }
+
+    #[test]
     fn parses_hold_disable() {
         let cli = Cli::parse(["hold", "--off", "Git.Git"].into_iter().map(str::to_string))
             .expect("cli should parse");
@@ -8238,8 +8453,8 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
             cli.command,
             Subcommand::Install {
                 mode: InstallMode::Exact(vec![
-                    "Git.Git".to_string(),
-                    "Microsoft.PowerToys".to_string()
+                    PackageSpec::without_version("Git.Git"),
+                    PackageSpec::without_version("Microsoft.PowerToys")
                 ])
             }
         );
@@ -8372,7 +8587,7 @@ pip_user = true
 
         let requires = command_requires_process_elevation(
             &Subcommand::Install {
-                mode: InstallMode::Exact(vec!["requests".to_string()]),
+                mode: InstallMode::Exact(vec![PackageSpec::without_version("requests")]),
             },
             Some(Backend::Pip),
             &runtime,
@@ -9105,7 +9320,7 @@ pip_user = true
         let plan = Backend::Scoop
             .plan(
                 &Subcommand::Install {
-                    mode: InstallMode::Exact(vec!["git".to_string()]),
+                    mode: InstallMode::Exact(vec![PackageSpec::without_version("git")]),
                 },
                 &runtime,
             )
