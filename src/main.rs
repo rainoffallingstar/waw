@@ -296,6 +296,15 @@ fn run() -> Result<ExitCode, String> {
         _ => {}
     }
 
+    if let Subcommand::Export { path } = &cli.command {
+        let backends = resolve_auto_backends(selected_backend, config)?;
+        return run_export(backends, path.clone(), &runtime);
+    }
+
+    if let Subcommand::Import { path } = &cli.command {
+        return run_import(path, cli.dry_run, selected_backend, config, &runtime);
+    }
+
     if let Subcommand::Search { query } = &cli.command {
         let backends = resolve_auto_backends(selected_backend, config)?;
         return run_search(backends, query, &runtime, cli.json);
@@ -997,6 +1006,257 @@ fn run_search(
         print_candidates(&candidates);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One entry in an exported manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestPackage {
+    backend: Backend,
+    id: String,
+    name: String,
+    version: Option<String>,
+}
+
+/// Packages winget can list but cannot reinstall: ARP and MSIX entries are
+/// inventory resources, not installable identifiers. On this machine 111 of
+/// 205 listed packages are like this, so exporting them would produce a
+/// manifest that fails on import.
+fn is_installable_package_id(backend: Backend, package_id: &str) -> bool {
+    if backend != Backend::Winget {
+        return true;
+    }
+    !(package_id.starts_with("ARP\\") || package_id.starts_with("MSIX\\"))
+}
+
+fn collect_manifest_packages(
+    backends: &[Backend],
+    runtime: &RuntimeSettings<'_>,
+) -> Result<Vec<ManifestPackage>, String> {
+    let mut packages = Vec::new();
+    let aggregate = backends.len() > 1;
+
+    for backend in backends {
+        let invocation = backend
+            .plan_list(false, runtime)
+            .into_iter()
+            .next()
+            .expect("list should always produce one invocation");
+        if aggregate {
+            println!("Collecting installed packages from {backend}");
+        }
+
+        let capture = match run_capture_detailed_with_label_when(
+            &invocation,
+            &format!("Collecting {backend} packages"),
+            false,
+            |capture| backend.accepts_list_capture(false, capture),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                if aggregate {
+                    eprintln!("warning: failed to collect {backend}: {error}");
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        if !backend.accepts_list_capture(false, &capture) {
+            let error = render_command_failure(&invocation, &capture);
+            if aggregate {
+                eprintln!("warning: failed to collect {backend}: {error}");
+                continue;
+            }
+            return Err(error);
+        }
+
+        let Some(rows) = backend.parse_list_entries(false, &capture.stdout) else {
+            let error = format!("could not parse installed packages from {backend}");
+            if aggregate {
+                eprintln!("warning: {error}");
+                continue;
+            }
+            return Err(error);
+        };
+
+        let skipped = rows
+            .iter()
+            .filter(|row| !is_installable_package_id(row.backend, &row.package_id))
+            .count();
+        if skipped > 0 {
+            eprintln!(
+                "note: skipping {skipped} {backend} package(s) that cannot be reinstalled by id"
+            );
+        }
+
+        packages.extend(
+            rows.into_iter()
+                .filter(|row| is_installable_package_id(row.backend, &row.package_id))
+                .map(|row| ManifestPackage {
+                    backend: row.backend,
+                    id: row.package_id,
+                    name: row.name,
+                    version: Some(row.current_version),
+                }),
+        );
+    }
+
+    Ok(packages)
+}
+
+fn render_manifest_json(packages: &[ManifestPackage]) -> String {
+    let entries = packages
+        .iter()
+        .map(|package| {
+            format!(
+                "    {{\"backend\":\"{}\",\"id\":\"{}\",\"name\":\"{}\",\"version\":{}}}",
+                package.backend,
+                escape_json_string(&package.id),
+                escape_json_string(&package.name),
+                render_json_optional_string(package.version.as_deref()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        "{{\n  \"schema\": \"waw-packages/1\",\n  \"packages\": [\n{entries}\n  ]\n}}\n"
+    )
+}
+
+fn run_export(
+    backends: Vec<Backend>,
+    path: Option<PathBuf>,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<ExitCode, String> {
+    let packages = collect_manifest_packages(&backends, runtime)?;
+    let rendered = render_manifest_json(&packages);
+
+    match path {
+        Some(path) => {
+            fs::write(&path, rendered)
+                .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+            println!(
+                "Exported {} package(s) to {}",
+                packages.len(),
+                path.display()
+            );
+        }
+        None => print!("{rendered}"),
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn parse_manifest(contents: &str) -> Result<Vec<ManifestPackage>, String> {
+    let root = parse_json(contents)?;
+
+    // Accept our own manifest as well as winget's export format, so that
+    // `winget export` output can be fed straight to `waw import`.
+    if let Some(packages) = root.get("packages").and_then(JsonValue::as_array) {
+        return packages
+            .iter()
+            .map(|entry| {
+                let backend_name = entry
+                    .get("backend")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("winget");
+                let backend = Backend::parse(backend_name)?;
+                let id = entry
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| "manifest package is missing \"id\"".to_string())?;
+                Ok(ManifestPackage {
+                    backend,
+                    id: id.to_string(),
+                    name: entry
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or(id)
+                        .to_string(),
+                    version: entry
+                        .get("version")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string),
+                })
+            })
+            .collect();
+    }
+
+    if let Some(sources) = root.get("Sources").and_then(JsonValue::as_array) {
+        let mut packages = Vec::new();
+        for source in sources {
+            let Some(entries) = source.get("Packages").and_then(JsonValue::as_array) else {
+                continue;
+            };
+            for entry in entries {
+                if let Some(id) = entry.get("PackageIdentifier").and_then(JsonValue::as_str) {
+                    packages.push(ManifestPackage {
+                        backend: Backend::Winget,
+                        id: id.to_string(),
+                        name: id.to_string(),
+                        version: None,
+                    });
+                }
+            }
+        }
+        if !packages.is_empty() {
+            return Ok(packages);
+        }
+    }
+
+    Err("manifest is neither a waw manifest nor a winget export file".to_string())
+}
+
+fn run_import(
+    path: &Path,
+    dry_run: bool,
+    selected_backend: Option<Backend>,
+    config: &Config,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<ExitCode, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let packages = parse_manifest(&contents)?;
+    if packages.is_empty() {
+        println!("Manifest contains no packages.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut groups: Vec<(Backend, Vec<String>)> = Vec::new();
+    let mut skipped = 0usize;
+    for package in &packages {
+        if let Some(selected) = selected_backend {
+            if selected != package.backend {
+                skipped += 1;
+                continue;
+            }
+        } else if !config.is_backend_enabled(package.backend) {
+            skipped += 1;
+            continue;
+        }
+        match groups.iter_mut().find(|(backend, _)| *backend == package.backend) {
+            Some((_, ids)) => ids.push(package.id.clone()),
+            None => groups.push((package.backend, vec![package.id.clone()])),
+        }
+    }
+
+    if skipped > 0 {
+        eprintln!("note: skipping {skipped} package(s) for backends that are disabled or filtered out");
+    }
+    if groups.is_empty() {
+        println!("Nothing to install from this manifest.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut invocations = Vec::new();
+    for (backend, ids) in &groups {
+        println!(
+            "Importing {} package(s) with {backend}",
+            ids.len()
+        );
+        invocations.extend(backend.plan_install(ids, runtime));
+    }
+
+    execute_invocations(invocations, dry_run, true, runtime)
 }
 
 fn run_list(
@@ -2466,6 +2726,8 @@ enum Subcommand {
     Show { package: String },
     Backends,
     Backend { action: BackendAction },
+    Export { path: Option<PathBuf> },
+    Import { path: PathBuf },
     Help,
 }
 
@@ -2669,6 +2931,61 @@ impl Subcommand {
             "show" => Ok(Self::Show {
                 package: parser.take_required_single_value("show")?,
             }),
+            "export" => {
+                let mut path = None;
+                while let Some(arg) = parser.peek() {
+                    let arg = arg.to_string();
+                    match arg.as_str() {
+                        "--file" | "-o" => {
+                            parser.next();
+                            let value = parser
+                                .next()
+                                .ok_or_else(|| "export --file requires a path".to_string())?;
+                            path = Some(PathBuf::from(value));
+                        }
+                        value if value.starts_with('-') => {
+                            return Err(format!("unknown option for export: {value}"));
+                        }
+                        _ => {
+                            let value = parser.next().expect("peeked value must exist");
+                            path = Some(PathBuf::from(value));
+                        }
+                    }
+                }
+                Ok(Self::Export { path })
+            }
+            "import" => {
+                let mut path = None;
+                while let Some(arg) = parser.peek() {
+                    let arg = arg.to_string();
+                    match arg.as_str() {
+                        "--file" | "-f" => {
+                            parser.next();
+                            let value = parser
+                                .next()
+                                .ok_or_else(|| "import --file requires a path".to_string())?;
+                            path = Some(PathBuf::from(value));
+                        }
+                        value if value.starts_with('-') => {
+                            return Err(format!("unknown option for import: {value}"));
+                        }
+                        _ => {
+                            if path.is_some() {
+                                return Err(
+                                    "import accepts only one manifest path".to_string()
+                                );
+                            }
+                            path = Some(PathBuf::from(
+                                parser.next().expect("peeked value must exist"),
+                            ));
+                        }
+                    }
+                }
+                let path = path.ok_or_else(|| {
+                    "import requires a manifest path (or --file <path>)".to_string()
+                })?;
+                Ok(Self::Import { path })
+            }
             "backends" => Ok(Self::Backends),
             "backend" => Ok(Self::Backend {
                 action: BackendAction::parse(parser)?,
@@ -3034,6 +3351,7 @@ impl Backend {
             Subcommand::List { upgradable } => Ok(self.plan_list(*upgradable, runtime)),
             Subcommand::Show { package } => Ok(self.plan_show(package, runtime)),
             Subcommand::Backends | Subcommand::Backend { action: _ } => Ok(Vec::new()),
+            Subcommand::Export { .. } | Subcommand::Import { .. } => Ok(Vec::new()),
             Subcommand::Help => Ok(Vec::new()),
         }
     }
@@ -7052,6 +7370,218 @@ fn render_toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(Vec<(String, JsonValue)>),
+}
+
+impl JsonValue {
+    fn get(&self, key: &str) -> Option<&JsonValue> {
+        match self {
+            Self::Object(entries) => entries
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&[JsonValue]> {
+        match self {
+            Self::Array(values) => Some(values),
+            _ => None,
+        }
+    }
+}
+
+/// Minimal recursive-descent JSON reader. It exists so `import` can read a
+/// manifest without pulling in a dependency; it accepts standard JSON and
+/// rejects anything it cannot fully understand.
+fn parse_json(input: &str) -> Result<JsonValue, String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut position = 0usize;
+    let value = parse_json_value(&chars, &mut position)?;
+    skip_json_whitespace(&chars, &mut position);
+    if position != chars.len() {
+        return Err(format!(
+            "unexpected trailing JSON content at character {position}"
+        ));
+    }
+    Ok(value)
+}
+
+fn skip_json_whitespace(chars: &[char], position: &mut usize) {
+    while *position < chars.len() && chars[*position].is_whitespace() {
+        *position += 1;
+    }
+}
+
+fn parse_json_value(chars: &[char], position: &mut usize) -> Result<JsonValue, String> {
+    skip_json_whitespace(chars, position);
+    let Some(current) = chars.get(*position).copied() else {
+        return Err("unexpected end of JSON input".to_string());
+    };
+    match current {
+        '{' => parse_json_object(chars, position),
+        '[' => parse_json_array(chars, position),
+        '"' => parse_json_string(chars, position).map(JsonValue::String),
+        't' | 'f' | 'n' => parse_json_literal(chars, position),
+        _ => parse_json_number(chars, position),
+    }
+}
+
+fn parse_json_object(chars: &[char], position: &mut usize) -> Result<JsonValue, String> {
+    *position += 1; // consume '{'
+    let mut entries = Vec::new();
+    skip_json_whitespace(chars, position);
+    if chars.get(*position) == Some(&'}') {
+        *position += 1;
+        return Ok(JsonValue::Object(entries));
+    }
+    loop {
+        skip_json_whitespace(chars, position);
+        let key = parse_json_string(chars, position)?;
+        skip_json_whitespace(chars, position);
+        if chars.get(*position) != Some(&':') {
+            return Err(format!("expected ':' after object key at {position}"));
+        }
+        *position += 1;
+        let value = parse_json_value(chars, position)?;
+        entries.push((key, value));
+        skip_json_whitespace(chars, position);
+        match chars.get(*position) {
+            Some(',') => {
+                *position += 1;
+            }
+            Some('}') => {
+                *position += 1;
+                return Ok(JsonValue::Object(entries));
+            }
+            _ => return Err(format!("expected ',' or '}}' in object at {position}")),
+        }
+    }
+}
+
+fn parse_json_array(chars: &[char], position: &mut usize) -> Result<JsonValue, String> {
+    *position += 1; // consume '['
+    let mut values = Vec::new();
+    skip_json_whitespace(chars, position);
+    if chars.get(*position) == Some(&']') {
+        *position += 1;
+        return Ok(JsonValue::Array(values));
+    }
+    loop {
+        values.push(parse_json_value(chars, position)?);
+        skip_json_whitespace(chars, position);
+        match chars.get(*position) {
+            Some(',') => {
+                *position += 1;
+            }
+            Some(']') => {
+                *position += 1;
+                return Ok(JsonValue::Array(values));
+            }
+            _ => return Err(format!("expected ',' or ']' in array at {position}")),
+        }
+    }
+}
+
+fn parse_json_string(chars: &[char], position: &mut usize) -> Result<String, String> {
+    if chars.get(*position) != Some(&'"') {
+        return Err(format!("expected string at {position}"));
+    }
+    *position += 1;
+    let mut value = String::new();
+    loop {
+        let Some(current) = chars.get(*position).copied() else {
+            return Err("unterminated JSON string".to_string());
+        };
+        *position += 1;
+        match current {
+            '"' => return Ok(value),
+            '\\' => {
+                let Some(escape) = chars.get(*position).copied() else {
+                    return Err("unterminated JSON escape".to_string());
+                };
+                *position += 1;
+                match escape {
+                    '"' => value.push('"'),
+                    '\\' => value.push('\\'),
+                    '/' => value.push('/'),
+                    'b' => value.push('\u{8}'),
+                    'f' => value.push('\u{c}'),
+                    'n' => value.push('\n'),
+                    'r' => value.push('\r'),
+                    't' => value.push('\t'),
+                    'u' => {
+                        let mut code = 0u32;
+                        for _ in 0..4 {
+                            let Some(digit) = chars.get(*position).and_then(|ch| ch.to_digit(16))
+                            else {
+                                return Err("invalid \\u escape in JSON string".to_string());
+                            };
+                            code = code * 16 + digit;
+                            *position += 1;
+                        }
+                        value.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    }
+                    other => return Err(format!("unsupported JSON escape \\{other}")),
+                }
+            }
+            other => value.push(other),
+        }
+    }
+}
+
+fn parse_json_literal(chars: &[char], position: &mut usize) -> Result<JsonValue, String> {
+    for (literal, value) in [
+        ("true", JsonValue::Bool(true)),
+        ("false", JsonValue::Bool(false)),
+        ("null", JsonValue::Null),
+    ] {
+        let end = *position + literal.chars().count();
+        if end <= chars.len() && chars[*position..end].iter().copied().eq(literal.chars()) {
+            *position = end;
+            return Ok(value);
+        }
+    }
+    Err(format!("invalid JSON literal at {position}"))
+}
+
+fn parse_json_number(chars: &[char], position: &mut usize) -> Result<JsonValue, String> {
+    let start = *position;
+    if chars.get(*position) == Some(&'-') {
+        *position += 1;
+    }
+    while let Some(ch) = chars.get(*position) {
+        if ch.is_ascii_digit() || matches!(ch, '.' | 'e' | 'E' | '+' | '-') {
+            *position += 1;
+        } else {
+            break;
+        }
+    }
+    if start == *position {
+        return Err(format!("invalid JSON value at {position}"));
+    }
+    let raw: String = chars[start..*position].iter().collect();
+    let parsed: f64 = raw
+        .parse()
+        .map_err(|_| format!("invalid JSON number at {start}: {raw}"))?;
+    Ok(JsonValue::Number(parsed))
+}
+
 fn escape_json_string(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -7127,6 +7657,8 @@ Commands:
   search <query...>        Search the selected backend, or all enabled+available backends in auto mode
   list [--upgradable]      List packages in a normalized table, using the selected backend or all enabled+available backends in auto mode
   show <pkg>               Show normalized package details from the selected backend, or probe all enabled+available backends in auto mode
+  export [--file <path>]   Emit an installable manifest of installed packages
+  import <path>            Install packages listed in a waw or winget export manifest
   backends                 Show detected backend availability and enabled state
   backend list             Same as `backends`
   backend enable <name>    Enable a backend in config
@@ -7167,6 +7699,8 @@ Examples:
   {APP_NAME} search powertoys
   {APP_NAME} list --upgradable
   {APP_NAME} show Git.Git
+  {APP_NAME} export --file packages.json
+  {APP_NAME} import packages.json
   {APP_NAME} backends
   {APP_NAME} --json backends
   {APP_NAME} --json show pip
@@ -7422,6 +7956,94 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
             before, after,
             "a failed launch must not leave capture files behind (before={before}, after={after})"
         );
+    }
+
+    #[test]
+    fn parses_minimal_json_values() {
+        let value = parse_json(r#"{"a":1,"b":[true,false,null],"c":"x","d":{"e":2}}"#)
+            .expect("json should parse");
+        assert_eq!(value.get("c").and_then(JsonValue::as_str), Some("x"));
+        assert_eq!(value.get("b").and_then(JsonValue::as_array).map(<[_]>::len), Some(3));
+        assert_eq!(
+            value.get("d").and_then(|inner| inner.get("e")),
+            Some(&JsonValue::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn json_parser_rejects_trailing_garbage() {
+        assert!(parse_json(r#"{"a":1} trailing"#).is_err());
+        assert!(parse_json(r#"{"a":}"#).is_err());
+        assert!(parse_json("").is_err());
+    }
+
+    #[test]
+    fn json_parser_handles_escapes_and_unicode() {
+        let value = parse_json(r#"{"k":"a\"b\\c\u4e91"}"#).expect("json should parse");
+        assert_eq!(value.get("k").and_then(JsonValue::as_str), Some("a\"b\\c云"));
+    }
+
+    #[test]
+    fn winget_resource_ids_are_not_installable() {
+        assert!(!is_installable_package_id(
+            Backend::Winget,
+            r"ARP\Machine\X64\74402CAB-65A4-4F40-8D63-02A6DB3FB923_is1"
+        ));
+        assert!(!is_installable_package_id(
+            Backend::Winget,
+            r"MSIX\MFSyncCloudShell_1.0.0.0_x64__f7bd3qkyghp9r"
+        ));
+        assert!(is_installable_package_id(Backend::Winget, "123.123pan"));
+        assert!(is_installable_package_id(Backend::Scoop, "git"));
+        assert!(is_installable_package_id(Backend::Npm, "@scope/pkg"));
+    }
+
+    #[test]
+    fn manifest_round_trips_through_render_and_parse() {
+        let packages = vec![
+            ManifestPackage {
+                backend: Backend::Winget,
+                id: "123.123pan".to_string(),
+                name: "123云盘".to_string(),
+                version: Some("3.1.5.0".to_string()),
+            },
+            ManifestPackage {
+                backend: Backend::Scoop,
+                id: "git".to_string(),
+                name: "git".to_string(),
+                version: Some("2.53.0.3".to_string()),
+            },
+        ];
+
+        let rendered = render_manifest_json(&packages);
+        let parsed = parse_manifest(&rendered).expect("manifest should parse");
+        assert_eq!(parsed, packages);
+    }
+
+    #[test]
+    fn manifest_accepts_winget_export_format() {
+        let winget_export = r#"{
+  "$schema": "https://aka.ms/winget-packages.schema.2.0.json",
+  "CreationDate": "2026-10-27T17:28:06.559-00:00",
+  "Sources": [
+    {"Packages": [
+      {"PackageIdentifier": "7zip.7zip"},
+      {"PackageIdentifier": "Git.Git"}
+    ], "SourceDetails": {"Name": "winget"}}
+  ]
+}"#;
+
+        let parsed = parse_manifest(winget_export).expect("winget export should parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].backend, Backend::Winget);
+        assert_eq!(parsed[0].id, "7zip.7zip");
+        assert_eq!(parsed[1].id, "Git.Git");
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_format() {
+        assert!(parse_manifest(r#"{"unexpected": true}"#).is_err());
+        assert!(parse_manifest("not json").is_err());
     }
 
     #[test]
