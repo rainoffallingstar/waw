@@ -473,6 +473,7 @@ fn run_waw_with_input(sandbox: &Path, args: &[&str], input: &str) -> CommandOutp
         .env("WAW_CHOCO_CMD", command_path(sandbox, "choco"))
         .env("WAW_NPM_CMD", command_path(sandbox, "npm"))
         .env("WAW_PYTHON_CMD", command_path(sandbox, "python"))
+        .env("WAW_FORCE_INTERACTIVE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -4,6 +4,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$script:StepTimeoutMs = 300000
+
 function Invoke-Step {
     param(
         [string]$Label,
@@ -51,11 +53,15 @@ function Invoke-Waw {
         $process = Start-Process `
             -FilePath $script:WawBinary `
             -ArgumentList $fullArgs `
-            -Wait `
             -PassThru `
             -NoNewWindow `
             -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath
+
+        if (-not $process.WaitForExit($script:StepTimeoutMs)) {
+            try { $process.Kill($true) } catch { }
+            throw "waw command timed out after $([int]($script:StepTimeoutMs / 1000))s: waw $($fullArgs -join ' ')"
+        }
 
         $stdout = if (Test-Path -LiteralPath $stdoutPath) {
             Get-Content -LiteralPath $stdoutPath -Raw

@@ -24,6 +24,20 @@ const ELEVATED_SUCCESS_MARKER: &str = "WAW_ELEVATED_SUCCESS:";
 const ELEVATED_FAILURE_MARKER: &str = "WAW_ELEVATED_FAILURE:";
 const ELEVATED_BOOTSTRAP_FAILURE_MARKER: &str = "WAW_ELEVATED_BOOTSTRAP_FAILURE:";
 const WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE: i32 = -1978335189;
+const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 180;
+static COMMAND_TIMEOUT_SECONDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_COMMAND_TIMEOUT_SECONDS);
+
+fn configure_command_timeout(seconds: u64) {
+    COMMAND_TIMEOUT_SECONDS.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn command_timeout() -> Option<Duration> {
+    match COMMAND_TIMEOUT_SECONDS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        seconds => Some(Duration::from_secs(seconds)),
+    }
+}
 
 #[cfg(windows)]
 type Handle = *mut c_void;
@@ -116,6 +130,7 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let mut loaded_config = LoadedConfig::load(cli.config_path.as_deref())?;
+    configure_command_timeout(loaded_config.config.command_timeout_seconds);
     let backend_assume_yes = cli.assume_yes.unwrap_or(loaded_config.config.assume_yes);
     let backend_auto_elevate = cli
         .auto_elevate
@@ -164,7 +179,7 @@ fn run() -> Result<ExitCode, String> {
 
     if let Subcommand::Search { query } = &cli.command {
         let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_search(backends, query, &runtime);
+        return run_search(backends, query, &runtime, cli.json);
     }
 
     if let Subcommand::Install {
@@ -185,7 +200,7 @@ fn run() -> Result<ExitCode, String> {
 
     if let Subcommand::List { upgradable } = &cli.command {
         let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_list(backends, *upgradable, &runtime, cli.dry_run);
+        return run_list(backends, *upgradable, &runtime, cli.dry_run, cli.json);
     }
 
     if let Subcommand::Show { package } = &cli.command {
@@ -690,7 +705,7 @@ fn run_interactive_install(
     runtime: &RuntimeSettings<'_>,
     dry_run: bool,
 ) -> Result<ExitCode, String> {
-    let candidates = collect_search_candidates(&backends, query, runtime)?;
+    let candidates = collect_search_candidates(&backends, query, runtime, false)?;
     if candidates.is_empty() {
         println!("No matching packages found.");
         return Ok(ExitCode::SUCCESS);
@@ -703,11 +718,17 @@ fn run_interactive_install(
         );
     }
 
-    let selected_indices = prompt_for_selection("install", candidates.len())?;
-    if selected_indices.is_empty() {
-        println!("No selection made. Nothing to install.");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let selected_indices = match choose_candidates(
+        "install",
+        &candidates,
+        runtime.assume_yes,
+    )? {
+        Some(indices) => indices,
+        None => {
+            println!("No selection made. Nothing to install.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
 
     let mut invocations = Vec::new();
     for backend in backends {
@@ -744,11 +765,17 @@ fn run_interactive_remove(
         );
     }
 
-    let selected_indices = prompt_for_selection("remove", candidates.len())?;
-    if selected_indices.is_empty() {
-        println!("No selection made. Nothing to remove.");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let selected_indices = match choose_candidates(
+        "remove",
+        &candidates,
+        runtime.assume_yes,
+    )? {
+        Some(indices) => indices,
+        None => {
+            println!("No selection made. Nothing to remove.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
 
     let mut invocations = Vec::new();
     for backend in backends {
@@ -840,9 +867,12 @@ fn run_search(
     backends: Vec<Backend>,
     query: &str,
     runtime: &RuntimeSettings<'_>,
+    json: bool,
 ) -> Result<ExitCode, String> {
-    let candidates = collect_search_candidates(&backends, query, runtime)?;
-    if candidates.is_empty() {
+    let candidates = collect_search_candidates(&backends, query, runtime, json)?;
+    if json {
+        println!("{}", render_search_results_json(&candidates));
+    } else if candidates.is_empty() {
         println!("No matching packages found.");
     } else {
         print_candidates(&candidates);
@@ -855,6 +885,7 @@ fn run_list(
     upgradable: bool,
     runtime: &RuntimeSettings<'_>,
     dry_run: bool,
+    json: bool,
 ) -> Result<ExitCode, String> {
     let single_backend = backends.len() == 1;
     let noun = if upgradable {
@@ -865,57 +896,76 @@ fn run_list(
     let mut parsed_rows = Vec::new();
     let mut raw_sections = Vec::new();
 
-    for backend in backends {
-        let invocation = backend
-            .plan_list(upgradable, runtime)
-            .into_iter()
-            .next()
-            .expect("list should always produce one invocation");
-        println!("Listing {noun} from {backend}");
-
-        if dry_run {
-            println!("> {}", invocation.render_for_display());
-            continue;
+    if !json {
+        for backend in &backends {
+            println!("Listing {noun} from {backend}");
         }
+    }
 
-        let capture = match run_capture_detailed_with_label_when(
-            &invocation,
-            &format!("Listing {noun} from {backend}"),
-            false,
-            |capture| backend.accepts_list_capture(upgradable, capture),
-        ) {
+    let invocations: Vec<Invocation> = backends
+        .iter()
+        .map(|backend| {
+            backend
+                .plan_list(upgradable, runtime)
+                .into_iter()
+                .next()
+                .expect("list should always produce one invocation")
+        })
+        .collect();
+
+    if dry_run {
+        for invocation in &invocations {
+            println!("> {}", invocation.render_for_display());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let labels: Vec<String> = backends
+        .iter()
+        .map(|backend| format!("Listing {noun} from {backend}"))
+        .collect();
+    let captures = if single_backend {
+        invocations
+            .iter()
+            .zip(labels)
+            .map(|(invocation, label)| run_capture_detailed_with_label(invocation, &label))
+            .collect()
+    } else {
+        run_captures_parallel(invocations.clone(), labels)
+    };
+
+    for (index, backend) in backends.iter().enumerate() {
+        let capture = match &captures[index] {
             Ok(capture) => capture,
             Err(error) => {
                 if single_backend {
-                    return Err(error);
+                    return Err(error.clone());
                 }
                 eprintln!("warning: failed to list {noun} from {backend}: {error}");
                 continue;
             }
         };
-        if !backend.accepts_list_capture(upgradable, &capture) {
+        if !backend.accepts_list_capture(upgradable, capture) {
+            let error = render_command_failure(&invocations[index], capture);
             if single_backend {
-                return Err(render_command_failure(&invocation, &capture));
+                return Err(error);
             }
-            eprintln!(
-                "warning: failed to list {noun} from {backend}: {}",
-                render_command_failure(&invocation, &capture)
-            );
+            eprintln!("warning: failed to list {noun} from {backend}: {error}");
             continue;
         }
 
         if let Some(rows) = backend.parse_list_entries(upgradable, &capture.stdout) {
             parsed_rows.extend(rows);
-        } else if let Some(section) = render_backend_output_section(backend, &capture.stdout) {
+        } else if let Some(section) = render_backend_output_section(*backend, &capture.stdout) {
             raw_sections.push(section);
         }
     }
 
-    if dry_run {
+    let parsed_rows = sort_list_rows(parsed_rows);
+    if json {
+        println!("{}", render_list_results_json(&parsed_rows, upgradable));
         return Ok(ExitCode::SUCCESS);
     }
-
-    let parsed_rows = sort_list_rows(parsed_rows);
     if !parsed_rows.is_empty() {
         print_list_rows(&parsed_rows, upgradable);
     }
@@ -1080,42 +1130,91 @@ fn run_show(
     }
 }
 
+fn run_captures_parallel(
+    invocations: Vec<Invocation>,
+    labels: Vec<String>,
+) -> Vec<Result<CommandCapture, String>> {
+    let mut handles = Vec::with_capacity(invocations.len());
+    for (invocation, label) in invocations.into_iter().zip(labels) {
+        let handle = thread::spawn(move || {
+            let _ = label;
+            run_quiet_command_capture(&invocation)
+        });
+        handles.push(handle);
+    }
+    handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|_| Err("backend thread panicked".to_string()))
+        })
+        .collect()
+}
+
 fn collect_search_candidates(
     backends: &[Backend],
     query: &str,
     runtime: &RuntimeSettings<'_>,
+    quiet: bool,
 ) -> Result<Vec<SearchCandidate>, String> {
-    let mut candidates = Vec::new();
     let aggregate = backends.len() > 1;
 
     for backend in backends {
-        let search_invocation = backend.search_invocation(query, runtime);
-        if aggregate {
-            println!("Searching {backend} for: {query}");
-        } else {
-            println!("Searching candidates for: {query}");
+        if !quiet {
+            if aggregate {
+                println!("Searching {backend} for: {query}");
+            } else {
+                println!("Searching candidates for: {query}");
+            }
         }
+    }
 
-        let search_output = match run_capture_with_label(
-            &search_invocation,
-            &format!("Searching {backend} for {query}"),
-        ) {
-            Ok(output) => output,
-            Err(error) => {
+    let invocations: Vec<Invocation> = backends
+        .iter()
+        .map(|backend| backend.search_invocation(query, runtime))
+        .collect();
+    let labels: Vec<String> = backends
+        .iter()
+        .map(|backend| format!("Searching {backend} for {query}"))
+        .collect();
+
+    let captures = if aggregate && !quiet {
+        run_captures_parallel(invocations.clone(), labels)
+    } else {
+        invocations
+            .iter()
+            .zip(labels)
+            .map(|(invocation, label)| run_capture_detailed_with_label(invocation, &label))
+            .collect()
+    };
+
+    let mut candidates = Vec::new();
+    for (index, backend) in backends.iter().enumerate() {
+        match &captures[index] {
+            Ok(capture) if capture.success => {
+                candidates.extend(backend.parse_search_candidates(&capture.stdout));
+            }
+            Ok(capture) => {
+                let error = render_command_failure(&invocations[index], capture);
                 if aggregate {
                     eprintln!("warning: failed to search {backend}: {error}");
                     continue;
                 }
                 return Err(error);
             }
-        };
-        candidates.extend(backend.parse_search_candidates(&search_output));
+            Err(error) => {
+                if aggregate {
+                    eprintln!("warning: failed to search {backend}: {error}");
+                    continue;
+                }
+                return Err(error.clone());
+            }
+        }
     }
 
     let candidates = dedupe_search_candidates(candidates);
-    let candidates = sort_search_candidates(candidates, query, backends);
-
-    Ok(candidates)
+    Ok(sort_search_candidates(candidates, query, backends))
 }
 
 fn collect_installed_candidates(
@@ -1189,21 +1288,61 @@ fn collect_upgradable_candidates(
     backends: &[Backend],
     runtime: &RuntimeSettings<'_>,
 ) -> Result<Vec<SearchCandidate>, String> {
-    let mut candidates = Vec::new();
     let aggregate = backends.len() > 1;
+    let invocations: Vec<Invocation> = backends
+        .iter()
+        .map(|backend| {
+            backend
+                .plan_list(true, runtime)
+                .into_iter()
+                .next()
+                .expect("upgradable list should always produce one invocation")
+        })
+        .collect();
+    let labels: Vec<String> = backends
+        .iter()
+        .map(|backend| format!("Checking updates for {backend}"))
+        .collect();
 
-    for backend in backends {
-        let rows = match collect_upgradable_rows(*backend, runtime) {
-            Ok(rows) => rows,
+    let captures = if aggregate {
+        run_captures_parallel(invocations.clone(), labels)
+    } else {
+        invocations
+            .iter()
+            .zip(labels)
+            .map(|(invocation, label)| {
+                run_capture_detailed_with_label(invocation, &label)
+            })
+            .collect()
+    };
+
+    let mut candidates = Vec::new();
+    for (index, backend) in backends.iter().enumerate() {
+        let capture = match &captures[index] {
+            Ok(capture) => capture,
             Err(error) => {
                 if aggregate {
-                    eprintln!("warning: failed to inspect pending upgrades for {backend}: {error}");
+                    eprintln!(
+                        "warning: failed to inspect pending upgrades for {backend}: {error}"
+                    );
                     continue;
                 }
-                return Err(error);
+                return Err(error.clone());
             }
         };
-
+        if !backend.accepts_list_capture(true, capture) {
+            let error = render_command_failure(&invocations[index], capture);
+            if aggregate {
+                eprintln!(
+                    "warning: failed to inspect pending upgrades for {backend}: {error}"
+                );
+                continue;
+            }
+            return Err(error);
+        }
+        let rows = backend
+            .parse_list_entries(true, &capture.stdout)
+            .unwrap_or_default();
         candidates.extend(rows.into_iter().map(package_upgrade_candidate));
     }
 
@@ -1211,14 +1350,6 @@ fn collect_upgradable_candidates(
     Ok(sort_search_candidates(candidates, "", backends))
 }
 
-fn run_capture_with_label(invocation: &Invocation, label: &str) -> Result<String, String> {
-    let capture = run_capture_detailed_with_label(invocation, label)?;
-    if !capture.success {
-        return Err(render_command_failure(invocation, &capture));
-    }
-
-    Ok(capture.stdout)
-}
 
 fn run_capture_detailed_with_label(
     invocation: &Invocation,
@@ -1240,6 +1371,13 @@ where
 }
 
 fn render_command_failure(invocation: &Invocation, capture: &CommandCapture) -> String {
+    if capture.timed_out {
+        return format!(
+            "backend command timed out after {}s: {}",
+            COMMAND_TIMEOUT_SECONDS.load(std::sync::atomic::Ordering::Relaxed),
+            invocation.render_for_display()
+        );
+    }
     let stderr = capture.stderr.trim();
     if stderr.is_empty() {
         format!(
@@ -1271,6 +1409,20 @@ fn run_logged_command_capture_with_label(
     inherit_stdin: bool,
     accept_capture: impl FnOnce(&CommandCapture) -> bool,
 ) -> Result<CommandCapture, String> {
+    run_logged_command_capture_inner(invocation, label, inherit_stdin, accept_capture, false)
+}
+
+fn run_quiet_command_capture(invocation: &Invocation) -> Result<CommandCapture, String> {
+    run_logged_command_capture_inner(invocation, "", false, |_| false, true)
+}
+
+fn run_logged_command_capture_inner(
+    invocation: &Invocation,
+    label: &str,
+    inherit_stdin: bool,
+    accept_capture: impl FnOnce(&CommandCapture) -> bool,
+    quiet: bool,
+) -> Result<CommandCapture, String> {
     let capture = CommandLogCapture::new()?;
     let stdout_file = fs::File::create(&capture.stdout_path)
         .map_err(|error| format!("failed to open stdout capture file: {error}"))?;
@@ -1290,7 +1442,11 @@ fn run_logged_command_capture_with_label(
         .spawn()
         .map_err(|error| format!("failed to launch {}: {error}", invocation.program))?;
 
-    let mut reporter = ProgressReporter::new();
+    let mut reporter = ProgressReporter::new_with_enabled(!quiet);
+    let timeout = command_timeout();
+    let started_at = Instant::now();
+    let mut timed_out = false;
+
     loop {
         reporter.tick(&progress_label)?;
         if child
@@ -1300,12 +1456,24 @@ fn run_logged_command_capture_with_label(
         {
             break;
         }
+        if timeout.is_some_and(|limit| started_at.elapsed() >= limit) {
+            let _ = child.kill();
+            let _ = child.wait();
+            timed_out = true;
+            break;
+        }
         thread::sleep(Duration::from_millis(120));
     }
 
-    let status = child
-        .wait()
-        .map_err(|error| format!("failed to collect {} result: {error}", invocation.program))?;
+    let status = if timed_out {
+        None
+    } else {
+        Some(
+            child
+                .wait()
+                .map_err(|error| format!("failed to collect {} result: {error}", invocation.program))?,
+        )
+    };
 
     let stdout = read_capture_log(&capture.stdout_path);
     let stderr = read_capture_log(&capture.stderr_path);
@@ -1314,8 +1482,9 @@ fn run_logged_command_capture_with_label(
     let command_capture = CommandCapture {
         stdout,
         stderr,
-        success: status.success(),
-        status_code: status.code().unwrap_or(1),
+        success: status.as_ref().is_some_and(|status| status.success()),
+        status_code: status.as_ref().and_then(|status| status.code()).unwrap_or(1),
+        timed_out,
     };
     reporter.finish(
         command_capture.success || accept_capture(&command_capture),
@@ -1397,29 +1566,6 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-fn collect_upgradable_rows(
-    backend: Backend,
-    runtime: &RuntimeSettings<'_>,
-) -> Result<Vec<PackageListEntry>, String> {
-    let invocation = backend
-        .plan_list(true, runtime)
-        .into_iter()
-        .next()
-        .expect("upgradable list should always produce one invocation");
-    let capture = run_capture_detailed_with_label_when(
-        &invocation,
-        &format!("Checking updates for {backend}"),
-        false,
-        |capture| backend.accepts_list_capture(true, capture),
-    )?;
-    if !backend.accepts_list_capture(true, &capture) {
-        return Err(render_command_failure(&invocation, &capture));
-    }
-
-    Ok(backend
-        .parse_list_entries(true, &capture.stdout)
-        .unwrap_or_default())
-}
 
 fn package_upgrade_candidate(entry: PackageListEntry) -> SearchCandidate {
     SearchCandidate {
@@ -1907,7 +2053,63 @@ fn print_candidates(candidates: &[SearchCandidate]) {
     println!();
 }
 
+fn choose_candidates(
+    action: &str,
+    candidates: &[SearchCandidate],
+    assume_yes: bool,
+) -> Result<Option<Vec<usize>>, String> {
+    // Interactive terminal keeps the original behaviour: always prompt.
+    if interactive_stdin_available() {
+        return prompt_for_selection(action, candidates.len()).map(Some);
+    }
+
+    // Non-interactive: never block on stdin.
+    if assume_yes {
+        let exact: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.label.eq_ignore_ascii_case(candidate.install_id.as_str())
+            })
+            .map(|(index, _)| index + 1)
+            .collect();
+        if candidates.len() == 1 {
+            println!(
+                "auto-selected {} (non-interactive; only one candidate)",
+                candidates[0].install_id
+            );
+            return Ok(Some(vec![1]));
+        }
+        if exact.len() == 1 {
+            println!(
+                "auto-selected {} (non-interactive; unique exact match)",
+                candidates[exact[0] - 1].install_id
+            );
+            return Ok(Some(exact));
+        }
+    }
+
+    Err(format!(
+        "`{action}` found {} candidates but stdin is not a terminal. \
+         Use `{action} --exact <package>` to choose one explicitly.",
+        candidates.len()
+    ))
+}
+
+fn interactive_stdin_available() -> bool {
+    io::stdin().is_terminal()
+        || env::var("WAW_FORCE_INTERACTIVE")
+            .map(|value| !value.trim().is_empty() && value.trim() != "0")
+            .unwrap_or(false)
+}
+
 fn prompt_for_selection(action: &str, max: usize) -> Result<Vec<usize>, String> {
+    if !interactive_stdin_available() {
+        return Err(format!(
+            "interactive selection for `{action}` requires a terminal. \
+             Re-run with `--exact` to name packages directly, or from an interactive shell."
+        ));
+    }
     print!("Select packages to {action} (e.g. 1 2 5, 1,3-4; empty to cancel): ");
     io::stdout()
         .flush()
@@ -3140,7 +3342,8 @@ impl Backend {
         match self {
             Self::Npm => parse_npm_show_details(output),
             Self::Pip => parse_pip_show_details(output),
-            Self::Winget | Self::Scoop | Self::Chocolatey => parse_key_value_show_details(output)
+            Self::Chocolatey => parse_choco_show_details(output),
+            Self::Winget | Self::Scoop => parse_key_value_show_details(output)
                 .map(|mut details| {
                     details.backend = self;
                     details
@@ -3531,6 +3734,7 @@ struct Config {
     choco_source: Option<String>,
     scoop_bucket: Option<String>,
     pip_user: bool,
+    command_timeout_seconds: u64,
     enable_winget: bool,
     enable_scoop: bool,
     enable_choco: bool,
@@ -3548,6 +3752,7 @@ impl Default for Config {
             choco_source: None,
             scoop_bucket: None,
             pip_user: true,
+            command_timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
             enable_winget: true,
             enable_scoop: true,
             enable_choco: true,
@@ -3592,6 +3797,11 @@ impl Config {
                 "choco_source" => config.choco_source = Some(parse_string(value)?),
                 "scoop_bucket" => config.scoop_bucket = Some(parse_string(value)?),
                 "pip_user" => config.pip_user = parse_bool(value)?,
+            "command_timeout_seconds" => {
+                config.command_timeout_seconds = value.parse::<u64>().map_err(|_| {
+                    format!("invalid value for command_timeout_seconds: {value}")
+                })?;
+            }
                 "enable_winget" => config.enable_winget = parse_bool(value)?,
                 "enable_scoop" => config.enable_scoop = parse_bool(value)?,
                 "enable_choco" => config.enable_choco = parse_bool(value)?,
@@ -3673,6 +3883,10 @@ impl Config {
             lines.push(format!("scoop_bucket = {}", render_toml_string(bucket)));
         }
         lines.push(format!("pip_user = {}", self.pip_user));
+        lines.push(format!(
+            "command_timeout_seconds = {}",
+            self.command_timeout_seconds
+        ));
         lines.push(format!("enable_winget = {}", self.enable_winget));
         lines.push(format!("enable_scoop = {}", self.enable_scoop));
         lines.push(format!("enable_choco = {}", self.enable_choco));
@@ -3880,6 +4094,43 @@ fn render_show_results_json(results: &[ShowBackendResult]) -> String {
     format!("[\n  {items}\n]")
 }
 
+fn render_list_results_json(rows: &[PackageListEntry], upgradable: bool) -> String {
+    let items = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{{\"backend\":\"{}\",\"name\":\"{}\",\"package_id\":\"{}\",\"current_version\":\"{}\",\"available_version\":{}}}",
+                escape_json_string(&row.backend.to_string()),
+                escape_json_string(&row.name),
+                escape_json_string(&row.package_id),
+                escape_json_string(&row.current_version),
+                render_json_optional_string(row.available_version.as_deref()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    let _ = upgradable;
+    format!("[\n  {items}\n]")
+}
+
+fn render_search_results_json(candidates: &[SearchCandidate]) -> String {
+    let items = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{{\"backend\":\"{}\",\"label\":\"{}\",\"install_id\":\"{}\",\"version\":{},\"source\":{}}}",
+                escape_json_string(&candidate.backend.to_string()),
+                escape_json_string(&candidate.label),
+                escape_json_string(&candidate.install_id),
+                render_json_optional_string(candidate.version.as_deref()),
+                render_json_optional_string(candidate.source.as_deref()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    format!("[\n  {items}\n]")
+}
+
 fn render_show_result_json(result: &ShowBackendResult) -> String {
     let details = result
         .details
@@ -4055,6 +4306,7 @@ struct CommandCapture {
     stderr: String,
     success: bool,
     status_code: i32,
+    timed_out: bool,
 }
 
 struct CommandLogCapture {
@@ -4086,8 +4338,12 @@ struct ProgressReporter {
 
 impl ProgressReporter {
     fn new() -> Self {
+        Self::new_with_enabled(true)
+    }
+
+    fn new_with_enabled(enabled: bool) -> Self {
         Self {
-            enabled: io::stderr().is_terminal(),
+            enabled: enabled && io::stderr().is_terminal(),
             frame_index: 0,
             last_width: 0,
             started_at: Instant::now(),
@@ -4330,6 +4586,7 @@ fn run_elevated_program(
         stderr: visible_stderr,
         success: outcome.status.success(),
         status_code: outcome.status.code().unwrap_or(1),
+        timed_out: false,
     })
 }
 
@@ -6020,8 +6277,9 @@ fn parse_pip_show_details(output: &str) -> Option<PackageDetails> {
         .unwrap_or_default();
     let extra_fields = fields
         .into_iter()
-        .filter(|(label, _)| {
-            !matches!(
+        .filter(|(label, value)| {
+            !value.trim().is_empty()
+                && !matches!(
                 label.as_str(),
                 "Name"
                     | "Version"
@@ -6054,79 +6312,92 @@ fn parse_pip_show_details(output: &str) -> Option<PackageDetails> {
     })
 }
 
+const NAME_ALIASES: &[&str] = &[
+    "Name",
+    "Package Identifier",
+    "PackageIdentifier",
+    "Id",
+    "Package",
+    "名称",
+];
+const VERSION_ALIASES: &[&str] = &["Version", "Installed Version", "Latest Version", "版本"];
+const SUMMARY_ALIASES: &[&str] = &[
+    "Summary",
+    "Description",
+    "Short Description",
+    "Moniker",
+    "描述",
+    "绰号",
+];
+const HOMEPAGE_ALIASES: &[&str] = &[
+    "Homepage",
+    "Home-page",
+    "Project URL",
+    "ProjectUrl",
+    "Publisher URL",
+    "PublisherUrl",
+    "主页",
+    "发布服务器 URL",
+    "软件站点",
+];
+const LICENSE_ALIASES: &[&str] = &["License", "License Url", "LicenseUrl", "许可证"];
+const AUTHOR_ALIASES: &[&str] = &["Author", "Publisher", "Maintainer", "作者", "发布者"];
+const REPOSITORY_ALIASES: &[&str] = &[
+    "Repository",
+    "Repository Url",
+    "RepositoryUrl",
+    "存储库",
+    "存储库 URL",
+];
+const KEYWORDS_ALIASES: &[&str] = &["Tags", "Keywords", "标记", "关键字"];
+const DEPENDENCIES_ALIASES: &[&str] = &["Dependencies", "Requires", "依赖项", "依赖"];
+
 fn parse_key_value_show_details(output: &str) -> Option<PackageDetails> {
     let fields = parse_colon_fields(output);
-    let name = find_field_value(&fields, &["Name", "Package Identifier", "Id", "Package"])?;
-    let version = find_field_value(&fields, &["Version", "Installed Version", "Latest Version"])
-        .unwrap_or_else(|| "-".to_string());
-    let summary = find_field_value(
-        &fields,
-        &["Summary", "Description", "Short Description", "Moniker"],
-    );
-    let homepage = find_field_value(
-        &fields,
-        &["Homepage", "Home-page", "Project URL", "Publisher URL"],
-    );
-    let license = find_field_value(&fields, &["License", "License Url"]);
-    let author = find_field_value(&fields, &["Author", "Publisher", "Maintainer"]);
-    let repository = find_field_value(&fields, &["Repository", "Repository Url"]);
-    let keywords = find_field_value(&fields, &["Tags", "Keywords"])
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
+    let mut details = parse_details_from_fields(&fields);
+    if details.name.trim().is_empty()
+        && let Some((display, id)) = parse_winget_found_header(output)
+    {
+        details.name = if display.is_empty() { id } else { display };
+    }
+    if details.name.trim().is_empty() {
+        return None;
+    }
+    Some(details)
+}
+
+fn parse_details_from_fields(fields: &[(String, String)]) -> PackageDetails {
+    let name = find_field_value(fields, NAME_ALIASES).unwrap_or_default();
+    let version = find_field_value(fields, VERSION_ALIASES).unwrap_or_else(|| "-".to_string());
+    let summary = find_field_value(fields, SUMMARY_ALIASES);
+    let homepage = find_field_value(fields, HOMEPAGE_ALIASES);
+    let license = find_field_value(fields, LICENSE_ALIASES);
+    let author = find_field_value(fields, AUTHOR_ALIASES);
+    let repository = find_field_value(fields, REPOSITORY_ALIASES);
+    let keywords = find_field_value(fields, KEYWORDS_ALIASES)
+        .map(|value| split_list_value(&value))
         .unwrap_or_default();
-    let dependencies = find_field_value(&fields, &["Dependencies", "Requires"])
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
+    let dependencies = find_field_value(fields, DEPENDENCIES_ALIASES)
+        .map(|value| split_list_value(&value))
         .unwrap_or_default();
     let extra_fields = fields
-        .into_iter()
-        .filter(|(label, _)| {
-            !matches!(
-                label.as_str(),
-                "Name"
-                    | "Package Identifier"
-                    | "Id"
-                    | "Package"
-                    | "Version"
-                    | "Installed Version"
-                    | "Latest Version"
-                    | "Summary"
-                    | "Description"
-                    | "Short Description"
-                    | "Moniker"
-                    | "Homepage"
-                    | "Home-page"
-                    | "Project URL"
-                    | "Publisher URL"
-                    | "License"
-                    | "License Url"
-                    | "Author"
-                    | "Publisher"
-                    | "Maintainer"
-                    | "Repository"
-                    | "Repository Url"
-                    | "Tags"
-                    | "Keywords"
-                    | "Dependencies"
-                    | "Requires"
-            )
+        .iter()
+        .filter(|(label, value)| {
+            !value.trim().is_empty()
+                && !is_known_label(label, NAME_ALIASES)
+                && !is_known_label(label, VERSION_ALIASES)
+                && !is_known_label(label, SUMMARY_ALIASES)
+                && !is_known_label(label, HOMEPAGE_ALIASES)
+                && !is_known_label(label, LICENSE_ALIASES)
+                && !is_known_label(label, AUTHOR_ALIASES)
+                && !is_known_label(label, REPOSITORY_ALIASES)
+                && !is_known_label(label, KEYWORDS_ALIASES)
+                && !is_known_label(label, DEPENDENCIES_ALIASES)
         })
-        .map(|(label, value)| (normalize_field_label(&label), value))
+        .map(|(label, value)| (normalize_field_label(label), value.clone()))
         .collect();
 
-    Some(PackageDetails {
+    PackageDetails {
         backend: Backend::Winget,
         name,
         version,
@@ -6138,31 +6409,221 @@ fn parse_key_value_show_details(output: &str) -> Option<PackageDetails> {
         keywords,
         dependencies,
         extra_fields,
+    }
+}
+
+fn is_known_label(label: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| label_matches(label, name))
+}
+
+fn parse_winget_found_header(output: &str) -> Option<(String, String)> {
+    let line = output.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let open = line.find('[')?;
+    let close = line[open..].find(']')? + open;
+    let id = line[open + 1..close].trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let display = strip_found_prefix(line[..open].trim()).to_string();
+    Some((display, id))
+}
+
+fn strip_found_prefix(value: &str) -> &str {
+    for prefix in ["已找到", "Found", "found"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            return rest.trim();
+        }
+    }
+    value
+}
+
+fn parse_choco_show_details(output: &str) -> Option<PackageDetails> {
+    let fields = parse_colon_fields(output);
+
+    let title = find_field_value(&fields, &["Title", "标题"]);
+    let package_line = parse_choco_package_line(output);
+    let name = title
+        .as_deref()
+        .map(|value| value.split('|').next().unwrap_or(value).trim().to_string())
+        .map(|value| match value.strip_suffix("(Install)") {
+            Some(inner) if !inner.trim().is_empty() => inner.trim().to_string(),
+            _ => value,
+        })
+        .or_else(|| package_line.as_ref().map(|(name, _)| name.clone()))?;
+
+    let version = find_field_value(&fields, &["Version", "版本"])
+        .or_else(|| package_line.as_ref().map(|(_, version)| version.clone()))
+        .unwrap_or_else(|| "-".to_string());
+
+    let summary = find_field_value(&fields, &["Summary", "摘要"])
+        .or_else(|| find_field_value(&fields, &["Description", "描述"]));
+    let homepage = find_field_value(
+        &fields,
+        &[
+            "Software Site",
+            "Project Site",
+            "Package Url",
+            "Package URL",
+            "软件站点",
+        ],
+    );
+    let license = find_field_value(&fields, &["Software License", "License", "许可证"]);
+    let author = find_field_value(
+        &fields,
+        &["Author", "Publisher", "Maintainer", "作者", "发布者"],
+    );
+    let repository = find_field_value(
+        &fields,
+        &[
+            "Software Source",
+            "Chocolatey Package Source",
+            "Project Source",
+        ],
+    );
+    let keywords = find_field_value(&fields, &["Tags", "Keywords", "标记"])
+        .map(|value| split_list_value(&value.replace(' ', ",")))
+        .unwrap_or_default();
+
+    let known = [
+        "Title",
+        "Summary",
+        "Description",
+        "Software Site",
+        "Software License",
+        "Software Source",
+        "Package Url",
+        "Package URL",
+        "Tags",
+        "Author",
+        "Publisher",
+        "Maintainer",
+        "Chocolatey Package Source",
+        "Project Source",
+        "Version",
+    ];
+    let extra_fields = fields
+        .iter()
+        .filter(|(label, value)| {
+            !value.trim().is_empty() && !known.iter().any(|name| label_matches(label, name))
+        })
+        .map(|(label, value)| (normalize_field_label(label), value.clone()))
+        .collect();
+
+    Some(PackageDetails {
+        backend: Backend::Chocolatey,
+        name,
+        version,
+        summary,
+        homepage,
+        license,
+        author,
+        repository,
+        keywords,
+        dependencies: Vec::new(),
+        extra_fields,
     })
 }
 
+fn parse_choco_package_line(output: &str) -> Option<(String, String)> {
+    let mut saw_banner = false;
+    for line in output.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if line.contains(':') {
+            continue;
+        }
+        if line.starts_with("Chocolatey v") || line.eq_ignore_ascii_case("chocolatey") {
+            saw_banner = true;
+            continue;
+        }
+        if !saw_banner {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else { continue };
+        let Some(version) = parts.next() else { continue };
+        if !version.starts_with(|ch: char| ch.is_ascii_digit()) {
+            continue;
+        }
+        return Some((name.to_string(), version.to_string()));
+    }
+    None
+}
+
 fn parse_colon_fields(output: &str) -> Vec<(String, String)> {
-    output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| {
-            let (label, value) = line.split_once(':')?;
-            let value = value.trim();
-            if value.is_empty() {
-                None
-            } else {
-                Some((label.trim().to_string(), value.to_string()))
+    let mut fields: Vec<(String, String)> = Vec::new();
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        let Some((index, width)) = split_field_line(line) else {
+            if indented
+                && let Some((_, value)) = fields.last_mut()
+            {
+                if !value.is_empty() {
+                    value.push('\n');
+                }
+                value.push_str(line.trim());
             }
-        })
-        .collect()
+            continue;
+        };
+
+        let label = line[..index].trim();
+        if label.is_empty() {
+            continue;
+        }
+        let value = line[index + width..].trim().to_string();
+        fields.push((label.to_string(), value));
+    }
+
+    fields
+}
+
+fn split_field_line(line: &str) -> Option<(usize, usize)> {
+    let half = line.find(':').map(|index| (index, 1));
+    let full = line
+        .find('\u{FF1A}')
+        .map(|index| (index, '\u{FF1A}'.len_utf8()));
+    match (half, full) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(single), None) | (None, Some(single)) => Some(single),
+        (None, None) => None,
+    }
 }
 
 fn find_field_value(fields: &[(String, String)], names: &[&str]) -> Option<String> {
     fields
         .iter()
-        .find(|(label, _)| names.iter().any(|name| label.eq_ignore_ascii_case(name)))
-        .map(|(_, value)| value.clone())
+        .find(|(label, value)| {
+            !value.trim().is_empty() && names.iter().any(|name| label_matches(label, name))
+        })
+        .map(|(_, value)| value.trim().to_string())
+}
+
+fn label_matches(label: &str, name: &str) -> bool {
+    compact_label(label).eq_ignore_ascii_case(&compact_label(name))
+}
+
+fn compact_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .map(|ch| if ch == '\u{FF1A}' { ':' } else { ch })
+        .collect()
+}
+
+fn split_list_value(value: &str) -> Vec<String> {
+    value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn normalize_field_label(label: &str) -> String {
@@ -6436,7 +6897,10 @@ fn shell_escape(value: &str) -> String {
 }
 
 fn command_supports_json(command: &Subcommand) -> bool {
-    matches!(command, Subcommand::Show { .. })
+    matches!(
+        command,
+        Subcommand::Show { .. } | Subcommand::List { .. } | Subcommand::Search { .. }
+    )
 }
 
 fn print_help() {
@@ -6474,13 +6938,17 @@ Options:
   -b, --backend <name>     Select backend explicitly
       --config <path>      Load config from a custom path
       --dry-run            Print backend commands without executing them
-      --json               Emit machine-readable JSON for `backends`, `backend ...`, and `show`
+      --json               Emit machine-readable JSON for `backends`, `backend ...`, `show`, `list`, and `search`
   -y, --yes                Force non-interactive execution (default)
       --interactive        Allow backend commands to prompt when supported
       --elevate            Force automatic Windows elevation attempts
       --no-elevate         Disable automatic Windows elevation attempts
   -h, --help               Show this help text
   -V, --version            Show version
+
+Environment:
+  WAW_FORCE_INTERACTIVE=1   Allow the interactive selector even when stdin is not a TTY
+  WAW_<BACKEND>_CMD         Override a backend executable (e.g. WAW_WINGET_CMD)
 
 Default config path:
   {config_hint}
@@ -6514,6 +6982,117 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_winget_localized_show_fields() {
+        let output = concat!(
+            "已找到 Git [Git.Git]\r\n",
+            "版本: 2.56.0.3\r\n",
+            "发布者: The Git Development Community\r\n",
+            "主页: https://gitforwindows.org/\r\n",
+            "许可证: GPL-2.0\r\n",
+            "描述:\r\n",
+            "  Git is a distributed version control system.\r\n",
+            "标记：\r\n",
+            "  git\r\n",
+            "  版本控制系统\r\n",
+        );
+
+        let details = parse_key_value_show_details(output).expect("should parse");
+        assert_eq!(details.name, "Git");
+        assert_eq!(details.version, "2.56.0.3");
+        assert_eq!(details.license.as_deref(), Some("GPL-2.0"));
+        assert_eq!(details.author.as_deref(), Some("The Git Development Community"));
+        assert_eq!(details.homepage.as_deref(), Some("https://gitforwindows.org/"));
+        assert!(
+            details.summary.as_deref().unwrap_or_default().contains("version control"),
+            "summary should absorb indented continuation: {:?}",
+            details.summary
+        );
+    }
+
+    #[test]
+    fn parses_full_width_colon_fields() {
+        let output = "名称：demo\n版本：1.2.3\n";
+        let fields = parse_colon_fields(output);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(find_field_value(&fields, NAME_ALIASES).as_deref(), Some("demo"));
+        assert_eq!(find_field_value(&fields, VERSION_ALIASES).as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn parses_english_show_fields_without_regression() {
+        let output = "\
+Name: git\n\
+Version: 2.53.0.3\n\
+Source: main\n\
+License: GPL-2.0-only\n";
+        let details = parse_key_value_show_details(output).expect("should parse");
+        assert_eq!(details.name, "git");
+        assert_eq!(details.version, "2.53.0.3");
+        assert_eq!(details.license.as_deref(), Some("GPL-2.0-only"));
+    }
+
+    #[test]
+    fn parses_choco_show_details() {
+        let output = "\
+Chocolatey v2.4.3\r\n\
+rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
+ Title: rustup (Install) | Published: 2024/8/30\r\n\
+ Package url https://community.chocolatey.org/packages/rustup.install/1.27.1\r\n\
+  Chocolatey Package Source: https://github.com/camilohe/rustup.install\r\n\
+ Tags: rustup rust\r\n\
+ Software Site: https://rustup.rs/\r\n\
+ Summary: rustup: the Rust toolchain installer\r\n";
+
+        let details = parse_choco_show_details(output).expect("should parse");
+        assert_eq!(details.name, "rustup");
+        assert_eq!(details.version, "1.27.1");
+        assert_eq!(details.homepage.as_deref(), Some("https://rustup.rs/"));
+        assert_eq!(
+            details.summary.as_deref(),
+            Some("rustup: the Rust toolchain installer")
+        );
+        assert_eq!(details.keywords, vec!["rustup", "rust"]);
+    }
+
+    #[test]
+    fn winget_found_header_supplies_name() {
+        let output = "已找到 7-Zip [7zip.7zip]\n版本: 26.00\n";
+        let details = parse_key_value_show_details(output).expect("should parse");
+        assert_eq!(details.name, "7-Zip");
+        assert_eq!(details.version, "26.00");
+    }
+
+    #[test]
+    fn list_json_is_valid_and_complete() {
+        let rows = vec![PackageListEntry {
+            backend: Backend::Winget,
+            name: "123云盘".to_string(),
+            package_id: "123.123pan".to_string(),
+            current_version: "3.1.5.0".to_string(),
+            available_version: Some("3.2.8.0".to_string()),
+        }];
+        let json = render_list_results_json(&rows, true);
+        assert!(json.contains("\"backend\":\"winget\""));
+        assert!(json.contains("123云盘"));
+        assert!(json.contains("\"available_version\":\"3.2.8.0\""));
+        assert!(json.starts_with("[\n"));
+    }
+
+    #[test]
+    fn search_json_renders_nulls() {
+        let candidates = vec![SearchCandidate {
+            backend: Backend::Npm,
+            label: "typescript".to_string(),
+            install_id: "typescript".to_string(),
+            version: None,
+            source: None,
+        }];
+        let json = render_search_results_json(&candidates);
+        assert!(json.contains("\"version\":null"));
+        assert!(json.contains("\"source\":null"));
+    }
 
     #[test]
     fn parses_hold_disable() {
@@ -6646,16 +7225,18 @@ mod tests {
     }
 
     #[test]
-    fn json_support_is_limited_to_show_outside_backend_commands() {
+    fn json_support_covers_show_list_and_search() {
         assert!(command_supports_json(&Subcommand::Show {
             package: "requests".to_string(),
         }));
-        assert!(!command_supports_json(&Subcommand::List {
+        assert!(command_supports_json(&Subcommand::List {
             upgradable: false
         }));
-        assert!(!command_supports_json(&Subcommand::Search {
-            query: "git".to_string(),
+        assert!(command_supports_json(&Subcommand::Search {
+            query: "git".to_string()
         }));
+        assert!(!command_supports_json(&Subcommand::Backends));
+        assert!(!command_supports_json(&Subcommand::Help));
     }
 
     #[test]
@@ -7223,6 +7804,7 @@ pip_user = true
                 .to_string(),
             success: false,
             status_code: 1,
+            timed_out: false,
         };
 
         assert!(is_tolerable_command_failure(&invocation, &capture));
@@ -7244,6 +7826,7 @@ pip_user = true
             stderr: String::new(),
             success: false,
             status_code: WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE,
+            timed_out: false,
         };
 
         assert!(is_tolerable_command_failure(&invocation, &capture));
@@ -8381,6 +8964,7 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
             stderr: "Package(s) not found".to_string(),
             success: false,
             status_code: 1,
+            timed_out: false,
         };
 
         assert_eq!(
@@ -8397,6 +8981,7 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
             stderr: String::new(),
             success: false,
             status_code: 1,
+            timed_out: false,
         };
 
         assert!(Backend::Npm.accepts_list_capture(true, &capture));
