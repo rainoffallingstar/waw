@@ -25,15 +25,10 @@ const ELEVATED_FAILURE_MARKER: &str = "WAW_ELEVATED_FAILURE:";
 const ELEVATED_BOOTSTRAP_FAILURE_MARKER: &str = "WAW_ELEVATED_BOOTSTRAP_FAILURE:";
 const WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE: i32 = -1978335189;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 180;
-static COMMAND_TIMEOUT_SECONDS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(DEFAULT_COMMAND_TIMEOUT_SECONDS);
 
-fn configure_command_timeout(seconds: u64) {
-    COMMAND_TIMEOUT_SECONDS.store(seconds, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn command_timeout() -> Option<Duration> {
-    match COMMAND_TIMEOUT_SECONDS.load(std::sync::atomic::Ordering::Relaxed) {
+/// `0` means "wait forever".
+fn timeout_from_seconds(seconds: u64) -> Option<Duration> {
+    match seconds {
         0 => None,
         seconds => Some(Duration::from_secs(seconds)),
     }
@@ -249,7 +244,6 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let mut loaded_config = LoadedConfig::load(cli.config_path.as_deref())?;
-    configure_command_timeout(loaded_config.config.command_timeout_seconds);
     let backend_assume_yes = cli.assume_yes.unwrap_or(loaded_config.config.assume_yes);
     let backend_auto_elevate = cli
         .auto_elevate
@@ -501,6 +495,9 @@ fn handle_backend_command(
                     &RuntimeSettings {
                         assume_yes,
                         auto_elevate,
+                        command_timeout: timeout_from_seconds(
+                            loaded_config.config.command_timeout_seconds,
+                        ),
                         config: &loaded_config.config,
                     },
                 )?;
@@ -608,6 +605,7 @@ fn runtime_from<'a>(config: &'a Config, cli: &Cli) -> RuntimeSettings<'a> {
     RuntimeSettings {
         assume_yes: cli.assume_yes.unwrap_or(config.assume_yes),
         auto_elevate: cli.auto_elevate.unwrap_or(config.auto_elevate),
+        command_timeout: timeout_from_seconds(config.command_timeout_seconds),
         config,
     }
 }
@@ -768,7 +766,7 @@ fn execute_invocations(
     }
 
     if should_batch_elevate {
-        run_elevated_invocations(&invocations, continue_on_error)?;
+        run_elevated_invocations(&invocations, continue_on_error, runtime.command_timeout)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -788,9 +786,15 @@ fn execute_invocations(
             && !process_is_elevated
         {
             println!("requesting administrator privileges...");
-            run_elevated_invocation(&invocation, &progress_label)?
+            run_elevated_invocation(&invocation, &progress_label, runtime.command_timeout)?
         } else {
-            run_logged_command_capture_with_label(&invocation, &progress_label, true, |_| false)?
+            run_logged_command_capture_with_label(
+                &invocation,
+                &progress_label,
+                true,
+                runtime.command_timeout,
+                |_| false,
+            )?
         };
 
         if !capture.success {
@@ -1053,6 +1057,7 @@ fn collect_manifest_packages(
             &invocation,
             &format!("Collecting {backend} packages"),
             false,
+            runtime.command_timeout,
             |capture| backend.accepts_list_capture(false, capture),
         ) {
             Ok(capture) => capture,
@@ -1315,10 +1320,12 @@ fn run_list(
         invocations
             .iter()
             .zip(labels)
-            .map(|(invocation, label)| run_capture_detailed_with_label(invocation, &label))
+            .map(|(invocation, label)| {
+                run_capture_detailed_with_label(invocation, &label, runtime.command_timeout)
+            })
             .collect()
     } else {
-        run_captures_parallel(invocations.clone(), labels)
+        run_captures_parallel(invocations.clone(), labels, runtime.command_timeout)
     };
 
     for (index, backend) in backends.iter().enumerate() {
@@ -1416,6 +1423,7 @@ fn run_show(
         let capture = match run_capture_detailed_with_label(
             &invocation,
             &format!("Showing {package} from {backend}"),
+            runtime.command_timeout,
         ) {
             Ok(capture) => capture,
             Err(error) => {
@@ -1520,12 +1528,13 @@ fn run_show(
 fn run_captures_parallel(
     invocations: Vec<Invocation>,
     labels: Vec<String>,
+    timeout: Option<Duration>,
 ) -> Vec<Result<CommandCapture, String>> {
     let mut handles = Vec::with_capacity(invocations.len());
     for (invocation, label) in invocations.into_iter().zip(labels) {
         let handle = thread::spawn(move || {
             let _ = label;
-            run_quiet_command_capture(&invocation)
+            run_quiet_command_capture(&invocation, timeout)
         });
         handles.push(handle);
     }
@@ -1567,12 +1576,14 @@ fn collect_search_candidates(
         .collect();
 
     let captures = if aggregate && !quiet {
-        run_captures_parallel(invocations.clone(), labels)
+        run_captures_parallel(invocations.clone(), labels, runtime.command_timeout)
     } else {
         invocations
             .iter()
             .zip(labels)
-            .map(|(invocation, label)| run_capture_detailed_with_label(invocation, &label))
+            .map(|(invocation, label)| {
+                run_capture_detailed_with_label(invocation, &label, runtime.command_timeout)
+            })
             .collect()
     };
 
@@ -1628,6 +1639,7 @@ fn collect_installed_candidates(
         let capture = match run_capture_detailed_with_label(
             &invocation,
             &format!("Searching installed packages in {backend} for {query}"),
+            runtime.command_timeout,
         ) {
             Ok(capture) => capture,
             Err(error) => {
@@ -1692,13 +1704,13 @@ fn collect_upgradable_candidates(
         .collect();
 
     let captures = if aggregate {
-        run_captures_parallel(invocations.clone(), labels)
+        run_captures_parallel(invocations.clone(), labels, runtime.command_timeout)
     } else {
         invocations
             .iter()
             .zip(labels)
             .map(|(invocation, label)| {
-                run_capture_detailed_with_label(invocation, &label)
+                run_capture_detailed_with_label(invocation, &label, runtime.command_timeout)
             })
             .collect()
     };
@@ -1741,27 +1753,29 @@ fn collect_upgradable_candidates(
 fn run_capture_detailed_with_label(
     invocation: &Invocation,
     label: &str,
+    timeout: Option<Duration>,
 ) -> Result<CommandCapture, String> {
-    run_capture_detailed_with_label_when(invocation, label, false, |_| false)
+    run_capture_detailed_with_label_when(invocation, label, false, timeout, |_| false)
 }
 
 fn run_capture_detailed_with_label_when<F>(
     invocation: &Invocation,
     label: &str,
     inherit_stdin: bool,
+    timeout: Option<Duration>,
     accept_capture: F,
 ) -> Result<CommandCapture, String>
 where
     F: FnOnce(&CommandCapture) -> bool,
 {
-    run_logged_command_capture_with_label(invocation, label, inherit_stdin, accept_capture)
+    run_logged_command_capture_with_label(invocation, label, inherit_stdin, timeout, accept_capture)
 }
 
 fn render_command_failure(invocation: &Invocation, capture: &CommandCapture) -> String {
     if capture.timed_out {
         return format!(
             "backend command timed out after {}s: {}",
-            COMMAND_TIMEOUT_SECONDS.load(std::sync::atomic::Ordering::Relaxed),
+            capture.timeout_seconds.unwrap_or(0),
             invocation.render_for_display()
         );
     }
@@ -1794,13 +1808,24 @@ fn run_logged_command_capture_with_label(
     invocation: &Invocation,
     label: &str,
     inherit_stdin: bool,
+    timeout: Option<Duration>,
     accept_capture: impl FnOnce(&CommandCapture) -> bool,
 ) -> Result<CommandCapture, String> {
-    run_logged_command_capture_inner(invocation, label, inherit_stdin, accept_capture, false)
+    run_logged_command_capture_inner(
+        invocation,
+        label,
+        inherit_stdin,
+        timeout,
+        accept_capture,
+        false,
+    )
 }
 
-fn run_quiet_command_capture(invocation: &Invocation) -> Result<CommandCapture, String> {
-    run_logged_command_capture_inner(invocation, "", false, |_| false, true)
+fn run_quiet_command_capture(
+    invocation: &Invocation,
+    timeout: Option<Duration>,
+) -> Result<CommandCapture, String> {
+    run_logged_command_capture_inner(invocation, "", false, timeout, |_| false, true)
 }
 
 /// Terminates a timed-out child and everything it spawned.
@@ -1826,6 +1851,7 @@ fn run_logged_command_capture_inner(
     invocation: &Invocation,
     label: &str,
     inherit_stdin: bool,
+    timeout: Option<Duration>,
     accept_capture: impl FnOnce(&CommandCapture) -> bool,
     quiet: bool,
 ) -> Result<CommandCapture, String> {
@@ -1887,7 +1913,6 @@ fn run_logged_command_capture_inner(
     let job: Option<()> = None;
 
     let mut reporter = ProgressReporter::new_with_enabled(!quiet);
-    let timeout = command_timeout();
     let started_at = Instant::now();
     let mut timed_out = false;
 
@@ -1927,6 +1952,7 @@ fn run_logged_command_capture_inner(
         success: status.as_ref().is_some_and(|status| status.success()),
         status_code: status.as_ref().and_then(|status| status.code()).unwrap_or(1),
         timed_out,
+        timeout_seconds: timeout.map(|limit| limit.as_secs()),
     };
     reporter.finish(
         command_capture.success || accept_capture(&command_capture),
@@ -4906,6 +4932,7 @@ fn render_json_object(entries: &[(String, String)]) -> String {
 struct RuntimeSettings<'a> {
     assume_yes: bool,
     auto_elevate: bool,
+    command_timeout: Option<Duration>,
     config: &'a Config,
 }
 
@@ -4975,6 +5002,9 @@ struct CommandCapture {
     success: bool,
     status_code: i32,
     timed_out: bool,
+    /// The limit that applied to this run, for diagnostics. `None` means no
+    /// limit was configured.
+    timeout_seconds: Option<u64>,
 }
 
 struct CommandLogCapture {
@@ -5242,18 +5272,23 @@ fn run_current_process_elevated() -> Result<CommandCapture, String> {
         .map_err(|error| format!("failed to resolve current executable for elevation: {error}"))?;
     let args: Vec<OsString> = env::args_os().skip(1).collect();
 
-    run_elevated_program(current_exe.as_os_str(), &args, "Running elevated command")
+    run_elevated_program(current_exe.as_os_str(), &args, "Running elevated command", None)
 }
 
-fn run_elevated_invocation(invocation: &Invocation, label: &str) -> Result<CommandCapture, String> {
+fn run_elevated_invocation(
+    invocation: &Invocation,
+    label: &str,
+    timeout: Option<Duration>,
+) -> Result<CommandCapture, String> {
     let args: Vec<OsString> = invocation.args.iter().map(OsString::from).collect();
 
-    run_elevated_program(OsStr::new(&invocation.program), &args, label)
+    run_elevated_program(OsStr::new(&invocation.program), &args, label, timeout)
 }
 
 fn run_elevated_invocations(
     invocations: &[Invocation],
     continue_on_error: bool,
+    timeout: Option<Duration>,
 ) -> Result<(), String> {
     let capture = ElevationCapture::new()?;
     let working_directory = env::current_dir()
@@ -5273,6 +5308,7 @@ fn run_elevated_invocations(
         &capture,
         "elevated command batch",
         &working_directory,
+        timeout,
     )?;
     if outcome.status.success() {
         Ok(())
@@ -5296,6 +5332,7 @@ fn run_elevated_program(
     program: &OsStr,
     args: &[OsString],
     label: &str,
+    timeout: Option<Duration>,
 ) -> Result<CommandCapture, String> {
     let capture = ElevationCapture::new()?;
     let working_directory = env::current_dir()
@@ -5314,6 +5351,7 @@ fn run_elevated_program(
         &capture,
         label,
         &working_directory,
+        timeout,
     )?;
     let visible_stderr = visible_elevated_stderr(&outcome.stderr_log);
     if !outcome.status.success() {
@@ -5330,6 +5368,7 @@ fn run_elevated_program(
         success: outcome.status.success(),
         status_code: outcome.status.code().unwrap_or(1),
         timed_out: false,
+        timeout_seconds: None,
     })
 }
 
@@ -5345,6 +5384,7 @@ fn run_logged_elevated_command_file(
     capture: &ElevationCapture,
     label: &str,
     working_directory: &str,
+    timeout: Option<Duration>,
 ) -> Result<ElevatedCommandOutcome, String> {
     let mut process = launch_elevated_command_file(
         command_path,
@@ -5354,7 +5394,6 @@ fn run_logged_elevated_command_file(
     )?;
 
     let mut reporter = ProgressReporter::new();
-    let timeout = command_timeout();
     let started_at = Instant::now();
     loop {
         let current_label = latest_elevated_step(&read_capture_log(&capture.status_path))
@@ -5369,7 +5408,7 @@ fn run_logged_elevated_command_file(
             reporter.finish(false, &current_label)?;
             return Err(format!(
                 "elevated command timed out after {}s: {current_label}",
-                COMMAND_TIMEOUT_SECONDS.load(std::sync::atomic::Ordering::Relaxed)
+                timeout.map(|limit| limit.as_secs()).unwrap_or(0)
             ));
         }
     }
@@ -8111,14 +8150,13 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
     }
 
     #[test]
-    fn command_timeout_none_when_disabled() {
-        configure_command_timeout(0);
-        assert!(command_timeout().is_none());
-        configure_command_timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS);
+    fn timeout_from_seconds_treats_zero_as_unlimited() {
+        assert!(timeout_from_seconds(0).is_none());
         assert_eq!(
-            command_timeout(),
+            timeout_from_seconds(DEFAULT_COMMAND_TIMEOUT_SECONDS),
             Some(Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECONDS))
         );
+        assert_eq!(timeout_from_seconds(5), Some(Duration::from_secs(5)));
     }
 
     #[test]
@@ -8130,6 +8168,7 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
             success: false,
             status_code: 1,
             timed_out: true,
+            timeout_seconds: None,
         };
         let message = render_command_failure(&invocation, &capture);
         assert!(
@@ -8229,7 +8268,8 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
             vec!["list".to_string()],
         );
 
-        let result = run_logged_command_capture_with_label(&invocation, "probe", false, |_| false);
+        let result =
+            run_logged_command_capture_with_label(&invocation, "probe", false, None, |_| false);
         assert!(result.is_err(), "launching a missing program must fail");
 
         let after = count_capture_files("waw-command-");
@@ -8361,6 +8401,7 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: false,
+            command_timeout: None,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("Git.Git@2.43.0")];
@@ -8377,6 +8418,7 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: false,
+            command_timeout: None,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("@types/node@20.11.0")];
@@ -8391,6 +8433,7 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: false,
+            command_timeout: None,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("requests@2.31.0")];
@@ -8404,6 +8447,7 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: false,
+            command_timeout: None,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("nodejs.install@0.10.35")];
@@ -8417,6 +8461,7 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: false,
+            command_timeout: None,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("gh@2.7.0")];
@@ -8797,6 +8842,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
 
@@ -8816,6 +8862,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
 
@@ -8840,6 +8887,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
 
@@ -8861,6 +8909,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
 
@@ -9230,6 +9279,7 @@ pip_user = true
             success: false,
             status_code: 1,
             timed_out: false,
+            timeout_seconds: None,
         };
 
         assert!(is_tolerable_command_failure(&invocation, &capture));
@@ -9252,6 +9302,7 @@ pip_user = true
             success: false,
             status_code: WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE,
             timed_out: false,
+            timeout_seconds: None,
         };
 
         assert!(is_tolerable_command_failure(&invocation, &capture));
@@ -9455,6 +9506,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: false,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
         let plan = Backend::Winget
@@ -9482,6 +9534,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
         let plan = Backend::Winget
@@ -9504,6 +9557,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: true,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
         let plan = Backend::Winget.plan_remove(
@@ -9540,6 +9594,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: false,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
         let plan = Backend::Winget
@@ -9573,6 +9628,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: false,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
         let plan = Backend::Scoop
@@ -9598,6 +9654,7 @@ pip_user = true
         let runtime = RuntimeSettings {
             assume_yes: false,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
         let plan = Backend::Chocolatey
@@ -10390,6 +10447,7 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
             success: false,
             status_code: 1,
             timed_out: false,
+            timeout_seconds: None,
         };
 
         assert_eq!(
@@ -10407,6 +10465,7 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
             success: false,
             status_code: 1,
             timed_out: false,
+            timeout_seconds: None,
         };
 
         assert!(Backend::Npm.accepts_list_capture(true, &capture));
@@ -10420,6 +10479,7 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
         let runtime = RuntimeSettings {
             assume_yes: false,
             auto_elevate: true,
+            command_timeout: None,
             config: &config,
         };
         let plan = Backend::Pip
