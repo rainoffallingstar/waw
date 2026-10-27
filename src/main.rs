@@ -2705,15 +2705,34 @@ impl Cli {
             let name = parser
                 .next()
                 .ok_or_else(|| "missing command. Try --help".to_string())?;
-            Subcommand::parse(name, &mut parser)?
-        };
 
-        if parser.has_remaining() {
-            return Err(format!(
-                "unexpected trailing arguments: {}",
-                parser.remaining().join(" ")
-            ));
-        }
+            // Global flags are also accepted after the subcommand name, so
+            // `waw list --json` behaves like `waw --json list`. They are pulled
+            // out before the subcommand parser sees them.
+            let (sub_args, trailing_globals) = split_global_flags(parser.remaining());
+            for flag in trailing_globals {
+                match flag.as_str() {
+                    "--json" => json = true,
+                    "--dry-run" => dry_run = true,
+                    "-y" | "--yes" => assume_yes = Some(true),
+                    "--interactive" => assume_yes = Some(false),
+                    "--elevate" => auto_elevate = Some(true),
+                    "--no-elevate" => auto_elevate = Some(false),
+                    "-h" | "--help" => show_help = true,
+                    "-V" => show_version = true,
+                    _ => {}
+                }
+            }
+            let mut sub_parser = ArgCursor::new(sub_args);
+            let parsed = Subcommand::parse(name, &mut sub_parser)?;
+            if sub_parser.has_remaining() {
+                return Err(format!(
+                    "unexpected trailing arguments: {}",
+                    sub_parser.remaining().join(" ")
+                ));
+            }
+            parsed
+        };
 
         Ok(Self {
             backend,
@@ -3142,6 +3161,51 @@ impl BackendAction {
             other => Err(format!("unsupported backend subcommand: {other}")),
         }
     }
+}
+
+/// Options that are global but commonly typed after the subcommand, e.g.
+/// `waw list --json`. This collects them out of the subcommand argument list.
+///
+/// The `--file`/`-f`/`-o` options take a value, so the token after them is left
+/// alone; otherwise `waw export --file --json` would swallow a real path.
+fn split_global_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
+    const VALUE_TAKING: [&str; 5] = ["--file", "-o", "-f", "--config", "--backend"];
+    const GLOBAL: [&str; 10] = [
+        "--json",
+        "--dry-run",
+        "-y",
+        "--yes",
+        "--interactive",
+        "--elevate",
+        "--no-elevate",
+        "-h",
+        "--help",
+        "-V",
+    ];
+
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut globals = Vec::new();
+    let mut skip_next_value = false;
+
+    for arg in args {
+        if skip_next_value {
+            skip_next_value = false;
+            remaining.push(arg.clone());
+            continue;
+        }
+        if VALUE_TAKING.contains(&arg.as_str()) {
+            skip_next_value = true;
+            remaining.push(arg.clone());
+            continue;
+        }
+        if GLOBAL.contains(&arg.as_str()) {
+            globals.push(arg.clone());
+            continue;
+        }
+        remaining.push(arg.clone());
+    }
+
+    (remaining, globals)
 }
 
 #[derive(Debug, Clone)]
@@ -7887,7 +7951,7 @@ Options:
   -b, --backend <name>     Select backend explicitly
       --config <path>      Load config from a custom path
       --dry-run            Print backend commands without executing them
-      --json               Emit machine-readable JSON for `backends`, `backend ...`, `show`, `list`, and `search`
+      --json               Emit JSON for `backends`, `backend ...`, `show`, `list`, and `search` (accepted before or after the command)
   -y, --yes                Force non-interactive execution (default)
       --interactive        Allow backend commands to prompt when supported
       --elevate            Force automatic Windows elevation attempts
@@ -8410,6 +8474,49 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
             PIP_SEARCH_SCRIPT.contains("/json"),
             "the prober should use the documented per-project JSON API"
         );
+    }
+
+    #[test]
+    fn global_flags_split_before_and_after_subcommand() {
+        let parse = |args: &[&str]| {
+            Cli::parse(args.iter().map(|value| value.to_string()))
+                .unwrap_or_else(|error| panic!("{args:?} should parse: {error}"))
+        };
+
+        let before = parse(&["--json", "list"]);
+        assert!(before.json);
+
+        let after = parse(&["list", "--json"]);
+        assert!(after.json, "global flag after the command must be honoured");
+
+        let mixed = parse(&["list", "--upgradable", "--json"]);
+        assert!(mixed.json);
+        assert_eq!(mixed.command, Subcommand::List { upgradable: true });
+
+        let dry = parse(&["install", "--exact", "git", "--dry-run"]);
+        assert!(dry.dry_run);
+    }
+
+    #[test]
+    fn global_flag_split_respects_value_taking_options() {
+        // `--file` takes a value; the flag after it is a path, not a global.
+        let (remaining, globals) = split_global_flags(&[
+            "--file".to_string(),
+            "--json".to_string(),
+            "--dry-run".to_string(),
+        ]);
+        assert_eq!(remaining, vec!["--file".to_string(), "--json".to_string()]);
+        assert_eq!(globals, vec!["--dry-run".to_string()]);
+    }
+
+    #[test]
+    fn unknown_subcommand_option_is_still_rejected() {
+        let result = Cli::parse(
+            ["list", "--nope"]
+                .iter()
+                .map(|value| value.to_string()),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
