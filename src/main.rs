@@ -3,12 +3,14 @@ mod capture;
 mod config;
 mod elevation;
 mod json;
+mod model;
 mod parse;
 mod render;
 #[cfg(windows)]
 mod win32;
 
 use json::{JsonValue, escape_json_string, parse_json};
+use model::*;
 use backend::Backend;
 #[allow(unused_imports)]
 use config::*;
@@ -3252,175 +3254,6 @@ impl Display for Backend {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RuntimeSettings<'a> {
-    assume_yes: bool,
-    auto_elevate: bool,
-    command_timeout: Option<Duration>,
-    config: &'a Config,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SearchCandidate {
-    backend: Backend,
-    label: String,
-    install_id: String,
-    version: Option<String>,
-    source: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoveTarget {
-    package: String,
-    version: Option<String>,
-}
-
-impl RemoveTarget {
-    fn unversioned(package: String) -> Self {
-        Self {
-            package,
-            version: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PackageListEntry {
-    backend: Backend,
-    name: String,
-    package_id: String,
-    current_version: String,
-    available_version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PackageDetails {
-    backend: Backend,
-    name: String,
-    version: String,
-    summary: Option<String>,
-    homepage: Option<String>,
-    license: Option<String>,
-    author: Option<String>,
-    repository: Option<String>,
-    keywords: Vec<String>,
-    dependencies: Vec<String>,
-    extra_fields: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ShowBackendResult {
-    backend: Backend,
-    command: String,
-    success: bool,
-    dry_run: bool,
-    details: Option<PackageDetails>,
-    raw_output: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandCapture {
-    stdout: String,
-    stderr: String,
-    success: bool,
-    status_code: i32,
-    timed_out: bool,
-    /// The limit that applied to this run, for diagnostics. `None` means no
-    /// limit was configured.
-    timeout_seconds: Option<u64>,
-}
-
-struct CommandLogCapture {
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
-}
-
-impl CommandLogCapture {
-    fn new() -> Result<Self, String> {
-        let base = unique_capture_base("waw-command")?;
-        Ok(Self {
-            stdout_path: base.with_extension("stdout.log"),
-            stderr_path: base.with_extension("stderr.log"),
-        })
-    }
-}
-
-impl Drop for CommandLogCapture {
-    fn drop(&mut self) {
-        // Removing here rather than at each success point keeps temporary files
-        // from leaking when a command fails to spawn, a wait errors out, or any
-        // other `?` returns early.
-        let _ = fs::remove_file(&self.stdout_path);
-        let _ = fs::remove_file(&self.stderr_path);
-    }
-}
-
-struct ProgressReporter {
-    enabled: bool,
-    frame_index: usize,
-    last_width: usize,
-    started_at: Instant,
-}
-
-impl ProgressReporter {
-    fn new() -> Self {
-        Self::new_with_enabled(true)
-    }
-
-    fn new_with_enabled(enabled: bool) -> Self {
-        Self {
-            enabled: enabled && io::stderr().is_terminal(),
-            frame_index: 0,
-            last_width: 0,
-            started_at: Instant::now(),
-        }
-    }
-
-    fn tick(&mut self, label: &str) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
-        let frame = FRAMES[self.frame_index % FRAMES.len()];
-        self.frame_index += 1;
-        self.render(&format!("{frame} {label}"))
-    }
-
-    fn finish(&mut self, success: bool, label: &str) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        let status = if success { "ok" } else { "failed" };
-        self.render(&format!(
-            "{status} {label} ({})",
-            format_elapsed(self.started_at.elapsed())
-        ))?;
-        io::stderr()
-            .write_all(b"\n")
-            .and_then(|_| io::stderr().flush())
-            .map_err(|error| format!("failed to update progress output: {error}"))?;
-        self.last_width = 0;
-        Ok(())
-    }
-
-    fn render(&mut self, message: &str) -> Result<(), String> {
-        let padding = self.last_width.saturating_sub(message.chars().count());
-        let padded = if padding == 0 {
-            message.to_string()
-        } else {
-            format!("{message}{}", " ".repeat(padding))
-        };
-        self.last_width = message.chars().count();
-        io::stderr()
-            .write_all(format!("\r{padded}").as_bytes())
-            .and_then(|_| io::stderr().flush())
-            .map_err(|error| format!("failed to update progress output: {error}"))
-    }
-}
-
 /// PyPI has no search API: the XML-RPC `search` endpoint was permanently
 /// disabled in 2020 because it was hammered into the ground, and the web UI's
 /// `/search/` route is not a machine API.
@@ -3502,50 +3335,6 @@ hits.sort(
 )
 print(json.dumps(hits))
 "#;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Invocation {
-    program: String,
-    args: Vec<String>,
-    message: Option<String>,
-    requires_elevation: bool,
-}
-
-impl Invocation {
-    fn owned(program: &str, args: Vec<String>) -> Self {
-        Self {
-            program: program.to_string(),
-            args,
-            message: None,
-            requires_elevation: false,
-        }
-    }
-
-    fn message(message: &str) -> Self {
-        Self {
-            program: String::new(),
-            args: Vec::new(),
-            message: Some(message.to_string()),
-            requires_elevation: false,
-        }
-    }
-
-    fn with_elevation(mut self, requires_elevation: bool) -> Self {
-        self.requires_elevation = requires_elevation;
-        self
-    }
-
-    fn render_for_display(&self) -> String {
-        if self.program.is_empty() {
-            return String::new();
-        }
-
-        let mut parts = Vec::with_capacity(self.args.len() + 1);
-        parts.push(shell_escape(&self.program));
-        parts.extend(self.args.iter().map(|arg| shell_escape(arg)));
-        parts.join(" ")
-    }
-}
 
 fn append_source_arg(args: &mut Vec<String>, source: Option<&str>) {
     if let Some(source) = source {
