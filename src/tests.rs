@@ -333,6 +333,26 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
     }
 
     #[test]
+    fn all_backends_failed_only_when_every_backend_failed() {
+        assert!(all_backends_failed("list", 3, &[]).is_none());
+        assert!(all_backends_failed("list", 3, &["a: x".to_string()]).is_none());
+        assert!(all_backends_failed("list", 3, &["a: x".to_string(), "b: y".to_string()]).is_none());
+
+        let error = all_backends_failed(
+            "list",
+            2,
+            &["a: boom".to_string(), "b: bang".to_string()],
+        )
+        .expect("all failed should produce an error");
+        assert!(error.contains("all 2 backend(s) failed"), "{error}");
+        assert!(error.contains("a: boom"), "{error}");
+        assert!(error.contains("b: bang"), "{error}");
+
+        // Defensive: no backends attempted must not claim failure.
+        assert!(all_backends_failed("list", 0, &[]).is_none());
+    }
+
+    #[test]
     fn parses_package_spec_forms() {
         let plain = PackageSpec::parse("git");
         assert_eq!(plain.name, "git");

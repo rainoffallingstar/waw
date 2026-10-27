@@ -531,6 +531,25 @@ fn resolve_single_backend(
     }
 }
 
+/// Multi-backend commands downgrade a single backend failure to a warning so
+/// one broken tool does not hide the others. When *every* backend fails there
+/// is nothing to report, so that case must surface as a real error -- otherwise
+/// a script cannot tell "all tools broken" from "nothing installed".
+fn all_backends_failed(
+    noun: &str,
+    attempted: usize,
+    failures: &[String],
+) -> Option<String> {
+    if attempted == 0 || failures.len() < attempted {
+        return None;
+    }
+    Some(format!(
+        "failed to {noun}: all {} backend(s) failed ({})",
+        attempted,
+        failures.join("; ")
+    ))
+}
+
 fn resolve_auto_backends(
     selected_backend: Option<Backend>,
     config: &Config,
@@ -870,6 +889,7 @@ fn collect_manifest_packages(
 ) -> Result<Vec<ManifestPackage>, String> {
     let mut packages = Vec::new();
     let aggregate = backends.len() > 1;
+    let mut failures = Vec::new();
 
     for backend in backends {
         let invocation = backend
@@ -892,6 +912,7 @@ fn collect_manifest_packages(
             Err(error) => {
                 if aggregate {
                     eprintln!("warning: failed to collect {backend}: {error}");
+                    failures.push(format!("{backend}: {error}"));
                     continue;
                 }
                 return Err(error);
@@ -901,6 +922,7 @@ fn collect_manifest_packages(
             let error = render_command_failure(&invocation, &capture);
             if aggregate {
                 eprintln!("warning: failed to collect {backend}: {error}");
+                failures.push(format!("{backend}: {error}"));
                 continue;
             }
             return Err(error);
@@ -910,6 +932,7 @@ fn collect_manifest_packages(
             let error = format!("could not parse installed packages from {backend}");
             if aggregate {
                 eprintln!("warning: {error}");
+                failures.push(format!("{backend}: {error}"));
                 continue;
             }
             return Err(error);
@@ -935,6 +958,10 @@ fn collect_manifest_packages(
                     version: Some(row.current_version),
                 }),
         );
+    }
+
+    if let Some(error) = all_backends_failed("export packages", backends.len(), &failures) {
+        return Err(error);
     }
 
     Ok(packages)
@@ -1156,6 +1183,7 @@ fn run_list(
         run_captures_parallel(invocations.clone(), labels, runtime.command_timeout)
     };
 
+    let mut failures = Vec::new();
     for (index, backend) in backends.iter().enumerate() {
         let capture = match &captures[index] {
             Ok(capture) => capture,
@@ -1164,6 +1192,7 @@ fn run_list(
                     return Err(error.clone());
                 }
                 eprintln!("warning: failed to list {noun} from {backend}: {error}");
+                failures.push(format!("{backend}: {error}"));
                 continue;
             }
         };
@@ -1173,6 +1202,7 @@ fn run_list(
                 return Err(error);
             }
             eprintln!("warning: failed to list {noun} from {backend}: {error}");
+            failures.push(format!("{backend}: {error}"));
             continue;
         }
 
@@ -1181,6 +1211,10 @@ fn run_list(
         } else if let Some(section) = render_backend_output_section(*backend, &capture.stdout) {
             raw_sections.push(section);
         }
+    }
+
+    if let Some(error) = all_backends_failed(noun, backends.len(), &failures) {
+        return Err(error);
     }
 
     let parsed_rows = sort_list_rows(parsed_rows);
@@ -1416,6 +1450,7 @@ fn collect_search_candidates(
     };
 
     let mut candidates = Vec::new();
+    let mut failures = Vec::new();
     for (index, backend) in backends.iter().enumerate() {
         match &captures[index] {
             Ok(capture) if capture.success => {
@@ -1425,6 +1460,7 @@ fn collect_search_candidates(
                 let error = render_command_failure(&invocations[index], capture);
                 if aggregate {
                     eprintln!("warning: failed to search {backend}: {error}");
+                    failures.push(format!("{backend}: {error}"));
                     continue;
                 }
                 return Err(error);
@@ -1432,11 +1468,16 @@ fn collect_search_candidates(
             Err(error) => {
                 if aggregate {
                     eprintln!("warning: failed to search {backend}: {error}");
+                    failures.push(format!("{backend}: {error}"));
                     continue;
                 }
                 return Err(error.clone());
             }
         }
+    }
+
+    if let Some(error) = all_backends_failed("search", backends.len(), &failures) {
+        return Err(error);
     }
 
     let candidates = dedupe_search_candidates(candidates);
@@ -1451,6 +1492,7 @@ fn collect_installed_candidates(
     let mut candidates = Vec::new();
     let aggregate = backends.len() > 1;
     let normalized_query = normalize_search_text(query);
+    let mut failures = Vec::new();
 
     for backend in backends {
         let invocation = backend
@@ -1475,6 +1517,7 @@ fn collect_installed_candidates(
                     eprintln!(
                         "warning: failed to inspect installed packages in {backend}: {error}"
                     );
+                    failures.push(format!("{backend}: {error}"));
                     continue;
                 }
                 return Err(error);
@@ -1484,6 +1527,7 @@ fn collect_installed_candidates(
             let error = render_command_failure(&invocation, &capture);
             if aggregate {
                 eprintln!("warning: failed to inspect installed packages in {backend}: {error}");
+                failures.push(format!("{backend}: {error}"));
                 continue;
             }
             return Err(error);
@@ -1504,6 +1548,11 @@ fn collect_installed_candidates(
             package_list_entry_matches_query(&row, &normalized_query)
                 .then(|| package_list_entry_candidate(row))
         }));
+    }
+
+    if let Some(error) = all_backends_failed("inspect installed packages", backends.len(), &failures)
+    {
+        return Err(error);
     }
 
     let candidates = dedupe_installed_candidates(candidates);
@@ -1544,6 +1593,7 @@ fn collect_upgradable_candidates(
     };
 
     let mut candidates = Vec::new();
+    let mut failures = Vec::new();
     for (index, backend) in backends.iter().enumerate() {
         let capture = match &captures[index] {
             Ok(capture) => capture,
@@ -1552,6 +1602,7 @@ fn collect_upgradable_candidates(
                     eprintln!(
                         "warning: failed to inspect pending upgrades for {backend}: {error}"
                     );
+                    failures.push(format!("{backend}: {error}"));
                     continue;
                 }
                 return Err(error.clone());
@@ -1563,6 +1614,7 @@ fn collect_upgradable_candidates(
                 eprintln!(
                     "warning: failed to inspect pending upgrades for {backend}: {error}"
                 );
+                failures.push(format!("{backend}: {error}"));
                 continue;
             }
             return Err(error);
@@ -1571,6 +1623,12 @@ fn collect_upgradable_candidates(
             .parse_list_entries(true, &capture.stdout)
             .unwrap_or_default();
         candidates.extend(rows.into_iter().map(package_upgrade_candidate));
+    }
+
+    if let Some(error) =
+        all_backends_failed("inspect pending upgrades", backends.len(), &failures)
+    {
+        return Err(error);
     }
 
     let candidates = dedupe_installed_candidates(candidates);
