@@ -1652,7 +1652,6 @@ fn run_logged_command_capture_inner(
 
     let stdout = read_capture_log(&capture.stdout_path);
     let stderr = read_capture_log(&capture.stderr_path);
-    capture.cleanup();
 
     let command_capture = CommandCapture {
         stdout,
@@ -4497,8 +4496,13 @@ impl CommandLogCapture {
             stderr_path: base.with_extension("stderr.log"),
         })
     }
+}
 
-    fn cleanup(&self) {
+impl Drop for CommandLogCapture {
+    fn drop(&mut self) {
+        // Removing here rather than at each success point keeps temporary files
+        // from leaking when a command fails to spawn, a wait errors out, or any
+        // other `?` returns early.
         let _ = fs::remove_file(&self.stdout_path);
         let _ = fs::remove_file(&self.stderr_path);
     }
@@ -4815,7 +4819,6 @@ fn run_logged_elevated_command_file(
     let final_label = latest_elevated_step(&status_log).unwrap_or_else(|| label.to_string());
     reporter.finish(status.success(), &final_label)?;
 
-    capture.cleanup();
     Ok(ElevatedCommandOutcome {
         status,
         stdout_log,
@@ -5032,8 +5035,10 @@ impl ElevationCapture {
             command_path: base.with_extension("command.txt"),
         })
     }
+}
 
-    fn cleanup(&self) {
+impl Drop for ElevationCapture {
+    fn drop(&mut self) {
         let _ = fs::remove_file(&self.stdout_path);
         let _ = fs::remove_file(&self.stderr_path);
         let _ = fs::remove_file(&self.status_path);
@@ -7317,6 +7322,106 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
             "timed-out command should say so, got: {message}"
         );
         assert!(!message.contains("exit code"));
+    }
+
+    // Only the capture-file tests below create files in the temp directory, and
+    // they assert on that directory's contents. Running them concurrently makes
+    // those assertions observe each other's files, so they take this lock.
+    static CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CAPTURE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn count_capture_files(prefix: &str) -> usize {
+        fs::read_dir(env::temp_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(prefix)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn command_capture_files_are_removable_by_drop() {
+        let _guard = capture_test_guard();
+        let capture = CommandLogCapture::new().expect("capture should be created");
+        let stdout_path = capture.stdout_path.clone();
+        let stderr_path = capture.stderr_path.clone();
+
+        fs::write(&stdout_path, b"out").expect("stdout should be writable");
+        fs::write(&stderr_path, b"err").expect("stderr should be writable");
+        assert!(stdout_path.exists());
+        assert!(stderr_path.exists());
+
+        drop(capture);
+
+        assert!(!stdout_path.exists(), "stdout capture should be removed on drop");
+        assert!(!stderr_path.exists(), "stderr capture should be removed on drop");
+    }
+
+    #[test]
+    fn elevation_capture_files_are_removable_by_drop() {
+        let _guard = capture_test_guard();
+        let capture = ElevationCapture::new().expect("capture should be created");
+        let paths = [
+            capture.stdout_path.clone(),
+            capture.stderr_path.clone(),
+            capture.status_path.clone(),
+            capture.command_path.clone(),
+        ];
+        for path in &paths {
+            fs::write(path, b"x").expect("capture file should be writable");
+            assert!(path.exists());
+        }
+
+        drop(capture);
+
+        for path in &paths {
+            assert!(!path.exists(), "{} should be removed on drop", path.display());
+        }
+    }
+
+    #[test]
+    fn capture_names_are_unique_under_rapid_creation() {
+        let _guard = capture_test_guard();
+        // Windows SystemTime granularity is roughly 15 ms, so this guards the
+        // parallel backend path against capture files clobbering each other.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let base = unique_capture_base("waw-uniqueness").expect("base should build");
+            assert!(
+                seen.insert(base.clone()),
+                "duplicate capture base generated: {}",
+                base.display()
+            );
+        }
+    }
+
+    #[test]
+    fn failing_command_still_removes_capture_files() {
+        let _guard = capture_test_guard();
+        let before = count_capture_files("waw-command-");
+        let invocation = Invocation::owned(
+            "waw-definitely-not-a-real-program-7f3a",
+            vec!["list".to_string()],
+        );
+
+        let result = run_logged_command_capture_with_label(&invocation, "probe", false, |_| false);
+        assert!(result.is_err(), "launching a missing program must fail");
+
+        let after = count_capture_files("waw-command-");
+        assert_eq!(
+            before, after,
+            "a failed launch must not leave capture files behind (before={before}, after={after})"
+        );
     }
 
     #[test]
