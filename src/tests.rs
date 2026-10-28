@@ -3420,3 +3420,14 @@ fn elevation_in_process_requires_the_exact_value_one() {
     assert!(elevation_requested(Some("1")));
     assert!(elevation_requested(Some(" 1 ")));
 }
+
+#[test]
+fn backend_display_honours_formatter_width() {
+    // `Display for Backend` used `f.write_str`, which ignores the formatter's
+    // width and alignment. Every `{:<width$}` table silently lost its padding
+    // for names shorter than the column, shifting the rest of the row left.
+    assert_eq!(format!("[{:<8}]", Backend::Winget), "[winget  ]");
+    assert_eq!(format!("[{:<8}]", Backend::Npm), "[npm     ]");
+    assert_eq!(format!("[{:>8}]", Backend::Npm), "[     npm]");
+    assert_eq!(format!("[{:<8}]", Backend::Chocolatey), "[choco   ]");
+}

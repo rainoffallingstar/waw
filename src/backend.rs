@@ -1049,12 +1049,17 @@ fn pip_index_cache_path() -> PathBuf {
 
 impl Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        // `write_str` would ignore the formatter's width and alignment, which
+        // silently broke every `{:<width$}` table: a backend name shorter than
+        // the column padded nothing and shifted the rest of the row left.
+        // Delegating to `Display for str` keeps `{:<8}` working.
+        let name = match self {
             Self::Winget => "winget",
             Self::Scoop => "scoop",
             Self::Chocolatey => "choco",
             Self::Npm => "npm",
             Self::Pip => "pip",
-        })
+        };
+        Display::fmt(name, f)
     }
 }
