@@ -469,6 +469,12 @@ pub(crate) fn invocation_progress_label(invocation: &Invocation) -> String {
             None => "Installing pip packages".to_string(),
         };
     }
+    if args.len() >= 3 && args[0] == "-m" && args[1] == "pip" && args[2] == "uninstall" {
+        return match target {
+            Some(target) => format!("Removing pip: {target}"),
+            None => "Removing pip packages".to_string(),
+        };
+    }
     if args.len() >= 3 && args[0] == "-m" && args[1] == "pip" && args[2] == "show" {
         return "Showing pip package details".to_string();
     }

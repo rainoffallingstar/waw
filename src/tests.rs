@@ -1202,6 +1202,59 @@ pip_user = true
     }
 
     #[test]
+    fn invocation_progress_label_says_removing_for_pip_uninstall() {
+        // Regression: `-m pip uninstall` had no branch, so removal printed the
+        // generic "Running pip...".
+        let with_target = Invocation::owned(
+            "python",
+            vec![
+                "-m".to_string(),
+                "pip".to_string(),
+                "uninstall".to_string(),
+                "pyfiglet".to_string(),
+                "--no-input".to_string(),
+                "--yes".to_string(),
+            ],
+        );
+        assert_eq!(
+            invocation_progress_label(&with_target),
+            "Removing pip: pyfiglet"
+        );
+
+        let without_target = Invocation::owned(
+            "python",
+            vec!["-m".to_string(), "pip".to_string(), "uninstall".to_string()],
+        );
+        assert_eq!(
+            invocation_progress_label(&without_target),
+            "Removing pip packages"
+        );
+    }
+
+    #[test]
+    fn every_backend_uses_a_removal_label() {
+        // Guard against another backend silently falling through to
+        // "Running <backend>".
+        let cases: [(&str, Vec<&str>); 4] = [
+            ("winget", vec!["uninstall", "--id", "Git.Git", "--exact"]),
+            ("scoop", vec!["uninstall", "git"]),
+            ("choco", vec!["uninstall", "less", "-y"]),
+            ("npm", vec!["uninstall", "--global", "cowsay"]),
+        ];
+        for (program, args) in cases {
+            let invocation = Invocation::owned(
+                program,
+                args.into_iter().map(str::to_string).collect(),
+            );
+            let label = invocation_progress_label(&invocation);
+            assert!(
+                label.starts_with("Removing"),
+                "{program} removal label was {label:?}"
+            );
+        }
+    }
+
+    #[test]
     fn invocation_progress_label_includes_pip_target_package() {
         let invocation = Invocation::owned(
             "python",
