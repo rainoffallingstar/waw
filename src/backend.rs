@@ -1019,3 +1019,16 @@ fn pip_index_cache_path() -> PathBuf {
     base.join(APP_NAME).join("pypi-index.json")
 }
 
+
+impl Display for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Winget => "winget",
+            Self::Scoop => "scoop",
+            Self::Chocolatey => "choco",
+            Self::Npm => "npm",
+            Self::Pip => "pip",
+        })
+    }
+}
+
