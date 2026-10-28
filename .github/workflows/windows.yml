@@ -51,7 +51,12 @@ jobs:
 
       - name: Run live Windows end-to-end gate
         shell: powershell
-        run: powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-live-e2e.ps1 -Binary .\target\release\waw.exe
+        # -ElevationInProcess exercises the elevated batch protocol against a
+        # stub backend: the generated PowerShell, the step/success markers and
+        # the failure summary. The real choco install still needs a UAC prompt
+        # that a hosted runner cannot answer, so it stays covered only by local
+        # runs. See issue #6.
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-live-e2e.ps1 -Binary .\target\release\waw.exe -ElevationInProcess
 
       - name: Validate Windows release helper
         if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))

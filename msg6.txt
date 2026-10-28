@@ -1,0 +1,42 @@
+Fixes #6.
+
+The elevated batch protocol can now run without UAC, and doing so immediately
+found a real bug that no test had ever reached.
+
+## The bug
+
+The generated per-command script echoed the child's output with
+`[Console]::Out.Write` and relied on the batch wrapper's `1>>`/`2>>` to put it
+in the log files. Console writes bypass PowerShell stream redirection, so
+nothing was ever written: a failed elevated command produced an empty log and
+the actual error text was lost. Verified with a stub that prints to both
+streams and exits 3 -- before the fix the output was empty, after it the
+stdout, stderr and `exit code 3` all appear.
+
+`1>>` also cannot be used for this: the parent process holds those files open
+for reading and PowerShell's redirection takes an exclusive handle
+(`The process cannot access the file ... because it is being used by another
+process`). Each invocation therefore appends with `Add-Content`, which also
+keeps stdout and stderr in separate files instead of merging them into one
+shared redirect target. The console writes remain so a human watching the UAC
+window still sees progress.
+
+## The harness
+
+`WAW_ELEVATION_IN_PROCESS=1` runs the same loader script with the current
+token instead of ShellExecuteEx+runas. The value check lives in
+`elevation_requested` so it can be unit tested without mutating the process
+environment.
+
+`run-windows-live-e2e.ps1 -ElevationInProcess` uses it with a stub choco: a
+succeeding stub must report ok, and a failing stub must fail the batch and
+surface both streams. CI now passes the flag.
+
+What this still does not cover, and the issue is right to say so: the
+ShellExecuteEx launch itself. That needs a real UAC prompt or a self-hosted
+runner, and remains the reason the choco install/remove case still prints
+UNVERIFIED on hosted runners. The stub also means the real choco binary's own
+behaviour is untested there.
+
+One more test asserts the generated script uses `Add-Content` for the log
+files and does not use `1>>`.

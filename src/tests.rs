@@ -1281,8 +1281,20 @@ fn elevated_batch_command_runs_each_invocation_and_redirects_logs() {
     assert!(command.contains(
             "Add-Content -LiteralPath 'C:\\Temp\\waw.status.log' -Value ('WAW_ELEVATED_FAILURE:Upgrading winget packages:' + $code) -Encoding utf8"
         ));
-    assert!(command.contains("1>> 'C:\\Temp\\waw.stdout.log'"));
-    assert!(command.contains("2>> 'C:\\Temp\\waw.stderr.log'"));
+    // The child's output must be appended to the log files directly. `1>>`
+    // cannot be used: the parent has those files open, and PowerShell's
+    // redirection takes an exclusive handle. Relying on `[Console]::Out.Write`
+    // alone lost the text, because console writes bypass stream redirection.
+    assert!(!command.contains("1>> 'C:\\Temp\\waw.stdout.log'"));
+    assert!(command.contains(
+        "Add-Content -LiteralPath 'C:\\Temp\\waw.stdout.log' -Value $stdoutText -NoNewline -Encoding utf8"
+    ));
+    assert!(command.contains(
+        "Add-Content -LiteralPath 'C:\\Temp\\waw.stderr.log' -Value $stderrText -NoNewline -Encoding utf8"
+    ));
+    // The console echo stays for a human watching the UAC window.
+    assert!(command.contains("[Console]::Out.Write($stdoutText)"));
+    assert!(command.contains("[Console]::Error.Write($stderrText)"));
 }
 
 #[test]
@@ -3394,4 +3406,17 @@ fn unversioned_install_plans_are_unchanged_for_scoop() {
 
     let plan = Backend::Scoop.plan_install(&[PackageSpec::parse("gh")], &runtime);
     assert_eq!(plan[0].args, vec!["install".to_string(), "gh".to_string()]);
+}
+
+#[test]
+fn elevation_in_process_requires_the_exact_value_one() {
+    // Anything else must stay on the real elevation path: a typo here would
+    // silently downgrade a privileged operation.
+    assert!(!elevation_requested(None));
+    assert!(!elevation_requested(Some("")));
+    assert!(!elevation_requested(Some("0")));
+    assert!(!elevation_requested(Some("true")));
+    assert!(!elevation_requested(Some("yes")));
+    assert!(elevation_requested(Some("1")));
+    assert!(elevation_requested(Some(" 1 ")));
 }

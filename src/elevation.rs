@@ -6,6 +6,8 @@
 //! reported back through marker lines in a status log.
 
 use super::*;
+#[cfg(windows)]
+use crate::win32::ProcessJob;
 
 pub(crate) fn is_process_elevated() -> bool {
     if !cfg!(windows) {
@@ -268,39 +270,78 @@ pub(crate) fn os_str_to_wide_null(value: &OsStr) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-pub(crate) struct ElevatedProcessHandle {
-    pub(crate) handle: Handle,
+pub(crate) enum ElevatedProcessHandle {
+    /// The real path: a handle returned by `ShellExecuteEx` with `runas`.
+    Elevated(Handle),
+    /// The testing path: a child started with the current token.
+    ///
+    /// Kept as a distinct variant rather than a flag so `terminate`/`finish`
+    /// cannot accidentally treat one as the other.
+    InProcess {
+        child: std::process::Child,
+        job: Option<ProcessJob>,
+    },
 }
 
 #[cfg(windows)]
 impl ElevatedProcessHandle {
     fn wait(&mut self, timeout: Duration) -> Result<Option<()>, String> {
-        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-        match unsafe { WaitForSingleObject(self.handle, timeout_ms) } {
-            WAIT_OBJECT_0 => Ok(Some(())),
-            WAIT_TIMEOUT => Ok(None),
-            WAIT_FAILED => Err(std::io::Error::last_os_error().to_string()),
-            code => Err(format!(
-                "unexpected wait status while monitoring elevated process: {code}"
-            )),
+        match self {
+            Self::Elevated(handle) => {
+                let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+                match unsafe { WaitForSingleObject(*handle, timeout_ms) } {
+                    WAIT_OBJECT_0 => Ok(Some(())),
+                    WAIT_TIMEOUT => Ok(None),
+                    WAIT_FAILED => Err(std::io::Error::last_os_error().to_string()),
+                    code => Err(format!(
+                        "unexpected wait status while monitoring elevated process: {code}"
+                    )),
+                }
+            }
+            Self::InProcess { child, .. } => match child.try_wait() {
+                Ok(Some(_)) => Ok(Some(())),
+                Ok(None) => {
+                    std::thread::sleep(timeout.min(Duration::from_millis(150)));
+                    child
+                        .try_wait()
+                        .map(|status| status.map(|_| ()))
+                        .map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error.to_string()),
+            },
         }
     }
 
     fn terminate(&self) -> bool {
-        unsafe { TerminateProcess(self.handle, 1) != 0 }
+        match self {
+            Self::Elevated(handle) => unsafe { TerminateProcess(*handle, 1) != 0 },
+            Self::InProcess { job, .. } => {
+                if let Some(job) = job {
+                    job.terminate(1);
+                }
+                true
+            }
+        }
     }
 
     fn finish(self) -> Result<std::process::ExitStatus, String> {
-        let mut exit_code = 1u32;
-        let ok = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) };
-        let close_result = unsafe { CloseHandle(self.handle) };
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+        match self {
+            Self::Elevated(handle) => {
+                let mut exit_code = 1u32;
+                let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+                let close_result = unsafe { CloseHandle(handle) };
+                if ok == 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                if close_result == 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                Ok(std::process::ExitStatus::from_raw(exit_code))
+            }
+            Self::InProcess { mut child, .. } => child
+                .wait()
+                .map_err(|error| format!("failed to collect the in-process batch: {error}")),
         }
-        if close_result == 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        Ok(std::process::ExitStatus::from_raw(exit_code))
     }
 }
 
@@ -318,6 +359,26 @@ impl ElevatedProcessHandle {
     }
 }
 
+/// Set to `1` to run the elevated batch *as the current user* instead of
+/// requesting administrator rights.
+///
+/// This exists so tests can exercise the parts of elevation that do not need
+/// a real admin token: the generated PowerShell, the progress markers, the
+/// success/failure lines, and the summary parsing. It deliberately does not
+/// stand in for the launch itself -- `ShellExecuteEx` with `runas` is untested
+/// by this path.
+const ELEVATION_IN_PROCESS_ENV: &str = "WAW_ELEVATION_IN_PROCESS";
+
+pub(crate) fn elevation_runs_in_process() -> bool {
+    elevation_requested(env::var(ELEVATION_IN_PROCESS_ENV).ok().as_deref())
+}
+
+/// The value check on its own, so it can be tested without mutating the
+/// process environment (unsafe, and racy against parallel tests).
+pub(crate) fn elevation_requested(value: Option<&str>) -> bool {
+    value.map(|value| value.trim() == "1").unwrap_or(false)
+}
+
 pub(crate) fn launch_elevated_command_file(
     command_path: &OsStr,
     status_path: &OsStr,
@@ -327,6 +388,11 @@ pub(crate) fn launch_elevated_command_file(
     #[cfg(windows)]
     {
         let loader_command = build_elevated_loader_command(command_path, status_path);
+        if elevation_runs_in_process() {
+            // Same script, same status file, no `runas` verb: this is the
+            // protocol without the privilege request.
+            return spawn_loader_in_process(&loader_command, working_directory, label);
+        }
         let parameters = [
             "-NoProfile",
             "-NonInteractive",
@@ -371,9 +437,7 @@ pub(crate) fn launch_elevated_command_file(
                 "failed to request administrator privileges for {label}: {error}"
             ));
         }
-        Ok(ElevatedProcessHandle {
-            handle: execute_info.hProcess,
-        })
+        Ok(ElevatedProcessHandle::Elevated(execute_info.hProcess))
     }
 
     #[cfg(not(windows))]
@@ -381,6 +445,46 @@ pub(crate) fn launch_elevated_command_file(
         let _ = (command_path, status_path, working_directory, label);
         Err("native elevation is only available on Windows".to_string())
     }
+}
+
+/// Runs the loader script with the current token.
+///
+/// Separate from the `runas` path so the two are distinguishable in tests:
+/// this one proves the script and its markers work, not that elevation works.
+#[cfg(windows)]
+fn spawn_loader_in_process(
+    loader_command: &str,
+    working_directory: &str,
+    label: &str,
+) -> Result<ElevatedProcessHandle, String> {
+    use crate::win32::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+    use std::process::{Command, Stdio};
+
+    let child = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", loader_command])
+        .current_dir(working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to run the elevated batch in-process: {error}"))?;
+
+    // Attach the child to a job object so a timeout takes down the whole
+    // tree, matching what the elevated path does through its own handle.
+    let job = ProcessJob::create();
+    if let Some(active_job) = job.as_ref() {
+        let process_handle =
+            unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, child.id()) };
+        if !process_handle.is_null() {
+            active_job.assign(process_handle);
+            unsafe {
+                CloseHandle(process_handle);
+            }
+        }
+    }
+    let _ = label;
+
+    Ok(ElevatedProcessHandle::InProcess { child, job })
 }
 
 pub(crate) struct ElevationCapture {
@@ -449,7 +553,13 @@ pub(crate) fn build_elevated_batch_command(
         .iter()
         .filter(|invocation| !invocation.program.is_empty())
         .map(|invocation| {
-            build_elevated_invocation_command(invocation, status_path, continue_on_error)
+            build_elevated_invocation_command(
+                invocation,
+                stdout_path,
+                stderr_path,
+                status_path,
+                continue_on_error,
+            )
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -458,17 +568,21 @@ pub(crate) fn build_elevated_batch_command(
     } else {
         "exit 0"
     };
+    // No `1>>`/`2>>` here: the parent has these files open for its own reads,
+    // and PowerShell's redirection takes an exclusive handle. Each invocation
+    // appends to them with `Add-Content` instead, which also keeps stdout and
+    // stderr separate (a single redirection target would merge them).
     format!(
-        "{}$ErrorActionPreference = 'Stop'; $script:wawBatchExitCode = 0; & {{ {commands}; {batch_exit} }} 1>> '{}' 2>> '{}'",
+        "{}$ErrorActionPreference = 'Stop'; $script:wawBatchExitCode = 0; & {{ {commands}; {batch_exit} }}",
         powershell_utf8_setup(),
-        escape_powershell_single_quoted_os(stdout_path),
-        escape_powershell_single_quoted_os(stderr_path),
     )
 }
 
 pub(crate) fn build_elevated_invocation_command(
     invocation: &Invocation,
+    batch_stdout_path: &OsStr,
     batch_stderr_path: &OsStr,
+    status_path: &OsStr,
     continue_on_error: bool,
 ) -> String {
     let argument_list = invocation
@@ -477,36 +591,63 @@ pub(crate) fn build_elevated_invocation_command(
         .map(|arg| format!("'{}'", escape_powershell_single_quoted(arg)))
         .collect::<Vec<_>>()
         .join(", ");
-    let progress_label = invocation_progress_label(invocation);
+    let progress_label = escape_powershell_single_quoted(&invocation_progress_label(invocation));
     let tolerated_exit_snippet =
         tolerated_elevated_exit_snippet(&invocation.program, &invocation.args);
-    let batch_stderr_path = escape_powershell_single_quoted_os(batch_stderr_path);
+    let program = escape_powershell_single_quoted(&invocation.program);
+    let stdout_path = escape_powershell_single_quoted_os(batch_stdout_path);
+    let stderr_path = escape_powershell_single_quoted_os(batch_stderr_path);
+    let status_path = escape_powershell_single_quoted_os(status_path);
+
+    // The child's output is copied into the batch log files with `Add-Content`
+    // rather than only echoed to the console. `[Console]::Out.Write` bypasses
+    // PowerShell's `1>>`/`2>>` redirection, so relying on it alone meant the
+    // parent read an empty log and a failed elevated command lost its error
+    // text entirely. The console writes stay so a human watching the UAC
+    // window still sees progress.
     let failure_tail = if continue_on_error {
         "if ($script:wawBatchExitCode -eq 0) { $script:wawBatchExitCode = $code }"
     } else {
         "exit $code"
     };
+
     format!(
-        "Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}'); $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); try {{ $proc = Start-Process -FilePath '{}' -ArgumentList @({}) -PassThru -Wait -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; if ($stdoutText.Length -gt 0) {{ [Console]::Out.Write($stdoutText) }}; if ($stderrText.Length -gt 0) {{ [Console]::Error.Write($stderrText) }}; $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; {} if ($code -eq 0) {{ Add-Content -LiteralPath '{}' -Value '{}{}' -Encoding utf8; [Console]::Error.WriteLine('{}{}') }} else {{ Add-Content -LiteralPath '{}' -Value ('{}{}:' + $code) -Encoding utf8; [Console]::Error.WriteLine('{}{}:' + $code); {} }} }} finally {{ Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue }}",
-        batch_stderr_path,
-        ELEVATED_STEP_MARKER,
-        escape_powershell_single_quoted(&progress_label),
-        ELEVATED_STEP_MARKER,
-        escape_powershell_single_quoted(&progress_label),
-        escape_powershell_single_quoted(&invocation.program),
-        argument_list,
-        tolerated_exit_snippet,
-        batch_stderr_path,
-        ELEVATED_SUCCESS_MARKER,
-        escape_powershell_single_quoted(&progress_label),
-        ELEVATED_SUCCESS_MARKER,
-        escape_powershell_single_quoted(&progress_label),
-        batch_stderr_path,
-        ELEVATED_FAILURE_MARKER,
-        escape_powershell_single_quoted(&progress_label),
-        ELEVATED_FAILURE_MARKER,
-        escape_powershell_single_quoted(&progress_label),
-        failure_tail,
+        "Add-Content -LiteralPath '{status_path}' -Value '{step}{label}' -Encoding utf8; \
+         [Console]::Error.WriteLine('{step}{label}'); \
+         $wawStdout = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stdout.log'); \
+         $wawStderr = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [guid]::NewGuid().ToString() + '.stderr.log'); \
+         try {{ \
+           $proc = Start-Process -FilePath '{program}' -ArgumentList @({argument_list}) -PassThru -Wait \
+             -RedirectStandardOutput $wawStdout -RedirectStandardError $wawStderr; \
+           $stdoutText = if (Test-Path -LiteralPath $wawStdout) {{ Get-Content -LiteralPath $wawStdout -Raw }} else {{ '' }}; \
+           $stderrText = if (Test-Path -LiteralPath $wawStderr) {{ Get-Content -LiteralPath $wawStderr -Raw }} else {{ '' }}; \
+           if ($stdoutText.Length -gt 0) {{ Add-Content -LiteralPath '{stdout_path}' -Value $stdoutText -NoNewline -Encoding utf8; [Console]::Out.Write($stdoutText) }}; \
+           if ($stderrText.Length -gt 0) {{ Add-Content -LiteralPath '{stderr_path}' -Value $stderrText -NoNewline -Encoding utf8; [Console]::Error.Write($stderrText) }}; \
+           $code = if ($null -eq $proc.ExitCode) {{ 0 }} else {{ $proc.ExitCode }}; \
+           {tolerated} \
+           if ($code -eq 0) {{ \
+             Add-Content -LiteralPath '{status_path}' -Value '{success}{label}' -Encoding utf8; \
+             [Console]::Error.WriteLine('{success}{label}') \
+           }} else {{ \
+             Add-Content -LiteralPath '{status_path}' -Value ('{failure}{label}:' + $code) -Encoding utf8; \
+             [Console]::Error.WriteLine('{failure}{label}:' + $code); \
+             {failure_tail} \
+           }} \
+         }} finally {{ \
+           Remove-Item -LiteralPath $wawStdout -ErrorAction SilentlyContinue; \
+           Remove-Item -LiteralPath $wawStderr -ErrorAction SilentlyContinue \
+         }}",
+        step = ELEVATED_STEP_MARKER,
+        success = ELEVATED_SUCCESS_MARKER,
+        failure = ELEVATED_FAILURE_MARKER,
+        label = progress_label,
+        program = program,
+        argument_list = argument_list,
+        tolerated = tolerated_exit_snippet,
+        stdout_path = stdout_path,
+        stderr_path = stderr_path,
+        status_path = status_path,
+        failure_tail = failure_tail,
     )
 }
 

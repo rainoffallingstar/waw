@@ -3,10 +3,17 @@ param(
     # Mutating commands need admin. On an interactive machine waw can raise a
     # UAC prompt, but a CI runner has nobody to click it, so those cases are
     # skipped unless this switch is passed.
-    [switch]$AllowElevation
+    [switch]$AllowElevation,
+    # Run the elevated batch as the current user. Covers the generated script,
+    # progress markers and failure summary; it does not request privileges, so
+    # a backend that genuinely needs admin will still fail. The gate uses this
+    # only with a stub backend, never with the real choco.
+    [switch]$ElevationInProcess
 )
 
 $ErrorActionPreference = "Stop"
+
+$script:ElevationInProcess = $ElevationInProcess.IsPresent
 
 $script:StepTimeoutMs = 300000
 
@@ -77,6 +84,11 @@ function Invoke-Waw {
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         $psi.CreateNoWindow = $true
+        if ($script:ElevationInProcess) {
+            # Exercise the elevated batch script, its markers and its summary
+            # without a UAC prompt. Does NOT cover ShellExecuteEx + runas.
+            $psi.EnvironmentVariables["WAW_ELEVATION_IN_PROCESS"] = "1"
+        }
 
         $process = [System.Diagnostics.Process]::Start($psi)
         $stdout = $process.StandardOutput.ReadToEnd()
@@ -232,6 +244,45 @@ pip_user = true
 
 Invoke-Step "Printing backend status snapshot" {
     Get-BackendStatuses | Write-Host
+}
+
+# Exercise the elevated batch protocol without UAC: a stub backend that
+# succeeds. This covers what actually regresses -- the generated PowerShell,
+# the step/success markers and the summary parsing -- while being explicit that
+# ShellExecuteEx + runas is still not tested here. See issue #6.
+Invoke-Step "Running the elevated batch protocol against a stub backend" {
+    $stubDir = Join-Path $tempRoot "elevation-stub"
+    New-Item -ItemType Directory -Force -Path $stubDir | Out-Null
+    $stubPath = Join-Path $stubDir "stub-choco.cmd"
+    # Print something to both streams so marker handling is realistic, then
+    # succeed. `@echo off` keeps cmd from echoing the command itself.
+    $stubContent = "@echo off`r`necho stub install output`r`necho stub install warning 1>&2`r`nexit /b 0`r`n"
+    [System.IO.File]::WriteAllText($stubPath, $stubContent, [System.Text.Encoding]::ASCII)
+
+    $previous = $env:WAW_CHOCO_CMD
+    $env:WAW_CHOCO_CMD = $stubPath
+    $env:WAW_ELEVATION_IN_PROCESS = "1"
+    try {
+        $result = Invoke-Waw @("--backend", "choco", "install", "--exact", "stub-package")
+        Assert-OutputContains $result.Output "ok " "The elevated batch did not report the stub install as ok."
+
+        # A failing stub must fail the batch, not be swallowed. This is the
+        # case that used to hide the child's output entirely: console writes
+        # bypass stream redirection, so the parent read empty logs.
+        $failContent = "@echo off`r`necho stub-stdout-marker`r`necho stub-stderr-marker 1>&2`r`nexit /b 3`r`n"
+        [System.IO.File]::WriteAllText($stubPath, $failContent, [System.Text.Encoding]::ASCII)
+        $failed = Invoke-Waw @("--backend", "choco", "install", "--exact", "stub-package") -AllowFailure
+        if ($failed.ExitCode -eq 0) {
+            throw "The elevated batch reported success for a command that exited 3.`n$($failed.Output)"
+        }
+        Assert-OutputContains $failed.Output "stub-stdout-marker" "The elevated batch did not surface the child's stdout after a failure."
+        Assert-OutputContains $failed.Output "stub-stderr-marker" "The elevated batch did not surface the child's stderr after a failure."
+        Assert-OutputContains $failed.Output "exit code 3" "The elevated batch did not report the child's exit code."
+    }
+    finally {
+        $env:WAW_CHOCO_CMD = $previous
+        Remove-Item Env:WAW_ELEVATION_IN_PROCESS -ErrorAction SilentlyContinue
+    }
 }
 
 Invoke-Step "Checking bootstrap command coverage" {
