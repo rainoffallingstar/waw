@@ -223,7 +223,14 @@ impl Backend {
                     .collect::<Vec<_>>(),
                 runtime,
             )),
-            Subcommand::Hold { packages, enable } => Ok(self.plan_hold(packages, *enable, runtime)),
+            Subcommand::Hold {
+                packages,
+                enable,
+                list: _,
+            } => {
+                // `hold --list` is handled in main.rs before reaching here.
+                Ok(self.plan_hold(packages, *enable, runtime))
+            }
             Subcommand::Search { query, .. } => Ok(self.plan_search(query, runtime)),
             Subcommand::List { upgradable } => Ok(self.plan_list(*upgradable, runtime)),
             Subcommand::Show { package } => Ok(self.plan_show(package, runtime)),
@@ -559,6 +566,21 @@ impl Backend {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    /// The command that reports this backend's pinned packages, or `None` when
+    /// the backend has no way to enumerate them.
+    ///
+    /// Scoop is the awkward one: `scoop hold` only *sets* a hold and there is
+    /// no listing subcommand, so this returns None rather than guessing.
+    pub(crate) fn plan_hold_list(self) -> Option<Invocation> {
+        match self {
+            Self::Winget | Self::Chocolatey => Some(self.base_invocation(vec![
+                "pin".to_string(),
+                "list".to_string(),
+            ])),
+            Self::Scoop | Self::Npm | Self::Pip => None,
         }
     }
 

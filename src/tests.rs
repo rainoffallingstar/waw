@@ -749,7 +749,8 @@ less|679.0.0|700.0.0\r\n";
             cli.command,
             Subcommand::Hold {
                 packages: vec!["Git.Git".to_string()],
-                enable: false
+                enable: false,
+                list: false
             }
         );
     }
@@ -2016,6 +2017,7 @@ pip_user = true
                 &Subcommand::Hold {
                     packages: vec!["git".to_string()],
                     enable: true,
+                    list: false,
                 },
                 &runtime,
             )
@@ -2032,6 +2034,101 @@ pip_user = true
                 "git".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parses_hold_list_flag() {
+        let cli = Cli::parse(["hold", "--list"].into_iter().map(str::to_string))
+            .expect("cli should parse");
+        assert_eq!(
+            cli.command,
+            Subcommand::Hold { packages: Vec::new(), enable: true, list: true }
+        );
+
+        let cli = Cli::parse(["hold", "-l"].into_iter().map(str::to_string))
+            .expect("cli should parse");
+        assert!(matches!(cli.command, Subcommand::Hold { list: true, .. }));
+    }
+
+    #[test]
+    fn hold_list_rejects_package_names() {
+        let result = Cli::parse(["hold", "--list", "git"].into_iter().map(str::to_string));
+        assert!(result.is_err());
+        let message = result.unwrap_err();
+        assert!(message.contains("--list"), "{message}");
+    }
+
+    #[test]
+    fn hold_without_packages_or_list_is_an_error() {
+        let result = Cli::parse(["hold"].into_iter().map(str::to_string));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--list"));
+    }
+
+    #[test]
+    fn winget_hold_list_plan_uses_pin_list() {
+        let invocation = Backend::Winget
+            .plan_hold_list()
+            .expect("winget can enumerate pins");
+        assert_eq!(invocation.args, vec!["pin".to_string(), "list".to_string()]);
+        assert_program_matches(&invocation.program, &["winget", "winget.exe"]);
+    }
+
+    #[test]
+    fn backends_without_pin_enumeration_return_none() {
+        assert!(Backend::Scoop.plan_hold_list().is_none());
+        assert!(Backend::Npm.plan_hold_list().is_none());
+        assert!(Backend::Pip.plan_hold_list().is_none());
+    }
+
+    #[test]
+    fn parses_winget_localized_pin_table() {
+        // Localized headers, so the parser keys off the dashed rule instead.
+        let output = concat!(
+            "名称 ID 版本 源 包钉类型\r\n",
+            "-------------------------------------\r\n",
+            "Git Git.Git 2.52.0 winget Blocking\r\n",
+            "PowerToys Microsoft.PowerToys 0.95.0 winget Pinned\r\n",
+        );
+
+        let rows = parse_hold_rows(Backend::Winget, output);
+        assert_eq!(
+            rows,
+            vec![
+                (Backend::Winget, "Git.Git".to_string(), "Blocking".to_string()),
+                (Backend::Winget, "Microsoft.PowerToys".to_string(), "Pinned".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_chocolatey_pin_list() {
+        let output = concat!(
+            "Chocolatey v2.4.1\r\n",
+            "git\r\n",
+            "vlc\r\n",
+        );
+
+        let rows = parse_hold_rows(Backend::Chocolatey, output);
+        assert_eq!(
+            rows,
+            vec![
+                (Backend::Chocolatey, "git".to_string(), "pinned".to_string()),
+                (Backend::Chocolatey, "vlc".to_string(), "pinned".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hold_list_parser_ignores_text_before_the_rule() {
+        let output = concat!(
+            "No pins matched the given criteria.\r\n",
+            "\r\n",
+            "名称 ID 版本 源 包钉类型\r\n",
+            "-------------------\r\n",
+        );
+
+        assert!(parse_hold_rows(Backend::Winget, output).is_empty());
     }
 
     #[test]
@@ -2842,6 +2939,7 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
                 &Subcommand::Hold {
                     packages: vec!["requests".to_string()],
                     enable: true,
+                    list: false,
                 },
                 &runtime,
             )

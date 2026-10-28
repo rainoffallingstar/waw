@@ -176,13 +176,17 @@ fn run() -> Result<ExitCode, String> {
             let backends = resolve_auto_backends(selected_backend, config)?;
             return run_show(backends, package, &runtime, cli.dry_run, cli.json);
         }
+        Subcommand::Hold { list: true, .. } => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_hold_list(backends, &runtime);
+        }
         Subcommand::Install {
             mode: InstallMode::Exact(_),
         }
         | Subcommand::Remove {
             mode: RemoveMode::Exact(_),
         }
-        | Subcommand::Hold { .. }
+        | Subcommand::Hold { list: false, .. }
         | Subcommand::Backends
         | Subcommand::Backend { .. }
         | Subcommand::Help => {
@@ -754,6 +758,141 @@ fn run_interactive_upgrade(
     execute_invocations(invocations, dry_run, true, runtime)
 }
 
+/// `waw hold --list`: report pinned packages per backend.
+///
+/// Backends that cannot enumerate their pins are named explicitly rather than
+/// silently omitted, so an empty table is never mistaken for "nothing is held
+/// anywhere".
+/// Parses pin listings into `(backend, package_id, pin_type)` rows.
+///
+/// winget prints a localized table:
+///
+///     名称 ID      版本   源     包钉类型
+///     -----------------------------------
+///     Git  Git.Git 2.52.0 winget Blocking
+///
+/// so the ID is the second whitespace-separated field of each data line. The
+/// header is localized, so the parser keys off structure: a dashed rule ends
+/// the header, and rows start after it.
+///
+/// Chocolatey prints one bare name per line with no type.
+fn parse_hold_rows(backend: Backend, output: &str) -> Vec<(Backend, String, String)> {
+    let mut rows = Vec::new();
+    let mut seen_separator = false;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if backend == Backend::Chocolatey {
+            if trimmed.starts_with("Chocolatey v") || trimmed.contains(' ') {
+                continue;
+            }
+            rows.push((backend, trimmed.to_string(), "pinned".to_string()));
+            continue;
+        }
+
+        if trimmed.chars().all(|ch| ch == '-') {
+            seen_separator = true;
+            continue;
+        }
+        if !seen_separator {
+            continue;
+        }
+
+        let mut fields = trimmed.split_whitespace();
+        let Some(_name) = fields.next() else { continue };
+        let Some(id) = fields.next() else { continue };
+        let pin_type = trimmed
+            .split_whitespace()
+            .last()
+            .unwrap_or("pinned")
+            .to_string();
+        rows.push((backend, id.to_string(), pin_type));
+    }
+
+    rows
+}
+fn run_hold_list(
+    backends: Vec<Backend>,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<ExitCode, String> {
+    let mut rows: Vec<(Backend, String, String)> = Vec::new();
+    let mut unsupported: Vec<Backend> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for backend in &backends {
+        let Some(invocation) = backend.plan_hold_list() else {
+            unsupported.push(*backend);
+            continue;
+        };
+
+        let capture = match run_capture_detailed_with_label(
+            &invocation,
+            &format!("Listing {backend} pins"),
+            runtime.command_timeout,
+        ) {
+            Ok(capture) if capture.success => capture,
+            Ok(capture) => {
+                failures.push(format!(
+                    "{backend}: {}",
+                    render_command_failure(&invocation, &capture)
+                ));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("{backend}: {error}"));
+                continue;
+            }
+        };
+
+        rows.extend(parse_hold_rows(*backend, &capture.stdout));
+    }
+
+    if !rows.is_empty() {
+        println!();
+        let backend_w = rows.iter().map(|r| r.0.to_string().len()).max().unwrap_or(7).max(7);
+        let id_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(7).max(7);
+        let pin_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(8).max(8);
+        println!(
+            "{:<backend_w$}  {:<id_w$}  {:<pin_w$}",
+            "Backend", "Package", "Pin type"
+        );
+        println!("{:-<backend_w$}  {:-<id_w$}  {:-<pin_w$}", "", "", "");
+        for (backend, id, pin) in &rows {
+            println!("{backend:<backend_w$}  {id:<id_w$}  {pin:<pin_w$}");
+        }
+    } else {
+        println!("No held packages found.");
+    }
+
+    if !unsupported.is_empty() {
+        println!();
+        println!(
+            "Cannot list holds for: {}",
+            unsupported
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("  These backends have no way to enumerate pins.");
+    }
+
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("warning: {failure}");
+        }
+        return Err(format!(
+            "failed to list pins for {} backend(s)",
+            failures.len()
+        ));
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
 fn run_update_all(
     backends: Vec<Backend>,
     dry_run: bool,

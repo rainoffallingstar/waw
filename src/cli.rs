@@ -145,7 +145,11 @@ pub(crate) enum Subcommand {
     Upgrade { packages: Vec<String> },
     Install { mode: InstallMode },
     Remove { mode: RemoveMode },
-    Hold { packages: Vec<String>, enable: bool },
+    Hold {
+        packages: Vec<String>,
+        enable: bool,
+        list: bool,
+    },
     Search { query: String, deep: bool },
     List { upgradable: bool },
     Show { package: String },
@@ -377,6 +381,7 @@ impl Subcommand {
             }
             "hold" => {
                 let mut enable = true;
+                let mut list = false;
                 let mut packages = Vec::new();
 
                 while let Some(arg) = parser.peek() {
@@ -389,6 +394,10 @@ impl Subcommand {
                             parser.next();
                             enable = true;
                         }
+                        "--list" | "-l" => {
+                            parser.next();
+                            list = true;
+                        }
                         value if value.starts_with('-') => {
                             return Err(format!("unknown option for hold: {value}"));
                         }
@@ -396,11 +405,18 @@ impl Subcommand {
                     }
                 }
 
-                if packages.is_empty() {
-                    return Err("hold requires at least one package".to_string());
+                if list {
+                    if !packages.is_empty() {
+                        return Err("hold --list does not take package names".to_string());
+                    }
+                    return Ok(Self::Hold { packages, enable, list });
                 }
 
-                Ok(Self::Hold { packages, enable })
+                if packages.is_empty() {
+                    return Err("hold requires at least one package, or --list".to_string());
+                }
+
+                Ok(Self::Hold { packages, enable, list })
             }
             "search" => {
                 let mut deep = false;
