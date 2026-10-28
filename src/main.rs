@@ -137,6 +137,10 @@ fn run() -> Result<ExitCode, String> {
         _ => {}
     }
 
+    if let Subcommand::Bucket { action } = &cli.command {
+        return run_bucket_command(action.clone(), config, cli.dry_run, &runtime);
+    }
+
     if let Subcommand::Export { path } = &cli.command {
         let backends = resolve_auto_backends(selected_backend, config)?;
         return run_export(backends, path.clone(), &runtime);
@@ -904,6 +908,84 @@ fn render_manifest_json(packages: &[ManifestPackage]) -> String {
     format!(
         "{{\n  \"schema\": \"waw-packages/1\",\n  \"packages\": [\n{entries}\n  ]\n}}\n"
     )
+}
+
+/// `waw bucket list` -- show the buckets Scoop actually has installed, plus
+/// which ones this config prefers.
+///
+/// Delegates to `scoop bucket list` rather than reading Scoop's internal
+/// state, so the answer always matches what Scoop itself would use.
+fn run_bucket_command(
+    action: BucketAction,
+    config: &Config,
+    dry_run: bool,
+    runtime: &RuntimeSettings<'_>,
+) -> Result<ExitCode, String> {
+    match action {
+        BucketAction::List => {
+            // Resolve scoop the same way every other command does, so an
+            // override or a non-PATH install still works.
+            let invocation = Invocation::owned(
+                &Backend::Scoop.preferred_program(),
+                vec!["bucket".to_string(), "list".to_string()],
+            );
+            if dry_run {
+                println!("> {}", invocation.render_for_display());
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let capture = run_capture_detailed_with_label(
+                &invocation,
+                "Listing scoop buckets",
+                runtime.command_timeout,
+            )?;
+            if !capture.success {
+                return Err(render_command_failure(&invocation, &capture));
+            }
+
+            // `scoop bucket list` prints a "Name Source Updated Manifests"
+            // table; keep only the bucket names.
+            let installed: Vec<String> = capture
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter(|line| !line.starts_with("Name"))
+                .filter(|line| !line.starts_with("----"))
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect();
+
+            println!("Scoop buckets:");
+            for name in &installed {
+                let preferred = config
+                    .scoop_default_bucket
+                    .as_deref()
+                    .is_some_and(|default| default.eq_ignore_ascii_case(name));
+                let listed = config
+                    .scoop_buckets
+                    .iter()
+                    .any(|bucket| bucket.eq_ignore_ascii_case(name));
+                let marker = match (preferred, listed) {
+                    (true, _) => "  (default)",
+                    (false, true) => "  (configured)",
+                    (false, false) => "",
+                };
+                println!("  {name}{marker}");
+            }
+            if installed.is_empty() {
+                println!("  (none reported by scoop)");
+            }
+
+            if let Some(default) = &config.scoop_default_bucket {
+                println!();
+                println!("Unqualified packages resolve to: {default}/<name>");
+            }
+
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 fn run_export(
@@ -2363,6 +2445,34 @@ fn parse_string(raw: &str) -> Result<String, String> {
     }
 }
 
+/// Parses a TOML-ish inline array of strings: `["main", "extras"]`.
+///
+/// A bare scalar is also accepted and treated as a one-element list, so
+/// `scoop_buckets = "extras"` does not fail.
+fn parse_string_list(raw: &str) -> Result<Vec<String>, String> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'));
+
+    let Some(inner) = inner else {
+        return Ok(vec![parse_string(trimmed)?]);
+    };
+
+    let mut items = Vec::new();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let value = parse_string(part)?;
+        if !value.is_empty() && !items.contains(&value) {
+            items.push(value);
+        }
+    }
+    Ok(items)
+}
+
 fn render_toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -2444,6 +2554,7 @@ Commands:
   backend install <name>   Run a bootstrap install command when supported on this host
   backend default <name>   Set the default backend and enable it if needed
   backend default auto     Clear the explicit default and return to auto detection
+  bucket [list]            List Scoop buckets and show which one is the default
 
 Options:
   -b, --backend <name>     Select backend explicitly
@@ -2480,6 +2591,7 @@ Examples:
   {APP_NAME} show Git.Git
   {APP_NAME} export --file packages.json
   {APP_NAME} import packages.json
+  {APP_NAME} bucket list
   {APP_NAME} backends
   {APP_NAME} --json backends
   {APP_NAME} --json show pip

@@ -228,7 +228,9 @@ impl Backend {
             Subcommand::List { upgradable } => Ok(self.plan_list(*upgradable, runtime)),
             Subcommand::Show { package } => Ok(self.plan_show(package, runtime)),
             Subcommand::Backends | Subcommand::Backend { action: _ } => Ok(Vec::new()),
-            Subcommand::Export { .. } | Subcommand::Import { .. } => Ok(Vec::new()),
+            Subcommand::Export { .. }
+            | Subcommand::Import { .. }
+            | Subcommand::Bucket { .. } => Ok(Vec::new()),
             Subcommand::Help => Ok(Vec::new()),
         }
     }

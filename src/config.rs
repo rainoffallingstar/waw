@@ -12,6 +12,16 @@ pub(crate) struct Config {
     pub(crate) auto_elevate: bool,
     pub(crate) winget_source: Option<String>,
     pub(crate) choco_source: Option<String>,
+    /// Buckets the user wants searched/pinned, in priority order.
+    ///
+    /// Replaces the old single `scoop_bucket`. A Scoop install normally spans
+    /// main, extras and sometimes versions, so one scalar could not describe it.
+    pub(crate) scoop_buckets: Vec<String>,
+    /// Bucket to prefer when a package name is not qualified with `bucket/pkg`.
+    /// `None` means "let Scoop resolve it", which is the correct default:
+    /// forcing a prefix made `waw install git` ask for `extras/git`.
+    pub(crate) scoop_default_bucket: Option<String>,
+    /// Deprecated single-bucket key, still parsed for existing configs.
     pub(crate) scoop_bucket: Option<String>,
     pub(crate) pip_user: bool,
     pub(crate) command_timeout_seconds: u64,
@@ -30,6 +40,8 @@ impl Default for Config {
             auto_elevate: true,
             winget_source: None,
             choco_source: None,
+            scoop_buckets: Vec::new(),
+            scoop_default_bucket: None,
             scoop_bucket: None,
             pip_user: true,
             command_timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
@@ -75,7 +87,23 @@ impl Config {
                 "auto_elevate" => config.auto_elevate = parse_bool(value)?,
                 "winget_source" => config.winget_source = Some(parse_string(value)?),
                 "choco_source" => config.choco_source = Some(parse_string(value)?),
-                "scoop_bucket" => config.scoop_bucket = Some(parse_string(value)?),
+                "scoop_buckets" => config.scoop_buckets = parse_string_list(value)?,
+                "scoop_default_bucket" => {
+                    config.scoop_default_bucket = Some(parse_string(value)?)
+                }
+                // Deprecated: a single bucket used to mean "prefix everything
+                // with it". Treat it as a default instead, which is what users
+                // actually wanted; also record it in the list.
+                "scoop_bucket" => {
+                    let bucket = parse_string(value)?;
+                    if !config.scoop_buckets.iter().any(|item| item == &bucket) {
+                        config.scoop_buckets.push(bucket.clone());
+                    }
+                    config.scoop_bucket = Some(bucket.clone());
+                    if config.scoop_default_bucket.is_none() {
+                        config.scoop_default_bucket = Some(bucket);
+                    }
+                }
                 "pip_user" => config.pip_user = parse_bool(value)?,
             "command_timeout_seconds" => {
                 config.command_timeout_seconds = value.parse::<u64>().map_err(|_| {
@@ -111,14 +139,34 @@ impl Config {
             .filter(|value| !value.trim().is_empty())
     }
 
+    /// Prefixes a Scoop package with the default bucket, but only when that
+    /// bucket is explicitly configured and is not `main`.
+    ///
+    /// `main` is Scoop's implicit default, so prefixing it changes nothing
+    /// except to break `pkg@version` specs. Anything already qualified
+    /// (`extras/foo`) is left alone.
     pub(crate) fn qualify_scoop_package(&self, package: &str) -> String {
-        match self
-            .scoop_bucket
+        if package.contains('/') {
+            return package.to_string();
+        }
+
+        let bucket = self
+            .scoop_default_bucket
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(bucket) if !package.contains('/') => format!("{bucket}/{package}"),
-            _ => package.to_string(),
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| !value.eq_ignore_ascii_case("main"));
+
+        match bucket {
+            Some(bucket) => {
+                // Preserve a `pkg@version` suffix: `gh@2.7.0` must become
+                // `extras/gh@2.7.0`, not `extras/gh@2.7.0` mis-split.
+                match package.split_once('@') {
+                    Some((name, version)) => format!("{bucket}/{name}@{version}"),
+                    None => format!("{bucket}/{package}"),
+                }
+            }
+            None => package.to_string(),
         }
     }
 
@@ -159,8 +207,20 @@ impl Config {
         if let Some(source) = &self.choco_source {
             lines.push(format!("choco_source = {}", render_toml_string(source)));
         }
-        if let Some(bucket) = &self.scoop_bucket {
-            lines.push(format!("scoop_bucket = {}", render_toml_string(bucket)));
+        if !self.scoop_buckets.is_empty() {
+            let rendered = self
+                .scoop_buckets
+                .iter()
+                .map(|bucket| render_toml_string(bucket))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("scoop_buckets = [{rendered}]"));
+        }
+        if let Some(bucket) = &self.scoop_default_bucket {
+            lines.push(format!(
+                "scoop_default_bucket = {}",
+                render_toml_string(bucket)
+            ));
         }
         lines.push(format!("pip_user = {}", self.pip_user));
         lines.push(format!(

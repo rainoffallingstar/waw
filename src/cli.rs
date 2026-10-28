@@ -151,6 +151,8 @@ pub(crate) enum Subcommand {
     Show { package: String },
     Backends,
     Backend { action: BackendAction },
+    /// `waw bucket [list]` -- inspect configured/available Scoop buckets.
+    Bucket { action: BucketAction },
     Export { path: Option<PathBuf> },
     Import { path: PathBuf },
     Help,
@@ -230,6 +232,11 @@ pub(crate) enum InstallMode {
 pub(crate) enum RemoveMode {
     Search(String),
     Exact(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BucketAction {
+    List,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,6 +487,23 @@ impl Subcommand {
                 Ok(Self::Import { path })
             }
             "backends" => Ok(Self::Backends),
+            "bucket" => {
+                let action = parser.next().unwrap_or_else(|| "list".to_string());
+                match action.as_str() {
+                    "list" => {
+                        if parser.has_remaining() {
+                            return Err(format!(
+                                "bucket list does not accept extra arguments: {}",
+                                parser.remaining().join(" ")
+                            ));
+                        }
+                        Ok(Self::Bucket {
+                            action: BucketAction::List,
+                        })
+                    }
+                    other => Err(format!("unsupported bucket command: {other}")),
+                }
+            }
             "backend" => Ok(Self::Backend {
                 action: BackendAction::parse(parser)?,
             }),

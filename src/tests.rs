@@ -1781,7 +1781,8 @@ pip_user = true
     #[test]
     fn scoop_install_uses_bucket_prefix() {
         let config = Config {
-            scoop_bucket: Some("extras".to_string()),
+            scoop_buckets: vec!["extras".to_string()],
+            scoop_default_bucket: Some("extras".to_string()),
             ..Config::default()
         };
         let runtime = RuntimeSettings {
@@ -1804,6 +1805,83 @@ pip_user = true
         assert_eq!(
             plan[0].args,
             vec!["install".to_string(), "extras/git".to_string()]
+        );
+    }
+
+    #[test]
+    fn scoop_bucket_qualification_matrix() {
+        let no_bucket = Config::default();
+        assert_eq!(no_bucket.qualify_scoop_package("git"), "git");
+        assert_eq!(no_bucket.qualify_scoop_package("gh@2.7.0"), "gh@2.7.0");
+
+        // `main` is Scoop's implicit default; prefixing it changes nothing but
+        // would break version specs.
+        let main = Config {
+            scoop_default_bucket: Some("main".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(main.qualify_scoop_package("git"), "git");
+
+        let extras = Config {
+            scoop_default_bucket: Some("extras".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(extras.qualify_scoop_package("gh"), "extras/gh");
+        // Version suffix must survive the prefix.
+        assert_eq!(extras.qualify_scoop_package("gh@2.7.0"), "extras/gh@2.7.0");
+        // Already-qualified names are untouched.
+        assert_eq!(extras.qualify_scoop_package("main/git"), "main/git");
+        assert_eq!(extras.qualify_scoop_package("extras/gh@2.7.0"), "extras/gh@2.7.0");
+    }
+
+    #[test]
+    fn legacy_scoop_bucket_key_maps_to_default() {
+        let config = Config::parse("scoop_bucket = \"extras\"\n").expect("should parse");
+        assert_eq!(config.scoop_default_bucket.as_deref(), Some("extras"));
+        assert_eq!(config.scoop_buckets, vec!["extras".to_string()]);
+        // The behaviour users relied on still happens.
+        assert_eq!(config.qualify_scoop_package("gh"), "extras/gh");
+    }
+
+    #[test]
+    fn scoop_buckets_parse_and_round_trip() {
+        let config = Config::parse(
+            "scoop_buckets = [\"main\", \"extras\", \"versions\"]\nscoop_default_bucket = \"extras\"\n",
+        )
+        .expect("should parse");
+        assert_eq!(
+            config.scoop_buckets,
+            vec!["main".to_string(), "extras".to_string(), "versions".to_string()]
+        );
+        assert_eq!(config.scoop_default_bucket.as_deref(), Some("extras"));
+
+        let rendered = config.to_toml();
+        let reparsed = Config::parse(&rendered).expect("round trip should parse");
+        assert_eq!(reparsed.scoop_buckets, config.scoop_buckets);
+        assert_eq!(reparsed.scoop_default_bucket, config.scoop_default_bucket);
+    }
+
+    #[test]
+    fn scoop_buckets_accepts_a_bare_scalar() {
+        let config = Config::parse("scoop_buckets = \"extras\"\n").expect("should parse");
+        assert_eq!(config.scoop_buckets, vec!["extras".to_string()]);
+    }
+
+
+
+
+    #[test]
+    fn parse_string_list_handles_arrays_and_scalars() {
+        assert_eq!(parse_string_list("\"a\"").expect("ok"), vec!["a".to_string()]);
+        assert_eq!(parse_string_list("[]").expect("ok"), Vec::<String>::new());
+        assert_eq!(
+            parse_string_list("[\"a\", \"b\"]").expect("ok"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Duplicates collapse.
+        assert_eq!(
+            parse_string_list("[\"a\",\"a\"]").expect("ok"),
+            vec!["a".to_string()]
         );
     }
 
