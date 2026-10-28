@@ -3,6 +3,7 @@ mod capture;
 mod cli;
 mod commands;
 mod holds;
+mod text;
 mod config;
 mod elevation;
 mod discovery;
@@ -17,6 +18,7 @@ mod win32;
 use json::{JsonValue, escape_json_string, parse_json};
 use discovery::*;
 use holds::Holds;
+use text::*;
 use model::*;
 use backend::Backend;
 #[allow(unused_imports)]
@@ -27,6 +29,7 @@ use commands::hold::*;
 use commands::install::*;
 use commands::collect::*;
 use commands::update::*;
+use commands::rank::*;
 use commands::query::*;
 use commands::select::*;
 use config::*;
@@ -606,203 +609,6 @@ fn command_works(program: &str, args: &[String]) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-}
-
-fn dedupe_candidates(candidates: Vec<SearchCandidate>) -> Vec<SearchCandidate> {
-    dedupe_search_candidates(candidates)
-}
-
-fn dedupe_search_candidates(candidates: Vec<SearchCandidate>) -> Vec<SearchCandidate> {
-    let mut deduped = Vec::new();
-    for candidate in candidates {
-        if !deduped.iter().any(|existing: &SearchCandidate| {
-            existing.backend == candidate.backend
-                && existing
-                    .install_id
-                    .eq_ignore_ascii_case(&candidate.install_id)
-                && existing.source == candidate.source
-        }) {
-            deduped.push(candidate);
-        }
-    }
-    deduped
-}
-
-fn dedupe_installed_candidates(candidates: Vec<SearchCandidate>) -> Vec<SearchCandidate> {
-    let mut deduped = Vec::new();
-    for candidate in candidates {
-        if !deduped.iter().any(|existing: &SearchCandidate| {
-            existing.backend == candidate.backend
-                && existing
-                    .install_id
-                    .eq_ignore_ascii_case(&candidate.install_id)
-                && existing.label.eq_ignore_ascii_case(&candidate.label)
-                && existing.version == candidate.version
-        }) {
-            deduped.push(candidate);
-        }
-    }
-    deduped
-}
-
-fn sort_search_candidates(
-    mut candidates: Vec<SearchCandidate>,
-    query: &str,
-    backends: &[Backend],
-) -> Vec<SearchCandidate> {
-    let query = normalize_search_text(query);
-
-    // pip already ranks its own results: the prober compares publication dates
-    // so a maintained `beautifulsoup4` outranks the abandoned `BeautifulSoup`.
-    // Re-sorting here with the generic prefix heuristic would undo that, since
-    // "BeautifulSoup" is an exact match and would win on rank alone.
-    if candidates.iter().all(|candidate| candidate.backend == Backend::Pip) {
-        return candidates;
-    }
-
-    candidates.sort_by(|left, right| {
-        let left_key = search_sort_key(left, &query, backends);
-        let right_key = search_sort_key(right, &query, backends);
-        left_key.cmp(&right_key)
-    });
-    candidates
-}
-
-fn search_sort_key(
-    candidate: &SearchCandidate,
-    query: &str,
-    backends: &[Backend],
-) -> (u8, usize, u8, usize, usize, String, String) {
-    let label = normalize_search_text(&candidate.label);
-    let install_id = normalize_search_text(&candidate.install_id);
-    (
-        search_match_rank(&label, &install_id, query),
-        backend_rank_for_search(candidate.backend, backends),
-        if candidate.version.is_some() { 0 } else { 1 },
-        install_id.len(),
-        label.len(),
-        label,
-        install_id,
-    )
-}
-
-fn search_match_rank(label: &str, install_id: &str, query: &str) -> u8 {
-    if query.is_empty() {
-        return 3;
-    }
-
-    let compact_query = compact_search_text(query);
-    let compact_label = compact_search_text(label);
-    let compact_install_id = compact_search_text(install_id);
-
-    if label == query
-        || install_id == query
-        || (!compact_query.is_empty()
-            && (compact_label == compact_query || compact_install_id == compact_query))
-    {
-        0
-    } else if label.starts_with(query)
-        || install_id.starts_with(query)
-        || (!compact_query.is_empty()
-            && (compact_label.starts_with(&compact_query)
-                || compact_install_id.starts_with(&compact_query)))
-    {
-        1
-    } else if label.contains(query)
-        || install_id.contains(query)
-        || (!compact_query.is_empty()
-            && (compact_label.contains(&compact_query)
-                || compact_install_id.contains(&compact_query)))
-    {
-        2
-    } else {
-        3
-    }
-}
-
-fn backend_rank_for_search(backend: Backend, backends: &[Backend]) -> usize {
-    backends
-        .iter()
-        .position(|candidate| *candidate == backend)
-        .unwrap_or(backends.len())
-}
-
-fn normalize_search_text(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
-}
-
-fn compact_search_text(value: &str) -> String {
-    normalize_search_text(value)
-        .chars()
-        .filter(|ch| ch.is_alphanumeric())
-        .collect()
-}
-
-fn extract_json_string_value_after_key(input: &str, start: usize, key: &str) -> Option<String> {
-    input[start..]
-        .find(key)
-        .and_then(|offset| extract_json_string_value(input, start + offset))
-}
-
-fn extract_json_string_value(input: &str, key_pos: usize) -> Option<String> {
-    let after_colon = input[key_pos..].find(':')? + key_pos + 1;
-    let first_quote = input[after_colon..].find('"')? + after_colon + 1;
-    let mut escaped = false;
-    let mut value = String::new();
-    for ch in input[first_quote..].chars() {
-        if escaped {
-            value.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == '"' {
-            return Some(value);
-        }
-        value.push(ch);
-    }
-    None
-}
-
-fn starts_with_version_char(value: &str) -> bool {
-    value
-        .chars()
-        .next()
-        .map(|ch| ch.is_ascii_digit())
-        .unwrap_or(false)
-}
-
-fn looks_like_version(value: &str) -> bool {
-    starts_with_version_char(value.trim_matches(|ch| ch == '(' || ch == ')' || ch == ':'))
-}
-
-fn normalize_list_version(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches(|ch| ch == '(' || ch == ')' || ch == ':')
-        .to_string()
-}
-
-fn looks_like_url(value: &str) -> bool {
-    let value = value.trim();
-    value.starts_with("http://") || value.starts_with("https://")
-}
-
-fn find_char_index(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .find(needle)
-        .map(|byte_index| haystack[..byte_index].chars().count())
-}
-
-fn slice_chars(value: &str, start: usize, end: usize) -> String {
-    value
-        .chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
 }
 
 fn shell_escape(value: &str) -> String {
