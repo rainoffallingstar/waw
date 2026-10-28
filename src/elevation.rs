@@ -77,6 +77,15 @@ pub(crate) fn run_elevated_invocations(
         timeout,
     )?;
     if outcome.status.success() {
+        // The elevated child writes its progress to a status log that the
+        // caller never sees, so report completion here instead of exiting
+        // silently after a successful batch.
+        for invocation in invocations {
+            if invocation.program.is_empty() {
+                continue;
+            }
+            println!("ok {}", crate::invocation_progress_label(invocation));
+        }
         Ok(())
     } else {
         if let Some(summary) = render_elevated_batch_summary(invocations, &outcome.status_log) {

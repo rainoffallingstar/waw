@@ -84,6 +84,7 @@ pub(crate) fn execute_invocations(
 
         if !capture.success {
             if is_tolerable_command_failure(&invocation, &capture) {
+                println!("ok {progress_label} (nothing to do)");
                 if continue_on_error {
                     succeeded.push(progress_label);
                 }
@@ -97,6 +98,12 @@ pub(crate) fn execute_invocations(
             }
             return Err(error);
         }
+
+        // Non-interactive runs have no spinner to fall back on, and elevated
+        // batches report through a status log that the caller does not
+        // display. Print an explicit result line so a successful mutating
+        // command is not silent.
+        println!("ok {progress_label}");
 
         if continue_on_error {
             succeeded.push(progress_label);

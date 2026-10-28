@@ -333,6 +333,55 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
     }
 
     #[test]
+    fn choco_list_skips_retry_noise_before_data() {
+        // Real Chocolatey 2.7 output when it cannot replace choco.exe.old:
+        // the retry/warning text goes to stdout ahead of the package rows.
+        let output = "\
+This is try 1/3. Retrying after 300 milliseconds.\r\n\
+ Error converted to warning:\r\n\
+ 对路径“C:\\ProgramData\\chocolatey\\choco.exe.old”的访问被拒绝。\r\n\
+This is try 2/3. Retrying after 400 milliseconds.\r\n\
+ Error converted to warning:\r\n\
+ 对路径“C:\\ProgramData\\chocolatey\\choco.exe.old”的访问被拒绝。\r\n\
+Maximum tries of 3 reached. Throwing error.\r\n\
+chocolatey|2.7.4\r\n\
+less|679.0.0\r\n\
+rustup.install|1.27.1\r\n";
+
+        let entries = parse_choco_list_entries(output).expect("should parse");
+        assert_eq!(entries.len(), 3, "noise must not hide packages: {entries:?}");
+        assert_eq!(entries[0].package_id, "chocolatey");
+        assert_eq!(entries[0].current_version, "2.7.4");
+        assert_eq!(entries[1].package_id, "less");
+        assert_eq!(entries[2].package_id, "rustup.install");
+    }
+
+    #[test]
+    fn choco_list_still_parses_clean_output() {
+        let entries = parse_choco_list_entries("less|679.0.0\n").expect("should parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].package_id, "less");
+    }
+
+    #[test]
+    fn choco_list_empty_output_is_not_an_error() {
+        let entries = parse_choco_list_entries("").expect("empty is fine");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn choco_upgrade_skips_noise_lines() {
+        let output = "\
+This is try 1/3. Retrying after 300 milliseconds.\r\n\
+Maximum tries of 3 reached. Throwing error.\r\n\
+less|679.0.0|700.0.0\r\n";
+        let entries = parse_choco_upgrade_entries(output).expect("should parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].package_id, "less");
+        assert_eq!(entries[0].available_version.as_deref(), Some("700.0.0"));
+    }
+
+    #[test]
     fn all_backends_failed_only_when_every_backend_failed() {
         assert!(all_backends_failed("list", 3, &[]).is_none());
         assert!(all_backends_failed("list", 3, &["a: x".to_string()]).is_none());

@@ -602,23 +602,39 @@ pub(crate) fn parse_scoop_upgrade_entries(output: &str) -> Option<Vec<PackageLis
 
 pub(crate) fn parse_choco_list_entries(output: &str) -> Option<Vec<PackageListEntry>> {
     let mut entries = Vec::new();
+    let mut saw_package_line = false;
+
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("Chocolatey v")
-            || trimmed.ends_with("packages installed.")
-        {
+        if trimmed.is_empty() || trimmed.starts_with("Chocolatey v") {
             continue;
         }
-
-        let (name, version) = trimmed.split_once('|')?;
+        // Chocolatey 2.7 emits retry/warning noise on stdout before the data
+        // (e.g. "This is try 1/3..." when it cannot replace choco.exe.old).
+        // Any line without the `name|version` shape is skipped rather than
+        // aborting the whole parse, otherwise one warning hides every package.
+        let Some((name, version)) = trimmed.split_once('|') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        saw_package_line = true;
         entries.push(PackageListEntry {
             backend: Backend::Chocolatey,
-            name: name.trim().to_string(),
-            package_id: name.trim().to_string(),
+            name: name.to_string(),
+            package_id: name.to_string(),
             current_version: normalize_list_version(version.trim()),
             available_version: None,
         });
+    }
+
+    // Distinguish "parsed fine, nothing installed" from "this is not list
+    // output at all": only claim success when at least one row matched or the
+    // text carried no pipe-separated content whatsoever.
+    if !saw_package_line && output.contains('|') {
+        return None;
     }
     Some(entries)
 }
@@ -636,8 +652,9 @@ pub(crate) fn parse_choco_upgrade_entries(output: &str) -> Option<Vec<PackageLis
         }
 
         let parts: Vec<&str> = trimmed.split('|').collect();
+        // Same tolerance as the list parser: noise lines are skipped, not fatal.
         if parts.len() < 3 {
-            return None;
+            continue;
         }
 
         entries.push(PackageListEntry {
