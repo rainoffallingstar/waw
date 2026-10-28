@@ -5,17 +5,20 @@
 //! Parallel capture is used for read-only collection across backends; the
 //! mutating path stays serial.
 
+use crate::Backend;
 use crate::capture::read_capture_log;
 use crate::elevation::*;
 use crate::model::*;
-use crate::Backend;
 use std::fs;
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
-use crate::win32::{CloseHandle, CREATE_SUSPENDED, OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE, ProcessJob, resume_process_threads};
+use crate::win32::{
+    CREATE_SUSPENDED, CloseHandle, OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE, ProcessJob,
+    resume_process_threads,
+};
 
 pub(crate) fn execute_invocations(
     invocations: Vec<Invocation>,
@@ -264,9 +267,8 @@ pub(crate) fn run_logged_command_capture_inner(
         let job = ProcessJob::create();
         let pid = child.id();
         if let Some(active_job) = job.as_ref() {
-            let process_handle = unsafe {
-                OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid)
-            };
+            let process_handle =
+                unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
             if !process_handle.is_null() {
                 let assigned = active_job.assign(process_handle);
                 unsafe {
@@ -306,15 +308,14 @@ pub(crate) fn run_logged_command_capture_inner(
         thread::sleep(Duration::from_millis(120));
     }
 
-    let status = if timed_out {
-        None
-    } else {
-        Some(
-            child
-                .wait()
-                .map_err(|error| format!("failed to collect {} result: {error}", invocation.program))?,
-        )
-    };
+    let status =
+        if timed_out {
+            None
+        } else {
+            Some(child.wait().map_err(|error| {
+                format!("failed to collect {} result: {error}", invocation.program)
+            })?)
+        };
 
     let stdout = read_capture_log(&capture.stdout_path);
     let stderr = read_capture_log(&capture.stderr_path);
@@ -323,7 +324,10 @@ pub(crate) fn run_logged_command_capture_inner(
         stdout,
         stderr,
         success: status.as_ref().is_some_and(|status| status.success()),
-        status_code: status.as_ref().and_then(|status| status.code()).unwrap_or(1),
+        status_code: status
+            .as_ref()
+            .and_then(|status| status.code())
+            .unwrap_or(1),
         timed_out,
         timeout_seconds: timeout.map(|limit| limit.as_secs()),
     };

@@ -88,9 +88,7 @@ impl Config {
                 "winget_source" => config.winget_source = Some(parse_string(value)?),
                 "choco_source" => config.choco_source = Some(parse_string(value)?),
                 "scoop_buckets" => config.scoop_buckets = parse_string_list(value)?,
-                "scoop_default_bucket" => {
-                    config.scoop_default_bucket = Some(parse_string(value)?)
-                }
+                "scoop_default_bucket" => config.scoop_default_bucket = Some(parse_string(value)?),
                 // Deprecated: a single bucket used to mean "prefix everything
                 // with it". Treat it as a default instead, which is what users
                 // actually wanted; also record it in the list.
@@ -105,11 +103,11 @@ impl Config {
                     }
                 }
                 "pip_user" => config.pip_user = parse_bool(value)?,
-            "command_timeout_seconds" => {
-                config.command_timeout_seconds = value.parse::<u64>().map_err(|_| {
-                    format!("invalid value for command_timeout_seconds: {value}")
-                })?;
-            }
+                "command_timeout_seconds" => {
+                    config.command_timeout_seconds = value.parse::<u64>().map_err(|_| {
+                        format!("invalid value for command_timeout_seconds: {value}")
+                    })?;
+                }
                 "enable_winget" => config.enable_winget = parse_bool(value)?,
                 "enable_scoop" => config.enable_scoop = parse_bool(value)?,
                 "enable_choco" => config.enable_choco = parse_bool(value)?,

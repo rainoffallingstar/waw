@@ -4,11 +4,11 @@
 //! `{"packages": [...]}` and winget's `{"Sources": [{"Packages": [...]}]}`, so
 //! the output of `winget export` can be fed straight back in.
 
-use crate::json::{escape_json_string, parse_json, JsonValue};
+use super::super::*;
+use crate::Backend;
+use crate::json::{JsonValue, escape_json_string, parse_json};
 use crate::model::*;
 use crate::render::render_json_optional_string;
-use crate::Backend;
-use super::super::*;
 
 /// One entry in an exported manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,9 +128,7 @@ pub(crate) fn render_manifest_json(packages: &[ManifestPackage]) -> String {
         })
         .collect::<Vec<_>>()
         .join(",\n");
-    format!(
-        "{{\n  \"schema\": \"waw-packages/1\",\n  \"packages\": [\n{entries}\n  ]\n}}\n"
-    )
+    format!("{{\n  \"schema\": \"waw-packages/1\",\n  \"packages\": [\n{entries}\n  ]\n}}\n")
 }
 
 /// `waw bucket list` -- show the buckets Scoop actually has installed, plus
@@ -322,14 +320,19 @@ pub(crate) fn run_import(
             skipped += 1;
             continue;
         }
-        match groups.iter_mut().find(|(backend, _)| *backend == package.backend) {
+        match groups
+            .iter_mut()
+            .find(|(backend, _)| *backend == package.backend)
+        {
             Some((_, ids)) => ids.push(package.id.clone()),
             None => groups.push((package.backend, vec![package.id.clone()])),
         }
     }
 
     if skipped > 0 {
-        eprintln!("note: skipping {skipped} package(s) for backends that are disabled or filtered out");
+        eprintln!(
+            "note: skipping {skipped} package(s) for backends that are disabled or filtered out"
+        );
     }
     if groups.is_empty() {
         println!("Nothing to install from this manifest.");
@@ -338,10 +341,7 @@ pub(crate) fn run_import(
 
     let mut invocations = Vec::new();
     for (backend, ids) in &groups {
-        println!(
-            "Importing {} package(s) with {backend}",
-            ids.len()
-        );
+        println!("Importing {} package(s) with {backend}", ids.len());
         let specs: Vec<PackageSpec> = ids
             .iter()
             .map(|id| PackageSpec::without_version(id))

@@ -38,7 +38,12 @@ pub(crate) fn run_current_process_elevated() -> Result<CommandCapture, String> {
         .map_err(|error| format!("failed to resolve current executable for elevation: {error}"))?;
     let args: Vec<OsString> = env::args_os().skip(1).collect();
 
-    run_elevated_program(current_exe.as_os_str(), &args, "Running elevated command", None)
+    run_elevated_program(
+        current_exe.as_os_str(),
+        &args,
+        "Running elevated command",
+        None,
+    )
 }
 
 pub(crate) fn run_elevated_invocation(
@@ -378,7 +383,6 @@ pub(crate) fn launch_elevated_command_file(
     }
 }
 
-
 pub(crate) struct ElevationCapture {
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
@@ -516,7 +520,10 @@ pub(crate) fn tolerated_elevated_exit_snippet(program: &str, args: &[String]) ->
     }
 }
 
-pub(crate) fn tolerated_elevated_exit_snippet_os(program: &OsStr, args: &[OsString]) -> &'static str {
+pub(crate) fn tolerated_elevated_exit_snippet_os(
+    program: &OsStr,
+    args: &[OsString],
+) -> &'static str {
     let program = program.to_string_lossy();
     let args = args
         .iter()
@@ -551,7 +558,10 @@ pub(crate) fn is_winget_upgrade_command_os(program: &str, args: &[String]) -> bo
     program.contains("winget") && args.first().map(String::as_str) == Some("upgrade")
 }
 
-pub(crate) fn is_tolerable_command_failure(invocation: &Invocation, capture: &CommandCapture) -> bool {
+pub(crate) fn is_tolerable_command_failure(
+    invocation: &Invocation,
+    capture: &CommandCapture,
+) -> bool {
     if is_winget_upgrade_command(&invocation.program, &invocation.args) {
         if capture.status_code == WINGET_NO_APPLICABLE_UPGRADE_EXIT_CODE {
             return true;
@@ -586,7 +596,6 @@ pub(crate) fn powershell_utf8_setup() -> &'static str {
         "chcp.com 65001 > $null; "
     )
 }
-
 
 pub(crate) fn latest_elevated_step(stderr_log: &str) -> Option<String> {
     stderr_log
@@ -658,7 +667,10 @@ pub(crate) fn summarize_elevated_batch(
     steps
 }
 
-pub(crate) fn render_elevated_batch_summary(invocations: &[Invocation], stderr_log: &str) -> Option<String> {
+pub(crate) fn render_elevated_batch_summary(
+    invocations: &[Invocation],
+    stderr_log: &str,
+) -> Option<String> {
     let steps = summarize_elevated_batch(invocations, stderr_log);
     if steps.is_empty() {
         return None;
@@ -735,7 +747,6 @@ pub(crate) fn visible_elevated_stderr(stderr_log: &str) -> String {
         format!("{}\n", lines.join("\n"))
     }
 }
-
 
 pub(crate) fn format_elevated_batch_failure(exit_code: i32, stderr_log: &str) -> String {
     let failure_count = count_elevated_failures(stderr_log);

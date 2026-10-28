@@ -5,13 +5,13 @@
 //! and the planned invocation. Keeping them in one place means the parsers,
 //! renderers, and executor all agree on the same shapes.
 
+use crate::Backend;
+use crate::Config;
 use crate::capture::unique_capture_base;
 use crate::format_elapsed;
 use crate::shell_escape;
-use crate::Backend;
-use crate::Config;
-use std::io::{self, IsTerminal, Write};
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
