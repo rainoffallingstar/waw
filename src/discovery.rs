@@ -404,6 +404,18 @@ hits.sort(key=rank_key)
 print(json.dumps(hits))
 "#;
 
+pub(crate) fn command_works(program: &str, args: &[String]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+
 pub(crate) fn append_source_arg(args: &mut Vec<String>, source: Option<&str>) {
     if let Some(source) = source {
         args.push("--source".to_string());
