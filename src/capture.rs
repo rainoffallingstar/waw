@@ -150,13 +150,17 @@ pub(crate) fn decode_utf8_capture(bytes: &[u8], final_chunk: bool) -> String {
 
 pub(crate) fn decode_utf16_capture(bytes: &[u8], final_chunk: bool, little_endian: bool) -> String {
     let even_len = bytes.len() - (bytes.len() % 2);
-    let mut units = bytes[..even_len]
-        .chunks_exact(2)
-        .map(|chunk| {
+    // `as_chunks` rather than `chunks_exact`: clippy 1.99 flags a constant
+    // chunk size, and indexing the fixed-size array avoids the bounds checks
+    // that came with `chunk[0]` / `chunk[1]`.
+    let (pairs, _remainder) = bytes[..even_len].as_chunks::<2>();
+    let mut units = pairs
+        .iter()
+        .map(|pair| {
             if little_endian {
-                u16::from_le_bytes([chunk[0], chunk[1]])
+                u16::from_le_bytes(*pair)
             } else {
-                u16::from_be_bytes([chunk[0], chunk[1]])
+                u16::from_be_bytes(*pair)
             }
         })
         .collect::<Vec<_>>();
