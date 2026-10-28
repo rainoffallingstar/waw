@@ -575,6 +575,63 @@ less|679.0.0|700.0.0\r\n";
     }
 
     #[test]
+    fn pip_results_are_not_reordered_by_the_generic_ranker() {
+        // The prober ranks by publication date, so it puts the maintained
+        // beautifulsoup4 ahead of the abandoned BeautifulSoup. The generic
+        // prefix ranker would undo that because "BeautifulSoup" is an exact
+        // match. Sorting must be a no-op for pure-pip result sets.
+        let candidates = vec![
+            SearchCandidate {
+                backend: Backend::Pip,
+                label: "beautifulsoup4 - Screen-scraping library".to_string(),
+                install_id: "beautifulsoup4".to_string(),
+                version: Some("4.15.0".to_string()),
+                source: Some("pypi".to_string()),
+            },
+            SearchCandidate {
+                backend: Backend::Pip,
+                label: "BeautifulSoup - Screen-scraping library".to_string(),
+                install_id: "BeautifulSoup".to_string(),
+                version: Some("3.2.2".to_string()),
+                source: Some("pypi".to_string()),
+            },
+        ];
+
+        let sorted = sort_search_candidates(
+            candidates.clone(),
+            "beautifulsoup",
+            &[Backend::Pip],
+        );
+        assert_eq!(
+            sorted[0].install_id, "beautifulsoup4",
+            "the prober's date-based order must survive"
+        );
+    }
+
+    #[test]
+    fn generic_ranking_still_applies_to_mixed_backends() {
+        let candidates = vec![
+            SearchCandidate {
+                backend: Backend::Npm,
+                label: "eslint-plugin-git".to_string(),
+                install_id: "eslint-plugin-git".to_string(),
+                version: None,
+                source: None,
+            },
+            SearchCandidate {
+                backend: Backend::Npm,
+                label: "git".to_string(),
+                install_id: "git".to_string(),
+                version: None,
+                source: None,
+            },
+        ];
+        let sorted =
+            sort_search_candidates(candidates, "git", &[Backend::Npm]);
+        assert_eq!(sorted[0].install_id, "git", "exact match still leads");
+    }
+
+    #[test]
     fn pip_search_parses_probe_json() {
         let output = r#"[
             {"name": "requests", "version": "2.34.2", "summary": "Python HTTP for Humans."},

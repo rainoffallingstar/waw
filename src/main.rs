@@ -2157,6 +2157,20 @@ impl Display for Backend {
 /// This probes the documented per-project JSON API instead. It only finds
 /// projects whose name it can guess from the query, which is stated in the
 /// CLI help. In exchange a search costs a handful of small requests.
+/// PyPI has no search API: the XML-RPC `search` endpoint was permanently
+/// disabled in 2020, and the web UI's `/search/` route is not a machine API.
+///
+/// This probes the documented per-project JSON API with names derived from the
+/// query. It costs a handful of small requests instead of the 45 MB / ~82 s
+/// full-index download the previous implementation did.
+///
+/// Two refinements over naive probing:
+///
+/// * Version-suffixed names are probed, because several widely used projects
+///   were renamed that way (`beautifulsoup` -> `beautifulsoup4`). Without this
+///   a query for "beautifulsoup" returns the abandoned 2008 package.
+/// * Yanked releases are ranked last, and a package with a strictly newer
+///   release wins a tie against a same-named older sibling.
 const PIP_SEARCH_SCRIPT: &str = r#"import json, sys, urllib.error, urllib.request
 query = sys.argv[1].strip()
 normalized = query.lower().replace(" ", "-").replace("_", "-")
@@ -2168,6 +2182,9 @@ def add(name):
         candidates.append(lowered)
 
 add(normalized)
+# Renamed projects: beautifulsoup -> beautifulsoup4, pymysql -> PyMySQL, etc.
+for suffix in ("4", "3", "2"):
+    add(normalized + suffix)
 for prefix in ("python-", "py-", "django-", "flask-"):
     add(prefix + normalized)
 add(normalized + "-cli")
@@ -2179,8 +2196,6 @@ add(normalized + "-server")
 add(normalized + "-utils")
 add(normalized + "-parser")
 add(normalized + "-py")
-add(normalized + "2")
-add(normalized + "3")
 parts = normalized.split("-")
 if len(parts) > 1:
     add(parts[0])
@@ -2204,10 +2219,26 @@ def fetch(name):
     real_name = info.get("name")
     if not real_name:
         return None
+
+    # Newest upload time across all releases, used to spot abandoned packages.
+    newest = ""
+    yanked = 0
+    total = 0
+    for files in (data.get("releases") or {}).values():
+        for entry in files:
+            total += 1
+            if entry.get("yanked"):
+                yanked += 1
+            uploaded = entry.get("upload_time_iso_8601") or ""
+            if uploaded > newest:
+                newest = uploaded
+
     return {
         "name": real_name,
         "version": info.get("version"),
         "summary": info.get("summary"),
+        "newest": newest,
+        "fully_yanked": total > 0 and yanked == total,
     }
 
 hits = []
@@ -2216,14 +2247,32 @@ for candidate in candidates:
     if info:
         hits.append(info)
 
-hits.sort(
-    key=lambda item: (
-        item["name"].lower() != normalized,
-        not item["name"].lower().startswith(normalized),
-        len(item["name"]),
-        item["name"].lower(),
+def rank_key(item):
+    name = item["name"].lower()
+    # Names that are the query or a numeric/word variant of it form one class;
+    # among them, recency decides. This is what puts beautifulsoup4 ahead of
+    # the abandoned beautifulsoup without demoting an exact match that is
+    # itself current.
+    same_family = name == normalized or (
+        name.startswith(normalized)
+        and name[len(normalized):len(normalized) + 1].isdigit()
     )
-)
+    # Invert the timestamp so "newer" sorts first.
+    inverted_date = "".join(
+        chr(255 - ord(c)) if ord(c) < 255 else c for c in item["newest"]
+    )
+    return (
+        # Yanked packages never lead.
+        item["fully_yanked"],
+        not same_family,
+        not name.startswith(normalized),
+        inverted_date,
+        name != normalized,
+        len(name),
+        name,
+    )
+
+hits.sort(key=rank_key)
 print(json.dumps(hits))
 "#;
 
@@ -2288,6 +2337,15 @@ fn sort_search_candidates(
     backends: &[Backend],
 ) -> Vec<SearchCandidate> {
     let query = normalize_search_text(query);
+
+    // pip already ranks its own results: the prober compares publication dates
+    // so a maintained `beautifulsoup4` outranks the abandoned `BeautifulSoup`.
+    // Re-sorting here with the generic prefix heuristic would undo that, since
+    // "BeautifulSoup" is an exact match and would win on rank alone.
+    if candidates.iter().all(|candidate| candidate.backend == Backend::Pip) {
+        return candidates;
+    }
+
     candidates.sort_by(|left, right| {
         let left_key = search_sort_key(left, &query, backends);
         let right_key = search_sort_key(right, &query, backends);
