@@ -34,6 +34,14 @@ jobs:
         shell: powershell
         run: powershell -ExecutionPolicy Bypass -File .\scripts\run-windows-tests.ps1 -Clippy
 
+      - name: Install Scoop so its E2E case can run
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          scoop --version
+          scoop bucket list
+
       - name: Build release binary for live E2E
         shell: powershell
         run: cargo build --release

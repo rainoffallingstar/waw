@@ -307,6 +307,17 @@ if ($ran -eq 0) {
     }
     throw "No case could run: every configured backend was unavailable."
 }
+
+# A green gate must not be read as "every mutating path was exercised".
+# Say plainly what was and was not covered.
+$unverified = @($cases | Where-Object { -not $available.ContainsKey($_.Backend) } | ForEach-Object { $_.Backend })
+if ($skippedElevation -gt 0) { $unverified += "choco" }
+if ($unverified.Count -gt 0) {
+    Write-Host ""
+    Write-Host "UNVERIFIED in this run: $($unverified -join ', ')" -ForegroundColor Yellow
+    Write-Host "  (unavailable on this host, or needs an interactive UAC prompt)"
+    Write-Host "  These paths are covered by local runs; CI cannot exercise them."
+}
 Write-Host "Ran $ran of $($cases.Count) install/remove cases."
 
 Write-Host "Live Windows end-to-end checks completed successfully." -ForegroundColor Green
