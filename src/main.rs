@@ -125,60 +125,66 @@ fn run() -> Result<ExitCode, String> {
     let selected_backend = cli.backend.or(config.backend);
     let runtime = runtime_from(config, &cli);
 
+    // One exhaustive match instead of a chain of `if let` checks: adding a
+    // Subcommand variant now fails to compile until it is routed here.
     match &cli.command {
-        Subcommand::Update if selected_backend.is_none() => {
+        Subcommand::Update => {
             let backends = resolve_auto_backends(selected_backend, config)?;
             return run_update_all(backends, cli.dry_run, &runtime);
         }
-        Subcommand::Upgrade { packages } if packages.is_empty() => {
+        Subcommand::Upgrade { packages } => {
             let backends = resolve_auto_backends(selected_backend, config)?;
-            return run_interactive_upgrade(backends, &runtime, cli.dry_run);
+            if packages.is_empty() {
+                return run_interactive_upgrade(backends, &runtime, cli.dry_run);
+            }
+            // Named packages fall through to the single-backend path.
         }
-        _ => {}
-    }
-
-    if let Subcommand::Bucket { action } = &cli.command {
-        return run_bucket_command(action.clone(), config, cli.dry_run, &runtime);
-    }
-
-    if let Subcommand::Export { path } = &cli.command {
-        let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_export(backends, path.clone(), &runtime);
-    }
-
-    if let Subcommand::Import { path } = &cli.command {
-        return run_import(path, cli.dry_run, selected_backend, config, &runtime);
-    }
-
-    if let Subcommand::Search { query, .. } = &cli.command {
-        let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_search(backends, query, &runtime, cli.json);
-    }
-
-    if let Subcommand::Install {
-        mode: InstallMode::Search(query),
-    } = &cli.command
-    {
-        let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_interactive_install(backends, query, &runtime, cli.dry_run);
-    }
-
-    if let Subcommand::Remove {
-        mode: RemoveMode::Search(query),
-    } = &cli.command
-    {
-        let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_interactive_remove(backends, query, &runtime, cli.dry_run);
-    }
-
-    if let Subcommand::List { upgradable } = &cli.command {
-        let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_list(backends, *upgradable, &runtime, cli.dry_run, cli.json);
-    }
-
-    if let Subcommand::Show { package } = &cli.command {
-        let backends = resolve_auto_backends(selected_backend, config)?;
-        return run_show(backends, package, &runtime, cli.dry_run, cli.json);
+        Subcommand::Bucket { action } => {
+            return run_bucket_command(action.clone(), config, cli.dry_run, &runtime);
+        }
+        Subcommand::Export { path } => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_export(backends, path.clone(), &runtime);
+        }
+        Subcommand::Import { path } => {
+            return run_import(path, cli.dry_run, selected_backend, config, &runtime);
+        }
+        Subcommand::Search { query, .. } => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_search(backends, query, &runtime, cli.json);
+        }
+        Subcommand::Install {
+            mode: InstallMode::Search(query),
+        } => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_interactive_install(backends, query, &runtime, cli.dry_run);
+        }
+        Subcommand::Remove {
+            mode: RemoveMode::Search(query),
+        } => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_interactive_remove(backends, query, &runtime, cli.dry_run);
+        }
+        Subcommand::List { upgradable } => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_list(backends, *upgradable, &runtime, cli.dry_run, cli.json);
+        }
+        Subcommand::Show { package } => {
+            let backends = resolve_auto_backends(selected_backend, config)?;
+            return run_show(backends, package, &runtime, cli.dry_run, cli.json);
+        }
+        Subcommand::Install {
+            mode: InstallMode::Exact(_),
+        }
+        | Subcommand::Remove {
+            mode: RemoveMode::Exact(_),
+        }
+        | Subcommand::Hold { .. }
+        | Subcommand::Backends
+        | Subcommand::Backend { .. }
+        | Subcommand::Help => {
+            // Routed by the single-backend path below.
+        }
     }
 
     let backend = match selected_backend {
