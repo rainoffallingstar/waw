@@ -1928,6 +1928,44 @@ pip_user = true
 
 
     #[test]
+    fn empty_arguments_are_rejected_instead_of_reaching_the_backend() {
+        // `search ""` used to pass an empty query through, which made scoop
+        // return every single-letter package; `show ""` made scoop print its
+        // own usage text and waw present that as package details.
+        for args in [
+            vec!["search", ""],
+            vec!["search", "   "],
+            vec!["show", ""],
+            vec!["install", "--exact", ""],
+            vec!["install", "--exact", "  "],
+        ] {
+            let result = Cli::parse(args.iter().map(|value| value.to_string()));
+            assert!(
+                result.is_err(),
+                "{args:?} should be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_empty_arguments_still_parse() {
+        assert!(Cli::parse(["search", "git"].iter().map(|v| v.to_string())).is_ok());
+        assert!(Cli::parse(["show", "git"].iter().map(|v| v.to_string())).is_ok());
+        assert!(
+            Cli::parse(["install", "--exact", "git"].iter().map(|v| v.to_string())).is_ok()
+        );
+    }
+
+    #[test]
+    fn unterminated_array_is_rejected() {
+        assert!(parse_string_list("[\"main\", \"extras\"").is_err());
+        assert!(parse_string_list("]").is_err());
+        assert!(parse_string_list("[\"main\"]").is_ok());
+        assert!(parse_string_list("\"main\"").is_ok());
+        assert!(parse_string_list("").is_ok());
+    }
+
+    #[test]
     fn parse_string_list_handles_arrays_and_scalars() {
         assert_eq!(parse_string_list("\"a\"").expect("ok"), vec!["a".to_string()]);
         assert_eq!(parse_string_list("[]").expect("ok"), Vec::<String>::new());

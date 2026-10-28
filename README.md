@@ -23,12 +23,14 @@ It was originally prototyped from the Rust version built during the UniGetUI-ins
 - `update`
 - `upgrade`
 - `install`
-- `install --exact`
+- `install --exact` (accepts `pkg@1.2.3` or pip's `pkg==1.2.3`)
 - `remove`
 - `hold`
 - `search`
-- `list`
+- `list [--upgradable]`
 - `show`
+- `export [--file <path>]`
+- `import <path>`
 
 ### Backend commands
 
@@ -38,6 +40,15 @@ It was originally prototyped from the Rust version built during the UniGetUI-ins
 - `backend disable`
 - `backend install`
 - `backend default`
+- `bucket [list]` (Scoop)
+
+### Global options
+
+Accepted before or after the subcommand:
+
+- `--backend <name>`, `--config <path>`, `--dry-run`
+- `--json` (for `backends`, `backend ...`, `show`, `list`, `search`)
+- `-y/--yes`, `--interactive`, `--elevate`, `--no-elevate`
 
 ## 🚀 Usage
 
@@ -103,8 +114,10 @@ assume_yes = true
 auto_elevate = true
 winget_source = "winget"
 choco_source = "https://community.chocolatey.org/api/v2/"
-scoop_bucket = "extras"
+scoop_buckets = ["main", "extras"]
+scoop_default_bucket = "extras"   # omit to let Scoop resolve unqualified names
 pip_user = true
+command_timeout_seconds = 180     # 0 disables the per-command timeout
 enable_winget = true
 enable_scoop = true
 enable_choco = true

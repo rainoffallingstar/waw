@@ -665,10 +665,13 @@ impl ArgCursor {
         }
 
         if packages.is_empty() {
-            Err(format!("{command} requires at least one package"))
-        } else {
-            Ok(packages)
+            return Err(format!("{command} requires at least one package"));
         }
+        if let Some(blank) = packages.iter().find(|name| name.trim().is_empty()) {
+            let _ = blank;
+            return Err(format!("{command} does not accept an empty package name"));
+        }
+        Ok(packages)
     }
 
     pub(crate) fn take_required_text(&mut self, command: &str) -> Result<String, String> {
@@ -682,10 +685,13 @@ impl ArgCursor {
         }
 
         if values.is_empty() {
-            Err(format!("{command} requires a query"))
-        } else {
-            Ok(values.join(" "))
+            return Err(format!("{command} requires a query"));
         }
+        let joined = values.join(" ");
+        if joined.trim().is_empty() {
+            return Err(format!("{command} requires a non-empty query"));
+        }
+        Ok(joined)
     }
 
     pub(crate) fn take_required_single_value(&mut self, command: &str) -> Result<String, String> {

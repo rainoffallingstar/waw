@@ -2514,6 +2514,15 @@ fn parse_string_list(raw: &str) -> Result<Vec<String>, String> {
         .and_then(|value| value.strip_suffix(']'));
 
     let Some(inner) = inner else {
+        // A value that starts a list but never closes it is a typo, not a
+        // scalar. Rejecting it beats silently treating `["main", "extras"` as
+        // one bucket named that.
+        if trimmed.starts_with('[') {
+            return Err(format!("unterminated array value: {trimmed}"));
+        }
+        if trimmed.contains(']') {
+            return Err(format!("unexpected ']' in value: {trimmed}"));
+        }
         return Ok(vec![parse_string(trimmed)?]);
     };
 
