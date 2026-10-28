@@ -422,3 +422,78 @@ pub(crate) fn render_backend_install_json(
         escape_json_string(backend.install_hint()),
     )
 }
+
+pub(crate) fn parse_string(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('"') {
+        if !trimmed.ends_with('"') || trimmed.len() < 2 {
+            return Err(format!("invalid quoted string: {trimmed}"));
+        }
+        Ok(trimmed[1..trimmed.len() - 1].replace("\\\"", "\""))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+/// Parses a TOML-ish inline array of strings: `["main", "extras"]`.
+///
+/// A bare scalar is also accepted and treated as a one-element list, so
+/// `scoop_buckets = "extras"` does not fail.
+pub(crate) fn parse_string_list(raw: &str) -> Result<Vec<String>, String> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'));
+
+    let Some(inner) = inner else {
+        // A value that starts a list but never closes it is a typo, not a
+        // scalar. Rejecting it beats silently treating `["main", "extras"` as
+        // one bucket named that.
+        if trimmed.starts_with('[') {
+            return Err(format!("unterminated array value: {trimmed}"));
+        }
+        if trimmed.contains(']') {
+            return Err(format!("unexpected ']' in value: {trimmed}"));
+        }
+        return Ok(vec![parse_string(trimmed)?]);
+    };
+
+    let mut items = Vec::new();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let value = parse_string(part)?;
+        if !value.is_empty() && !items.contains(&value) {
+            items.push(value);
+        }
+    }
+    Ok(items)
+}
+
+pub(crate) fn render_toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+pub(crate) fn parse_bool(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => Err(format!("invalid boolean value: {raw}")),
+    }
+}
+
+pub(crate) fn default_config_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join(APP_NAME).join("config.toml"))
+    } else if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+        Some(PathBuf::from(path).join(APP_NAME).join("config.toml"))
+    } else {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join(".config").join(APP_NAME).join("config.toml"))
+    }
+}
