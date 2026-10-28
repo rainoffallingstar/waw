@@ -3431,3 +3431,23 @@ fn backend_display_honours_formatter_width() {
     assert_eq!(format!("[{:>8}]", Backend::Npm), "[     npm]");
     assert_eq!(format!("[{:<8}]", Backend::Chocolatey), "[choco   ]");
 }
+
+#[test]
+fn backend_status_line_has_no_leading_padding() {
+    // The live E2E gate parses this with `^\s*(?<name>\w+):.*available$`.
+    // A padded status line (`    winget: ...`) broke that gate once already,
+    // so the contract is asserted rather than left implicit.
+    let status = BackendStatus {
+        backend: Backend::Winget,
+        supported: true,
+        enabled: true,
+        available: true,
+        default_selected: false,
+    };
+    let line = render_backend_status_line(&status, "supported", "enabled", "available", "");
+    assert_eq!(line, "winget: supported, enabled, available");
+    assert!(!line.starts_with(' '), "leading padding breaks parsing");
+
+    let line = render_backend_status_line(&status, "supported", "enabled", "available", " default");
+    assert_eq!(line, "winget: supported, enabled, available default");
+}

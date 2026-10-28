@@ -340,8 +340,8 @@ pub(crate) fn print_backend_status_line(status: &BackendStatus) {
     };
 
     println!(
-        "{:>10}: {support}, {enabled}, {availability}{default_mark}",
-        status.backend
+        "{}",
+        render_backend_status_line(status, support, enabled, availability, default_mark)
     );
 
     if !status.available {
@@ -350,6 +350,24 @@ pub(crate) fn print_backend_status_line(status: &BackendStatus) {
             status.backend.install_hint()
         );
     }
+}
+
+/// The one-line status row, separated out so the "no leading padding" contract
+/// can be asserted directly.
+///
+/// Leading spaces break the live E2E gate, which finds backends with
+/// `^\s*name:` style matching, and any other script that parses this output.
+pub(crate) fn render_backend_status_line(
+    status: &BackendStatus,
+    support: &str,
+    enabled: &str,
+    availability: &str,
+    default_mark: &str,
+) -> String {
+    format!(
+        "{}: {support}, {enabled}, {availability}{default_mark}",
+        status.backend
+    )
 }
 
 pub(crate) fn render_backend_statuses_json(config: &Config) -> String {

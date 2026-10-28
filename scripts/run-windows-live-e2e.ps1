@@ -326,7 +326,9 @@ $cases = @(
 $available = @{}
 $statusText = (Invoke-Waw @("backends")).Output
 foreach ($line in ($statusText -split "`n")) {
-    if ($line -match '^(?<name>\w+):.*available$') {
+    # Tolerate leading whitespace so cosmetic alignment changes in `backends`
+    # cannot silently break this gate.
+    if ($line -match '^\s*(?<name>\w+):.*available$') {
         $available[$Matches['name']] = $true
     }
 }
