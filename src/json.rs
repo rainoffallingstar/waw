@@ -31,6 +31,13 @@ impl JsonValue {
         }
     }
 
+    pub fn as_object(&self) -> Option<&[(String, JsonValue)]> {
+        match self {
+            Self::Object(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
     pub fn as_array(&self) -> Option<&[JsonValue]> {
         match self {
             Self::Array(values) => Some(values),

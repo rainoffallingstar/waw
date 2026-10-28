@@ -333,6 +333,43 @@ rustup.install 1.27.1 [Approved] Downloads cached for licensed users\r\n\
     }
 
     #[test]
+    fn npm_list_keeps_entries_without_version() {
+        // npm emits dependency entries with no "version" key for packages it
+        // treats as overridden or partially installed. A line-based state
+        // machine used to swallow everything after the first such entry.
+        let output = r#"{
+  "name": "npm",
+  "dependencies": {
+    "@scope/alpha": { "version": "1.0.0", "overridden": false },
+    "code-server": { "overridden": false },
+    "cowsay": { "version": "1.6.0", "overridden": false }
+  }
+}"#;
+
+        let entries = parse_npm_list_entries(output).expect("should parse");
+        let names: Vec<&str> = entries.iter().map(|e| e.package_id.as_str()).collect();
+        assert_eq!(names, vec!["@scope/alpha", "code-server", "cowsay"]);
+        assert_eq!(entries[0].current_version, "1.0.0");
+        // Missing version is reported as "-", not dropped.
+        assert_eq!(entries[1].current_version, "-");
+        assert_eq!(entries[2].current_version, "1.6.0");
+    }
+
+    #[test]
+    fn npm_list_handles_empty_dependencies() {
+        let entries = parse_npm_list_entries(r#"{"name":"npm","dependencies":{}}"#)
+            .expect("should parse");
+        assert!(entries.is_empty());
+        assert!(parse_npm_list_entries("{}").expect("ok").is_empty());
+        assert!(parse_npm_list_entries("").expect("ok").is_empty());
+    }
+
+    #[test]
+    fn npm_list_rejects_non_json() {
+        assert!(parse_npm_list_entries("Listing packages...").is_none());
+    }
+
+    #[test]
     fn choco_list_skips_retry_noise_before_data() {
         // Real Chocolatey 2.7 output when it cannot replace choco.exe.old:
         // the retry/warning text goes to stdout ahead of the package rows.
@@ -399,6 +436,36 @@ less|679.0.0|700.0.0\r\n";
 
         // Defensive: no backends attempted must not claim failure.
         assert!(all_backends_failed("list", 0, &[]).is_none());
+    }
+
+    #[test]
+    fn only_chocolatey_requires_elevation() {
+        let config = Config::default();
+        let runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &config,
+        };
+
+        assert!(Backend::Chocolatey.requires_elevation_for_mutation(&runtime));
+        assert!(!Backend::Winget.requires_elevation_for_mutation(&runtime));
+        assert!(!Backend::Scoop.requires_elevation_for_mutation(&runtime));
+        assert!(!Backend::Npm.requires_elevation_for_mutation(&runtime));
+        // pip honours `pip_user`; the default config sets it true.
+        assert!(!Backend::Pip.requires_elevation_for_mutation(&runtime));
+
+        let global_pip = Config {
+            pip_user: false,
+            ..Config::default()
+        };
+        let global_runtime = RuntimeSettings {
+            assume_yes: true,
+            auto_elevate: true,
+            command_timeout: None,
+            config: &global_pip,
+        };
+        assert!(Backend::Pip.requires_elevation_for_mutation(&global_runtime));
     }
 
     #[test]
@@ -1549,7 +1616,12 @@ pip_user = true
 
         assert_eq!(plan.len(), 1);
         assert_program_matches(&plan[0].program, &["winget", "winget.exe"]);
-        assert_eq!(plan[0].requires_elevation, cfg!(windows));
+        // winget installs per-user, so it must not request elevation. Demanding
+        // admin here meant every `waw install` raised a UAC prompt.
+        assert!(
+            !plan[0].requires_elevation,
+            "winget must not require elevation"
+        );
         assert_eq!(
             plan[0].args,
             vec![

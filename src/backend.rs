@@ -178,13 +178,20 @@ impl Backend {
             .with_elevation(self.requires_elevation_for_mutation(runtime))
     }
 
+    /// Whether a mutating command genuinely needs administrator rights.
+    ///
+    /// Only Chocolatey installs machine-wide by default. winget, Scoop and npm
+    /// all install per-user, and pip runs with `--user` unless configured
+    /// otherwise, so treating them as elevated made every `waw install` raise
+    /// a UAC prompt for no reason.
     pub(crate) fn requires_elevation_for_mutation(self, runtime: &RuntimeSettings<'_>) -> bool {
         if !cfg!(windows) {
             return false;
         }
 
         match self {
-            Self::Winget | Self::Scoop | Self::Chocolatey | Self::Npm => true,
+            Self::Chocolatey => true,
+            Self::Winget | Self::Scoop | Self::Npm => false,
             Self::Pip => !runtime.config.pip_user,
         }
     }

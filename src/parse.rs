@@ -668,6 +668,11 @@ pub(crate) fn parse_choco_upgrade_entries(output: &str) -> Option<Vec<PackageLis
     Some(entries)
 }
 
+/// npm's `list --json` output. Parsed with the real JSON reader rather than a
+/// line scanner: an entry may legitimately have no `version` key (npm emits
+/// those for packages it considers "overridden" or partially installed), and
+/// a line-based state machine silently swallowed every package after such an
+/// entry -- which is how `cowsay` went missing from `waw list`.
 pub(crate) fn parse_npm_list_entries(output: &str) -> Option<Vec<PackageListEntry>> {
     let trimmed = output.trim();
     if trimmed.is_empty() || trimmed == "{}" {
@@ -677,46 +682,27 @@ pub(crate) fn parse_npm_list_entries(output: &str) -> Option<Vec<PackageListEntr
         return None;
     }
 
+    let root = parse_json(trimmed).ok()?;
+    let dependencies = root.get("dependencies")?.as_object()?;
+
     let mut entries = Vec::new();
-    let mut in_dependencies = false;
-    let mut current_name: Option<String> = None;
-
-    for line in trimmed.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("\"dependencies\"") {
-            in_dependencies = true;
-            continue;
-        }
-        if !in_dependencies {
-            continue;
-        }
-        if current_name.is_none() {
-            if trimmed == "}" || trimmed == "}," {
-                continue;
-            }
-            if trimmed.ends_with('{') && trimmed.starts_with('"') {
-                let (name, _) = trimmed.split_once(':')?;
-                current_name = Some(name.trim().trim_matches('"').to_string());
-            }
-            continue;
-        }
-
-        if trimmed.starts_with("\"version\"") {
-            let version = extract_json_string_value_after_key(trimmed, 0, "\"version\"")?;
-            let name = current_name.take()?;
-            entries.push(PackageListEntry {
-                backend: Backend::Npm,
-                package_id: name.clone(),
-                name,
-                current_version: version,
-                available_version: None,
-            });
-        }
+    for (name, value) in dependencies {
+        let version = value
+            .get("version")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("-");
+        entries.push(PackageListEntry {
+            backend: Backend::Npm,
+            package_id: name.clone(),
+            name: name.clone(),
+            current_version: normalize_list_version(version),
+            available_version: None,
+        });
     }
 
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
     Some(entries)
 }
-
 pub(crate) fn parse_npm_upgrade_entries(output: &str) -> Option<Vec<PackageListEntry>> {
     let trimmed = output.trim();
     if trimmed.is_empty() || trimmed == "{}" {

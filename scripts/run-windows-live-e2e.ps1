@@ -1,5 +1,9 @@
 param(
-    [string]$Binary = ""
+    [string]$Binary = "",
+    # Mutating commands need admin. On an interactive machine waw can raise a
+    # UAC prompt, but a CI runner has nobody to click it, so those cases are
+    # skipped unless this switch is passed.
+    [switch]$AllowElevation
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,41 +42,51 @@ function Resolve-WawBinary {
     throw "Could not find waw.exe. Build the project first or pass -Binary."
 }
 
+function Quote-Arg {
+    param([string]$Value)
+    if ($Value -match '^[\w.:/\\@=+-]+$') { return $Value }
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+
 function Invoke-Waw {
     param(
         [string[]]$Arguments,
         [switch]$AllowFailure
     )
 
-    $fullArgs = @("--config", $script:ConfigPath, "--no-elevate") + $Arguments
+    # Mutating commands must be allowed to elevate: Chocolatey refuses to run
+    # unattended without admin and blocks on a "Do you want to continue?"
+    # prompt that no CI runner can answer. Read-only commands stay
+    # non-elevated so they never trigger a UAC dialog.
+    $mutating = ($Arguments | Where-Object { $_ -in @("install", "remove", "upgrade", "update") }) -ne $null
+    $elevationArg = if ($mutating) { "--elevate" } else { "--no-elevate" }
+    $fullArgs = @("--config", $script:ConfigPath, $elevationArg) + $Arguments
     Write-Host "waw $($fullArgs -join ' ')" -ForegroundColor Cyan
     $stdoutPath = Join-Path $tempRoot ([guid]::NewGuid().ToString() + ".stdout.log")
     $stderrPath = Join-Path $tempRoot ([guid]::NewGuid().ToString() + ".stderr.log")
 
     try {
-        $process = Start-Process `
-            -FilePath $script:WawBinary `
-            -ArgumentList $fullArgs `
-            -PassThru `
-            -NoNewWindow `
-            -RedirectStandardOutput $stdoutPath `
-            -RedirectStandardError $stderrPath
+        # Start-Process -PassThru does not reliably surface ExitCode when the
+        # process object is created with redirection, which made every command
+        # look like a -1 failure. A plain ProcessStartInfo returns the real
+        # value.
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $script:WawBinary
+        $psi.Arguments = ($fullArgs | ForEach-Object { Quote-Arg $_ }) -join ' '
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
 
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
         if (-not $process.WaitForExit($script:StepTimeoutMs)) {
             try { $process.Kill($true) } catch { }
             throw "waw command timed out after $([int]($script:StepTimeoutMs / 1000))s: waw $($fullArgs -join ' ')"
         }
+        $process.WaitForExit()
 
-        $stdout = if (Test-Path -LiteralPath $stdoutPath) {
-            Get-Content -LiteralPath $stdoutPath -Raw
-        } else {
-            ""
-        }
-        $stderr = if (Test-Path -LiteralPath $stderrPath) {
-            Get-Content -LiteralPath $stderrPath -Raw
-        } else {
-            ""
-        }
         $output = ($stdout + $stderr)
         $exitCode = $process.ExitCode
     }
@@ -255,8 +269,44 @@ $cases = @(
     }
 )
 
-foreach ($case in $cases) {
-    Invoke-InstallRemoveCase $case
+# The runner does not ship every package manager (Scoop in particular is a
+# per-user install). A backend that is simply absent is not a regression --
+# skip it and say so, rather than failing the whole gate.
+$available = @{}
+$statusText = (Invoke-Waw @("backends")).Output
+foreach ($line in ($statusText -split "`n")) {
+    if ($line -match '^(?<name>\w+):.*available$') {
+        $available[$Matches['name']] = $true
+    }
 }
+if ($available.Count -eq 0) {
+    throw "No backend is available on this runner; live E2E cannot verify anything."
+}
+
+$ran = 0
+$skippedElevation = 0
+foreach ($case in $cases) {
+    if (-not $available.ContainsKey($case.Backend)) {
+        Write-Host "skipping $($case.Backend): not installed on this runner" -ForegroundColor Yellow
+        continue
+    }
+    # Only Chocolatey requires administrator rights. winget, scoop, npm and
+    # pip all install per-user, so their cases can run without UAC.
+    if ($case.Backend -eq "choco" -and -not $AllowElevation) {
+        Write-Host "skipping choco: needs elevation (-AllowElevation)" -ForegroundColor Yellow
+        $skippedElevation += 1
+        continue
+    }
+    Invoke-InstallRemoveCase $case
+    $ran += 1
+}
+if ($ran -eq 0) {
+    if ($skippedElevation -gt 0) {
+        Write-Host "Only non-mutating checks ran (elevation disabled)." -ForegroundColor Yellow
+        return
+    }
+    throw "No case could run: every configured backend was unavailable."
+}
+Write-Host "Ran $ran of $($cases.Count) install/remove cases."
 
 Write-Host "Live Windows end-to-end checks completed successfully." -ForegroundColor Green
