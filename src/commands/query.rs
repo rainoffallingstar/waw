@@ -262,8 +262,6 @@ pub(crate) fn run_show(
     }
 }
 
-
-
 pub(crate) fn print_list_rows(rows: &[PackageListEntry], upgradable: bool) {
     let backend_width = rows
         .iter()

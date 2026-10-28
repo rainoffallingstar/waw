@@ -169,7 +169,8 @@ pub(crate) fn collect_installed_candidates(
         }));
     }
 
-    if let Some(error) = all_backends_failed("inspect installed packages", backends.len(), &failures)
+    if let Some(error) =
+        all_backends_failed("inspect installed packages", backends.len(), &failures)
     {
         return Err(error);
     }
@@ -218,9 +219,7 @@ pub(crate) fn collect_upgradable_candidates(
             Ok(capture) => capture,
             Err(error) => {
                 if aggregate {
-                    eprintln!(
-                        "warning: failed to inspect pending upgrades for {backend}: {error}"
-                    );
+                    eprintln!("warning: failed to inspect pending upgrades for {backend}: {error}");
                     failures.push(format!("{backend}: {error}"));
                     continue;
                 }
@@ -230,9 +229,7 @@ pub(crate) fn collect_upgradable_candidates(
         if !backend.accepts_list_capture(true, capture) {
             let error = render_command_failure(&invocations[index], capture);
             if aggregate {
-                eprintln!(
-                    "warning: failed to inspect pending upgrades for {backend}: {error}"
-                );
+                eprintln!("warning: failed to inspect pending upgrades for {backend}: {error}");
                 failures.push(format!("{backend}: {error}"));
                 continue;
             }
@@ -244,8 +241,7 @@ pub(crate) fn collect_upgradable_candidates(
         candidates.extend(rows.into_iter().map(package_upgrade_candidate));
     }
 
-    if let Some(error) =
-        all_backends_failed("inspect pending upgrades", backends.len(), &failures)
+    if let Some(error) = all_backends_failed("inspect pending upgrades", backends.len(), &failures)
     {
         return Err(error);
     }

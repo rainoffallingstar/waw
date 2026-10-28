@@ -3349,3 +3349,49 @@ fn show_results_json_can_encode_failures() {
         "\"error\":\"backend command failed with exit code 1: python3 -m pip show missing\""
     ));
 }
+
+#[test]
+fn only_scoop_lacks_exact_version_pinning() {
+    // `scoop install pkg@ver` rebuilds the manifest from the bucket's current
+    // definition, so the version is a hint rather than a pin.
+    assert!(!Backend::Scoop.version_pinning_is_exact());
+    assert!(Backend::Winget.version_pinning_is_exact());
+    assert!(Backend::Chocolatey.version_pinning_is_exact());
+    assert!(Backend::Npm.version_pinning_is_exact());
+    assert!(Backend::Pip.version_pinning_is_exact());
+}
+
+#[test]
+fn scoop_versioned_install_still_passes_the_version_through() {
+    // waw must not swallow the version: it is the best signal Scoop gets.
+    let config = Config::default();
+    let runtime = RuntimeSettings {
+        assume_yes: true,
+        auto_elevate: false,
+        command_timeout: None,
+        deep_search: false,
+        config: &config,
+    };
+
+    let plan = Backend::Scoop.plan_install(&[PackageSpec::parse("gh@2.7.0")], &runtime);
+    assert_eq!(plan.len(), 1);
+    assert_eq!(
+        plan[0].args,
+        vec!["install".to_string(), "gh@2.7.0".to_string()]
+    );
+}
+
+#[test]
+fn unversioned_install_plans_are_unchanged_for_scoop() {
+    let config = Config::default();
+    let runtime = RuntimeSettings {
+        assume_yes: true,
+        auto_elevate: false,
+        command_timeout: None,
+        deep_search: false,
+        config: &config,
+    };
+
+    let plan = Backend::Scoop.plan_install(&[PackageSpec::parse("gh")], &runtime);
+    assert_eq!(plan[0].args, vec!["install".to_string(), "gh".to_string()]);
+}

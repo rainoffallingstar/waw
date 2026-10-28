@@ -4,7 +4,11 @@
 //! no machine-readable alternative, so a lot of this crate is character
 //! slicing rather than structured parsing.
 
-pub(crate) fn extract_json_string_value_after_key(input: &str, start: usize, key: &str) -> Option<String> {
+pub(crate) fn extract_json_string_value_after_key(
+    input: &str,
+    start: usize,
+    key: &str,
+) -> Option<String> {
     input[start..]
         .find(key)
         .and_then(|offset| extract_json_string_value(input, start + offset))

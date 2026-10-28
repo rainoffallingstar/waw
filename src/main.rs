@@ -2,51 +2,44 @@ mod backend;
 mod capture;
 mod cli;
 mod commands;
-mod holds;
-mod text;
 mod config;
-mod elevation;
 mod discovery;
+mod elevation;
 mod exec;
+mod holds;
 mod json;
 mod model;
 mod parse;
 mod render;
+mod text;
 #[cfg(windows)]
 mod win32;
 
-use json::{JsonValue, escape_json_string, parse_json};
-use discovery::*;
-use holds::Holds;
-use text::*;
-use model::*;
 use backend::Backend;
+#[allow(unused_imports)]
+use capture::{decode_capture_text, read_capture_log, unique_capture_base};
 #[allow(unused_imports)]
 use cli::*;
 use commands::backend::*;
+use commands::collect::*;
 use commands::export::*;
 use commands::hold::*;
 use commands::install::*;
-use commands::collect::*;
-use commands::update::*;
-use commands::rank::*;
 use commands::query::*;
+use commands::rank::*;
 use commands::select::*;
+use commands::update::*;
 use config::*;
+use discovery::*;
 #[allow(unused_imports)]
 use elevation::*;
 #[allow(unused_imports)]
 use exec::*;
-#[allow(unused_imports)]
-use capture::{decode_capture_text, read_capture_log, unique_capture_base};
+use holds::Holds;
+use json::{JsonValue, escape_json_string, parse_json};
+use model::*;
 use parse::*;
 use render::*;
-#[cfg(windows)]
-use win32::{
-    CloseHandle, ERROR_CANCELLED, GetExitCodeProcess, Handle, SEE_MASK_NOCLOSEPROCESS,
-    ShellExecuteExW, ShellExecuteInfoW, TerminateProcess, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    WaitForSingleObject,
-};
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -58,6 +51,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use text::*;
+#[cfg(windows)]
+use win32::{
+    CloseHandle, ERROR_CANCELLED, GetExitCodeProcess, Handle, SEE_MASK_NOCLOSEPROCESS,
+    ShellExecuteExW, ShellExecuteInfoW, TerminateProcess, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WaitForSingleObject,
+};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -80,8 +80,6 @@ fn timeout_from_seconds(seconds: u64) -> Option<Duration> {
         seconds => Some(Duration::from_secs(seconds)),
     }
 }
-
-
 
 fn main() -> ExitCode {
     match run() {
@@ -258,6 +256,20 @@ fn run() -> Result<ExitCode, String> {
         other => other.clone(),
     };
 
+    // A versioned install is the case where `pkg@ver` can look like a pin and
+    // not be one; the upgrade path warns separately.
+    if let Subcommand::Install {
+        mode: InstallMode::Exact(specs),
+    } = &command
+    {
+        let versioned: Vec<String> = specs
+            .iter()
+            .filter(|spec| spec.version.is_some())
+            .map(|spec| spec.raw.clone())
+            .collect();
+        warn_on_inexact_version_pins(backend, &versioned);
+    }
+
     let invocations = backend.plan(&command, &runtime)?;
     execute_invocations(invocations, cli.dry_run, is_upgrade, &runtime)
 }
@@ -267,10 +279,7 @@ fn runtime_from<'a>(config: &'a Config, cli: &Cli) -> RuntimeSettings<'a> {
         assume_yes: cli.assume_yes.unwrap_or(config.assume_yes),
         auto_elevate: cli.auto_elevate.unwrap_or(config.auto_elevate),
         command_timeout: timeout_from_seconds(config.command_timeout_seconds),
-        deep_search: matches!(
-            cli.command,
-            Subcommand::Search { deep: true, .. }
-        ),
+        deep_search: matches!(cli.command, Subcommand::Search { deep: true, .. }),
         config,
     }
 }
@@ -372,11 +381,7 @@ fn resolve_single_backend(
 /// one broken tool does not hide the others. When *every* backend fails there
 /// is nothing to report, so that case must surface as a real error -- otherwise
 /// a script cannot tell "all tools broken" from "nothing installed".
-fn all_backends_failed(
-    noun: &str,
-    attempted: usize,
-    failures: &[String],
-) -> Option<String> {
+fn all_backends_failed(noun: &str, attempted: usize, failures: &[String]) -> Option<String> {
     if attempted == 0 || failures.len() < attempted {
         return None;
     }
@@ -432,7 +437,6 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-
 /// `upgrade` tracks installed packages, so a version pin there would mean
 /// "move to this exact version" rather than "install this exact version".
 /// Keep the user's spec text so `pkg@1.2.3` still upgrades to 1.2.3.
@@ -475,6 +479,9 @@ Commands:
   install <query...>       Search interactively across the selected/auto backends, then choose packages
   install --exact <pkg...> Install one or more packages directly on the selected backend
                            Pin a version with pkg@1.2.3 or pkg==1.2.3 (pip)
+                           Scoop caveat: `scoop install pkg@ver` rebuilds the
+                           manifest from the bucket's current definition, so the
+                           version is best-effort there. waw warns each time.
   remove <query...>        Search installed packages across the selected/auto backends, then choose packages to uninstall
   remove --exact <pkg...>  Uninstall one or more packages directly on the selected backend
   hold [--off] <pkg...>    Add or remove an upgrade hold

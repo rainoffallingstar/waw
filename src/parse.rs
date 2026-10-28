@@ -299,7 +299,10 @@ pub(crate) fn parse_winget_upgrade_entries(output: &str) -> Option<Vec<PackageLi
     parse_winget_tabular_entries(output, true)
 }
 
-pub(crate) fn parse_winget_tabular_entries(output: &str, upgradable: bool) -> Option<Vec<PackageListEntry>> {
+pub(crate) fn parse_winget_tabular_entries(
+    output: &str,
+    upgradable: bool,
+) -> Option<Vec<PackageListEntry>> {
     let mut entries = Vec::new();
     let mut previous_line = "";
     let mut dashed_header_seen = false;
@@ -411,7 +414,10 @@ pub(crate) fn infer_tabular_column_starts(separator_line: &str) -> Vec<usize> {
     starts
 }
 
-pub(crate) fn parse_winget_tabular_row_by_columns(line: &str, upgradable: bool) -> Option<PackageListEntry> {
+pub(crate) fn parse_winget_tabular_row_by_columns(
+    line: &str,
+    upgradable: bool,
+) -> Option<PackageListEntry> {
     let columns = split_columns_by_spacing(line);
     if upgradable {
         if columns.len() < 4 {
@@ -759,7 +765,10 @@ pub(crate) fn parse_pip_upgrade_entries(output: &str) -> Option<Vec<PackageListE
     parse_pip_json_entries(output, true)
 }
 
-pub(crate) fn parse_pip_json_entries(output: &str, upgradable: bool) -> Option<Vec<PackageListEntry>> {
+pub(crate) fn parse_pip_json_entries(
+    output: &str,
+    upgradable: bool,
+) -> Option<Vec<PackageListEntry>> {
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return Some(Vec::new());
@@ -947,19 +956,19 @@ pub(crate) fn parse_pip_show_details(output: &str) -> Option<PackageDetails> {
         .filter(|(label, value)| {
             !value.trim().is_empty()
                 && !matches!(
-                label.as_str(),
-                "Name"
-                    | "Version"
-                    | "Summary"
-                    | "Home-page"
-                    | "Homepage"
-                    | "License"
-                    | "License-Expression"
-                    | "Author"
-                    | "Author-email"
-                    | "Author Email"
-                    | "Requires"
-            )
+                    label.as_str(),
+                    "Name"
+                        | "Version"
+                        | "Summary"
+                        | "Home-page"
+                        | "Homepage"
+                        | "License"
+                        | "License-Expression"
+                        | "Author"
+                        | "Author-email"
+                        | "Author Email"
+                        | "Requires"
+                )
         })
         .map(|(label, value)| (normalize_field_label(&label), value))
         .collect();
@@ -987,7 +996,8 @@ pub(crate) const NAME_ALIASES: &[&str] = &[
     "Package",
     "名称",
 ];
-pub(crate) const VERSION_ALIASES: &[&str] = &["Version", "Installed Version", "Latest Version", "版本"];
+pub(crate) const VERSION_ALIASES: &[&str] =
+    &["Version", "Installed Version", "Latest Version", "版本"];
 pub(crate) const SUMMARY_ALIASES: &[&str] = &[
     "Summary",
     "Description",
@@ -1084,7 +1094,10 @@ pub(crate) fn is_known_label(label: &str, names: &[&str]) -> bool {
 }
 
 pub(crate) fn parse_winget_found_header(output: &str) -> Option<(String, String)> {
-    let line = output.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
     let open = line.find('[')?;
     let close = line[open..].find(']')? + open;
     let id = line[open + 1..close].trim().to_string();
@@ -1209,7 +1222,9 @@ pub(crate) fn parse_choco_package_line(output: &str) -> Option<(String, String)>
         }
         let mut parts = line.split_whitespace();
         let Some(name) = parts.next() else { continue };
-        let Some(version) = parts.next() else { continue };
+        let Some(version) = parts.next() else {
+            continue;
+        };
         if !version.starts_with(|ch: char| ch.is_ascii_digit()) {
             continue;
         }
@@ -1229,9 +1244,7 @@ pub(crate) fn parse_colon_fields(output: &str) -> Vec<(String, String)> {
 
         let indented = line.starts_with(' ') || line.starts_with('\t');
         let Some((index, width)) = split_field_line(line) else {
-            if indented
-                && let Some((_, value)) = fields.last_mut()
-            {
+            if indented && let Some((_, value)) = fields.last_mut() {
                 if !value.is_empty() {
                     value.push('\n');
                 }

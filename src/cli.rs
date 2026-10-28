@@ -142,23 +142,44 @@ impl Cli {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Subcommand {
     Update,
-    Upgrade { packages: Vec<String> },
-    Install { mode: InstallMode },
-    Remove { mode: RemoveMode },
+    Upgrade {
+        packages: Vec<String>,
+    },
+    Install {
+        mode: InstallMode,
+    },
+    Remove {
+        mode: RemoveMode,
+    },
     Hold {
         packages: Vec<String>,
         enable: bool,
         list: bool,
     },
-    Search { query: String, deep: bool },
-    List { upgradable: bool },
-    Show { package: String },
+    Search {
+        query: String,
+        deep: bool,
+    },
+    List {
+        upgradable: bool,
+    },
+    Show {
+        package: String,
+    },
     Backends,
-    Backend { action: BackendAction },
+    Backend {
+        action: BackendAction,
+    },
     /// `waw bucket [list]` -- inspect configured/available Scoop buckets.
-    Bucket { action: BucketAction },
-    Export { path: Option<PathBuf> },
-    Import { path: PathBuf },
+    Bucket {
+        action: BucketAction,
+    },
+    Export {
+        path: Option<PathBuf>,
+    },
+    Import {
+        path: PathBuf,
+    },
     Help,
 }
 
@@ -409,14 +430,22 @@ impl Subcommand {
                     if !packages.is_empty() {
                         return Err("hold --list does not take package names".to_string());
                     }
-                    return Ok(Self::Hold { packages, enable, list });
+                    return Ok(Self::Hold {
+                        packages,
+                        enable,
+                        list,
+                    });
                 }
 
                 if packages.is_empty() {
                     return Err("hold requires at least one package, or --list".to_string());
                 }
 
-                Ok(Self::Hold { packages, enable, list })
+                Ok(Self::Hold {
+                    packages,
+                    enable,
+                    list,
+                })
             }
             "search" => {
                 let mut deep = false;
@@ -503,9 +532,7 @@ impl Subcommand {
                         }
                         _ => {
                             if path.is_some() {
-                                return Err(
-                                    "import accepts only one manifest path".to_string()
-                                );
+                                return Err("import accepts only one manifest path".to_string());
                             }
                             path = Some(PathBuf::from(
                                 parser.next().expect("peeked value must exist"),

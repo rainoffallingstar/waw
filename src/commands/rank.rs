@@ -26,7 +26,9 @@ pub(crate) fn dedupe_search_candidates(candidates: Vec<SearchCandidate>) -> Vec<
     deduped
 }
 
-pub(crate) fn dedupe_installed_candidates(candidates: Vec<SearchCandidate>) -> Vec<SearchCandidate> {
+pub(crate) fn dedupe_installed_candidates(
+    candidates: Vec<SearchCandidate>,
+) -> Vec<SearchCandidate> {
     let mut deduped = Vec::new();
     for candidate in candidates {
         if !deduped.iter().any(|existing: &SearchCandidate| {
@@ -54,7 +56,10 @@ pub(crate) fn sort_search_candidates(
     // so a maintained `beautifulsoup4` outranks the abandoned `BeautifulSoup`.
     // Re-sorting here with the generic prefix heuristic would undo that, since
     // "BeautifulSoup" is an exact match and would win on rank alone.
-    if candidates.iter().all(|candidate| candidate.backend == Backend::Pip) {
+    if candidates
+        .iter()
+        .all(|candidate| candidate.backend == Backend::Pip)
+    {
         return candidates;
     }
 

@@ -44,7 +44,9 @@ pub(crate) fn choose_candidates(
             .iter()
             .enumerate()
             .filter(|(_, candidate)| {
-                candidate.label.eq_ignore_ascii_case(candidate.install_id.as_str())
+                candidate
+                    .label
+                    .eq_ignore_ascii_case(candidate.install_id.as_str())
             })
             .map(|(index, _)| index + 1)
             .collect();

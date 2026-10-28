@@ -415,7 +415,6 @@ pub(crate) fn command_works(program: &str, args: &[String]) -> bool {
         .unwrap_or(false)
 }
 
-
 pub(crate) fn append_source_arg(args: &mut Vec<String>, source: Option<&str>) {
     if let Some(source) = source {
         args.push("--source".to_string());

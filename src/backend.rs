@@ -182,7 +182,11 @@ impl Backend {
         }
     }
 
-    pub(crate) fn mutating_invocation(self, args: Vec<String>, runtime: &RuntimeSettings<'_>) -> Invocation {
+    pub(crate) fn mutating_invocation(
+        self,
+        args: Vec<String>,
+        runtime: &RuntimeSettings<'_>,
+    ) -> Invocation {
         self.base_invocation(args)
             .with_elevation(self.requires_elevation_for_mutation(runtime))
     }
@@ -240,9 +244,9 @@ impl Backend {
             Subcommand::List { upgradable } => Ok(self.plan_list(*upgradable, runtime)),
             Subcommand::Show { package } => Ok(self.plan_show(package, runtime)),
             Subcommand::Backends | Subcommand::Backend { action: _ } => Ok(Vec::new()),
-            Subcommand::Export { .. }
-            | Subcommand::Import { .. }
-            | Subcommand::Bucket { .. } => Ok(Vec::new()),
+            Subcommand::Export { .. } | Subcommand::Import { .. } | Subcommand::Bucket { .. } => {
+                Ok(Vec::new())
+            }
             Subcommand::Help => Ok(Vec::new()),
         }
     }
@@ -270,7 +274,11 @@ impl Backend {
         }
     }
 
-    pub(crate) fn plan_upgrade(self, packages: &[String], runtime: &RuntimeSettings<'_>) -> Vec<Invocation> {
+    pub(crate) fn plan_upgrade(
+        self,
+        packages: &[String],
+        runtime: &RuntimeSettings<'_>,
+    ) -> Vec<Invocation> {
         match self {
             Self::Winget => {
                 if packages.is_empty() {
@@ -380,6 +388,18 @@ impl Backend {
         self.plan_install_or_upgrade(packages, runtime, false)
     }
 
+    /// Whether `install pkg@ver` on this backend genuinely installs that
+    /// version's manifest.
+    ///
+    /// Scoop does not: `scoop install gh@2.7.0` regenerates the manifest from
+    /// the bucket's *current* definition and only takes the version string, so
+    /// the result can differ from what 2.7.0 originally shipped. That is
+    /// upstream behaviour and waw cannot fix it, but silently accepting
+    /// `pkg@ver` reads as a reproducible pin, so callers warn.
+    pub(crate) fn version_pinning_is_exact(self) -> bool {
+        !matches!(self, Self::Scoop)
+    }
+
     pub(crate) fn plan_install_or_upgrade(
         self,
         packages: &[PackageSpec],
@@ -478,11 +498,7 @@ impl Backend {
                         Some(version) => format!("{}=={version}", package.name),
                         None => package.name.clone(),
                     };
-                    let mut args = vec![
-                        "install".to_string(),
-                        spec,
-                        "--no-input".to_string(),
-                    ];
+                    let mut args = vec!["install".to_string(), spec, "--no-input".to_string()];
                     if upgrade {
                         args.push("--upgrade".to_string());
                     }
@@ -591,10 +607,9 @@ impl Backend {
     /// column of `scoop list` as "Held package".
     pub(crate) fn plan_hold_list(self) -> Option<Invocation> {
         match self {
-            Self::Winget | Self::Chocolatey => Some(self.base_invocation(vec![
-                "pin".to_string(),
-                "list".to_string(),
-            ])),
+            Self::Winget | Self::Chocolatey => {
+                Some(self.base_invocation(vec!["pin".to_string(), "list".to_string()]))
+            }
             Self::Scoop => Some(self.base_invocation(vec!["list".to_string()])),
             Self::Npm | Self::Pip => None,
         }
@@ -662,7 +677,11 @@ impl Backend {
         vec![self.search_invocation(query, runtime)]
     }
 
-    pub(crate) fn search_invocation(self, query: &str, runtime: &RuntimeSettings<'_>) -> Invocation {
+    pub(crate) fn search_invocation(
+        self,
+        query: &str,
+        runtime: &RuntimeSettings<'_>,
+    ) -> Invocation {
         match self {
             Self::Winget => {
                 let mut args = vec!["search".to_string(), query.to_string()];
@@ -702,7 +721,11 @@ impl Backend {
         candidates
     }
 
-    pub(crate) fn plan_list(self, upgradable: bool, runtime: &RuntimeSettings<'_>) -> Vec<Invocation> {
+    pub(crate) fn plan_list(
+        self,
+        upgradable: bool,
+        runtime: &RuntimeSettings<'_>,
+    ) -> Vec<Invocation> {
         match self {
             Self::Winget => {
                 if upgradable {
@@ -763,7 +786,11 @@ impl Backend {
         capture.success || matches!(self, Self::Npm if upgradable && capture.status_code == 1)
     }
 
-    pub(crate) fn parse_list_entries(self, upgradable: bool, output: &str) -> Option<Vec<PackageListEntry>> {
+    pub(crate) fn parse_list_entries(
+        self,
+        upgradable: bool,
+        output: &str,
+    ) -> Option<Vec<PackageListEntry>> {
         match (self, upgradable) {
             (Self::Winget, false) => parse_winget_list_entries(output),
             (Self::Winget, true) => parse_winget_upgrade_entries(output),
@@ -808,11 +835,12 @@ impl Backend {
             Self::Npm => parse_npm_show_details(output),
             Self::Pip => parse_pip_show_details(output),
             Self::Chocolatey => parse_choco_show_details(output),
-            Self::Winget | Self::Scoop => parse_key_value_show_details(output)
-                .map(|mut details| {
+            Self::Winget | Self::Scoop => {
+                parse_key_value_show_details(output).map(|mut details| {
                     details.backend = self;
                     details
-                }),
+                })
+            }
         }
     }
 
@@ -1019,7 +1047,6 @@ fn pip_index_cache_path() -> PathBuf {
     base.join(APP_NAME).join("pypi-index.json")
 }
 
-
 impl Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -1031,4 +1058,3 @@ impl Display for Backend {
         })
     }
 }
-

@@ -24,6 +24,12 @@ It was originally prototyped from the Rust version built during the UniGetUI-ins
 - `upgrade`
 - `install`
 - `install --exact` (accepts `pkg@1.2.3` or pip's `pkg==1.2.3`)
+
+> Scoop caveat: `scoop install pkg@ver` regenerates the manifest from the
+> bucket's current definition and only keeps the version string, so the result
+> may differ from what that release originally shipped. waw passes the version
+> through faithfully and prints a warning; the other four backends install the
+> exact version.
 - `remove`
 - `hold [--off] <pkg...>` / `hold --list`
 - `search`
