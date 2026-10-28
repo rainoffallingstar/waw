@@ -445,6 +445,7 @@ less|679.0.0|700.0.0\r\n";
             assume_yes: true,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
 
@@ -463,6 +464,7 @@ less|679.0.0|700.0.0\r\n";
             assume_yes: true,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &global_pip,
         };
         assert!(Backend::Pip.requires_elevation_for_mutation(&global_runtime));
@@ -503,6 +505,7 @@ less|679.0.0|700.0.0\r\n";
             assume_yes: true,
             auto_elevate: false,
             command_timeout: None,
+            deep_search: false,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("Git.Git@2.43.0")];
@@ -520,6 +523,7 @@ less|679.0.0|700.0.0\r\n";
             assume_yes: true,
             auto_elevate: false,
             command_timeout: None,
+            deep_search: false,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("@types/node@20.11.0")];
@@ -535,6 +539,7 @@ less|679.0.0|700.0.0\r\n";
             assume_yes: true,
             auto_elevate: false,
             command_timeout: None,
+            deep_search: false,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("requests@2.31.0")];
@@ -549,6 +554,7 @@ less|679.0.0|700.0.0\r\n";
             assume_yes: true,
             auto_elevate: false,
             command_timeout: None,
+            deep_search: false,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("nodejs.install@0.10.35")];
@@ -563,6 +569,7 @@ less|679.0.0|700.0.0\r\n";
             assume_yes: true,
             auto_elevate: false,
             command_timeout: None,
+            deep_search: false,
             config: &Config::default(),
         };
         let specs = vec![PackageSpec::parse("gh@2.7.0")];
@@ -666,16 +673,27 @@ less|679.0.0|700.0.0\r\n";
     }
 
     #[test]
-    fn pip_search_script_does_not_download_the_index() {
-        // Guard against reintroducing the whole-index download, which measured
-        // 45 MB and ~82 s per query.
+    fn pip_search_script_only_downloads_the_index_on_demand() {
+        // The default path must stay probe-only; the full index is opt-in via
+        // --deep and gated behind a cache check.
+        let (default_part, deep_part) = PIP_SEARCH_SCRIPT
+            .split_once("--deep")
+            .expect("script should distinguish deep mode");
         assert!(
-            !PIP_SEARCH_SCRIPT.contains("pypi.org/simple"),
-            "the pip search prober must not fetch the simple index"
+            !default_part.contains("pypi.org/simple"),
+            "the probe path must not fetch the simple index"
         );
         assert!(
-            PIP_SEARCH_SCRIPT.contains("/json"),
-            "the prober should use the documented per-project JSON API"
+            default_part.contains("/json"),
+            "the probe path should use the per-project JSON API"
+        );
+        assert!(
+            deep_part.contains("pypi.org/simple"),
+            "the deep path is what fetches the index"
+        );
+        assert!(
+            deep_part.contains("If-None-Match"),
+            "the deep path must revalidate with the cache ETag"
         );
     }
 
@@ -743,9 +761,7 @@ less|679.0.0|700.0.0\r\n";
 
         assert_eq!(
             cli.command,
-            Subcommand::Search {
-                query: "power toys".to_string()
-            }
+            Subcommand::Search { query: "power toys".to_string(), deep: false }
         );
     }
 
@@ -860,9 +876,7 @@ less|679.0.0|700.0.0\r\n";
         assert!(command_supports_json(&Subcommand::List {
             upgradable: false
         }));
-        assert!(command_supports_json(&Subcommand::Search {
-            query: "git".to_string()
-        }));
+        assert!(command_supports_json(&Subcommand::Search { query: "git".to_string(), deep: false }));
         assert!(!command_supports_json(&Subcommand::Backends));
         assert!(!command_supports_json(&Subcommand::Help));
     }
@@ -1001,6 +1015,7 @@ pip_user = true
             assume_yes: true,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
 
@@ -1021,6 +1036,7 @@ pip_user = true
             assume_yes: true,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
 
@@ -1046,6 +1062,7 @@ pip_user = true
             assume_yes: true,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
 
@@ -1068,6 +1085,7 @@ pip_user = true
             assume_yes: true,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
 
@@ -1718,6 +1736,7 @@ pip_user = true
             assume_yes: false,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
         let plan = Backend::Winget
@@ -1751,6 +1770,7 @@ pip_user = true
             assume_yes: true,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
         let plan = Backend::Winget
@@ -1774,6 +1794,7 @@ pip_user = true
             assume_yes: true,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
         let plan = Backend::Winget.plan_remove(
@@ -1811,13 +1832,12 @@ pip_user = true
             assume_yes: false,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
         let plan = Backend::Winget
             .plan(
-                &Subcommand::Search {
-                    query: "git".to_string(),
-                },
+                &Subcommand::Search { query: "git".to_string(), deep: false },
                 &runtime,
             )
             .expect("plan should build");
@@ -1846,6 +1866,7 @@ pip_user = true
             assume_yes: false,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
         let plan = Backend::Scoop
@@ -1987,6 +2008,7 @@ pip_user = true
             assume_yes: false,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
         let plan = Backend::Chocolatey
@@ -2812,6 +2834,7 @@ Location  : /opt/homebrew/lib/python3.14/site-packages"
             assume_yes: false,
             auto_elevate: true,
             command_timeout: None,
+            deep_search: false,
             config: &config,
         };
         let plan = Backend::Pip

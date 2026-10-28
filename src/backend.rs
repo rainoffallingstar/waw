@@ -224,7 +224,7 @@ impl Backend {
                 runtime,
             )),
             Subcommand::Hold { packages, enable } => Ok(self.plan_hold(packages, *enable, runtime)),
-            Subcommand::Search { query } => Ok(self.plan_search(query, runtime)),
+            Subcommand::Search { query, .. } => Ok(self.plan_search(query, runtime)),
             Subcommand::List { upgradable } => Ok(self.plan_list(*upgradable, runtime)),
             Subcommand::Show { package } => Ok(self.plan_show(package, runtime)),
             Subcommand::Backends | Subcommand::Backend { action: _ } => Ok(Vec::new()),
@@ -644,7 +644,7 @@ impl Backend {
                 query.to_string(),
                 "--json".to_string(),
             ]),
-            Self::Pip => self.pip_search_invocation(query),
+            Self::Pip => self.pip_search_invocation(query, runtime.deep_search),
         }
     }
 
@@ -777,16 +777,18 @@ impl Backend {
         }
     }
 
-    pub(crate) fn pip_search_invocation(self, query: &str) -> Invocation {
+    pub(crate) fn pip_search_invocation(self, query: &str, deep: bool) -> Invocation {
         let python = self.pip_python_program();
-        Invocation::owned(
-            &python,
-            vec![
-                "-c".to_string(),
-                PIP_SEARCH_SCRIPT.to_string(),
-                query.to_string(),
-            ],
-        )
+        let mut args = vec![
+            "-c".to_string(),
+            PIP_SEARCH_SCRIPT.to_string(),
+            query.to_string(),
+        ];
+        if deep {
+            args.push("--deep".to_string());
+            args.push(pip_index_cache_path().to_string_lossy().into_owned());
+        }
+        Invocation::owned(&python, args)
     }
 
     pub(crate) fn pip_python_program(self) -> String {
@@ -937,3 +939,18 @@ impl Backend {
         }
     }
 }
+
+/// Where the `--deep` index cache lives.
+///
+/// Under LOCALAPPDATA rather than next to config.toml: the cache is ~45 MB of
+/// regenerable data, while the config dir holds a small file people may edit
+/// or version-control.
+fn pip_index_cache_path() -> PathBuf {
+    let base = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(env::temp_dir);
+    base.join(APP_NAME).join("pypi-index.json")
+}
+

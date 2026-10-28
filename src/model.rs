@@ -20,6 +20,8 @@ pub(crate) struct RuntimeSettings<'a> {
     pub(crate) assume_yes: bool,
     pub(crate) auto_elevate: bool,
     pub(crate) command_timeout: Option<Duration>,
+    /// `search --deep`: consult the full PyPI index instead of guessing names.
+    pub(crate) deep_search: bool,
     pub(crate) config: &'a Config,
 }
 

@@ -146,7 +146,7 @@ pub(crate) enum Subcommand {
     Install { mode: InstallMode },
     Remove { mode: RemoveMode },
     Hold { packages: Vec<String>, enable: bool },
-    Search { query: String },
+    Search { query: String, deep: bool },
     List { upgradable: bool },
     Show { package: String },
     Backends,
@@ -402,9 +402,25 @@ impl Subcommand {
 
                 Ok(Self::Hold { packages, enable })
             }
-            "search" => Ok(Self::Search {
-                query: parser.take_required_text("search")?,
-            }),
+            "search" => {
+                let mut deep = false;
+                while let Some(arg) = parser.peek() {
+                    match arg {
+                        "--deep" => {
+                            parser.next();
+                            deep = true;
+                        }
+                        value if value.starts_with('-') => {
+                            return Err(format!("unknown option for search: {value}"));
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(Self::Search {
+                    query: parser.take_required_text("search")?,
+                    deep,
+                })
+            }
             "list" => {
                 let mut upgradable = false;
 

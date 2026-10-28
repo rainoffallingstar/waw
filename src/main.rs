@@ -150,7 +150,7 @@ fn run() -> Result<ExitCode, String> {
         return run_import(path, cli.dry_run, selected_backend, config, &runtime);
     }
 
-    if let Subcommand::Search { query } = &cli.command {
+    if let Subcommand::Search { query, .. } = &cli.command {
         let backends = resolve_auto_backends(selected_backend, config)?;
         return run_search(backends, query, &runtime, cli.json);
     }
@@ -349,6 +349,7 @@ fn handle_backend_command(
                         command_timeout: timeout_from_seconds(
                             loaded_config.config.command_timeout_seconds,
                         ),
+                        deep_search: false,
                         config: &loaded_config.config,
                     },
                 )?;
@@ -457,6 +458,10 @@ fn runtime_from<'a>(config: &'a Config, cli: &Cli) -> RuntimeSettings<'a> {
         assume_yes: cli.assume_yes.unwrap_or(config.assume_yes),
         auto_elevate: cli.auto_elevate.unwrap_or(config.auto_elevate),
         command_timeout: timeout_from_seconds(config.command_timeout_seconds),
+        deep_search: matches!(
+            cli.command,
+            Subcommand::Search { deep: true, .. }
+        ),
         config,
     }
 }
@@ -2171,7 +2176,7 @@ impl Display for Backend {
 ///   a query for "beautifulsoup" returns the abandoned 2008 package.
 /// * Yanked releases are ranked last, and a package with a strictly newer
 ///   release wins a tie against a same-named older sibling.
-const PIP_SEARCH_SCRIPT: &str = r#"import json, sys, urllib.error, urllib.request
+const PIP_SEARCH_SCRIPT: &str = r#"import gzip, json, os, sys, time, urllib.error, urllib.request
 query = sys.argv[1].strip()
 normalized = query.lower().replace(" ", "-").replace("_", "-")
 
@@ -2241,12 +2246,6 @@ def fetch(name):
         "fully_yanked": total > 0 and yanked == total,
     }
 
-hits = []
-for candidate in candidates:
-    info = fetch(candidate)
-    if info:
-        hits.append(info)
-
 def rank_key(item):
     name = item["name"].lower()
     # Names that are the query or a numeric/word variant of it form one class;
@@ -2272,7 +2271,104 @@ def rank_key(item):
         name,
     )
 
+if len(sys.argv) > 2 and sys.argv[2] == "--deep":
+    cache_path = sys.argv[3] if len(sys.argv) > 3 else ""
+    index_url = "https://pypi.org/simple/"
+    index_headers = {
+        "Accept": "application/vnd.pypi.simple.v1+json",
+        "User-Agent": "waw-cli",
+        "Accept-Encoding": "gzip",
+    }
+
+    cache = {}
+    if cache_path:
+        try:
+            with open(cache_path, "r", encoding="utf-8") as handle:
+                cache = json.load(handle)
+        except Exception:
+            cache = {}
+
+    names = cache.get("names") or []
+    etag = cache.get("etag")
+    fetched_at = cache.get("fetched_at") or 0
+    # Respect Cache-Control: max-age=600. Revalidating on every query would add
+    # a network round trip for a list that cannot have changed yet.
+    stale = (time.time() - fetched_at) > 600
+
+    if not names or stale:
+        request_headers = dict(index_headers)
+        if etag:
+            request_headers["If-None-Match"] = etag
+        try:
+            request = urllib.request.Request(index_url, headers=request_headers)
+            with urllib.request.urlopen(request, timeout=60) as response:
+                body = response.read()
+                if response.headers.get("Content-Encoding") == "gzip":
+                    body = gzip.decompress(body)
+                payload = json.loads(body)
+                names = [
+                    project.get("name")
+                    for project in payload.get("projects", [])
+                    if isinstance(project, dict) and project.get("name")
+                ]
+                etag = response.headers.get("ETag") or etag
+                stale = False
+        except urllib.error.HTTPError as error:
+            # 304 means the cached list is still current.
+            if error.code != 304:
+                names = []
+        except Exception:
+            # Network failure falls back to whatever cache exists.
+            pass
+
+        if cache_path and names:
+            try:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {"names": names, "etag": etag, "fetched_at": time.time()},
+                        handle,
+                    )
+            except Exception:
+                pass
+
+    needle = normalized
+    matches = [name for name in names if needle in name.lower()]
+    # Prefer names that start with the query, then shorter names, then
+    # alphabetical, and cap the detail lookups.
+    matches.sort(
+        key=lambda name: (
+            not name.lower().startswith(needle),
+            len(name),
+            name.lower(),
+        )
+    )
+    deep_hits = []
+    for name in matches[:20]:
+        info = fetch(name)
+        if info:
+            deep_hits.append(info)
+    deep_hits.sort(key=rank_key)
+    print(json.dumps(deep_hits))
+    sys.exit(0)
+
+hits = []
+for candidate in candidates:
+    info = fetch(candidate)
+    if info:
+        hits.append(info)
+
 hits.sort(key=rank_key)
+
+# --- --deep: search the full PyPI project index ----------------------------
+#
+# Probing only finds names the query can predict. With --deep, fetch the
+# documented simple index instead and substring-match it.
+#
+# Measured 2026-10-28: 10 MB gzipped / 45 MB decoded / 925k projects / 2.4 s
+# first fetch. The response carries an ETag and max-age=600, so later runs are
+# a conditional GET returning 304 in ~0.4 s with no body.
+
 print(json.dumps(hits))
 "#;
 
@@ -2608,7 +2704,9 @@ Commands:
   remove <query...>        Search installed packages across the selected/auto backends, then choose packages to uninstall
   remove --exact <pkg...>  Uninstall one or more packages directly on the selected backend
   hold [--off] <pkg...>    Add or remove an upgrade hold
-  search <query...>        Search the selected backend, or all enabled+available backends in auto mode
+  search [--deep] <query...>
+                           Search the selected backend or all enabled+available backends
+                           --deep (pip only): search the full PyPI index (~10 MB first run, cached)
                            Note: PyPI has no search API; pip results are name probes only
   list [--upgradable]      List packages in a normalized table, using the selected backend or all enabled+available backends in auto mode
   show <pkg>               Show normalized package details from the selected backend, or probe all enabled+available backends in auto mode
