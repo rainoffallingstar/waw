@@ -3,5 +3,6 @@
 pub(crate) mod backend;
 pub(crate) mod export;
 pub(crate) mod hold;
+pub(crate) mod install;
 pub(crate) mod query;
 pub(crate) mod select;
