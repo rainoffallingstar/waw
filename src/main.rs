@@ -2,6 +2,7 @@ mod backend;
 mod capture;
 mod cli;
 mod commands;
+mod holds;
 mod config;
 mod elevation;
 mod exec;
@@ -13,11 +14,13 @@ mod render;
 mod win32;
 
 use json::{JsonValue, escape_json_string, parse_json};
+use holds::Holds;
 use model::*;
 use backend::Backend;
 #[allow(unused_imports)]
 use cli::*;
 use commands::export::*;
+use commands::hold::*;
 use commands::query::*;
 use config::*;
 #[allow(unused_imports)]
@@ -138,7 +141,12 @@ fn run() -> Result<ExitCode, String> {
         Subcommand::Upgrade { packages } => {
             let backends = resolve_auto_backends(selected_backend, config)?;
             if packages.is_empty() {
-                return run_interactive_upgrade(backends, &runtime, cli.dry_run);
+                return run_interactive_upgrade(
+                    backends,
+                    &runtime,
+                    cli.dry_run,
+                    cli.config_path.as_deref(),
+                );
             }
             // Named packages fall through to the single-backend path.
         }
@@ -178,7 +186,22 @@ fn run() -> Result<ExitCode, String> {
         }
         Subcommand::Hold { list: true, .. } => {
             let backends = resolve_auto_backends(selected_backend, config)?;
-            return run_hold_list(backends, &runtime);
+            return run_hold_list(backends, &runtime, cli.config_path.as_deref());
+        }
+        Subcommand::Hold {
+            packages,
+            enable,
+            list: false,
+        } => {
+            let backend = resolve_single_backend(selected_backend, config)?;
+            return run_hold(
+                backend,
+                packages,
+                *enable,
+                &runtime,
+                cli.dry_run,
+                cli.config_path.as_deref(),
+            );
         }
         Subcommand::Install {
             mode: InstallMode::Exact(_),
@@ -186,7 +209,6 @@ fn run() -> Result<ExitCode, String> {
         | Subcommand::Remove {
             mode: RemoveMode::Exact(_),
         }
-        | Subcommand::Hold { list: false, .. }
         | Subcommand::Backends
         | Subcommand::Backend { .. }
         | Subcommand::Help => {
@@ -212,13 +234,22 @@ fn run() -> Result<ExitCode, String> {
         );
     }
 
-    let invocations = backend.plan(&cli.command, &runtime)?;
-    execute_invocations(
-        invocations,
-        cli.dry_run,
-        matches!(cli.command, Subcommand::Upgrade { .. }),
-        &runtime,
-    )
+    // Named upgrades are the one mutating path that can target a package waw
+    // itself is holding (pip/npm have no native pin to refuse for us).
+    let is_upgrade = matches!(cli.command, Subcommand::Upgrade { .. });
+    let command = match &cli.command {
+        Subcommand::Upgrade { packages } => Subcommand::Upgrade {
+            packages: filter_held_upgrade_targets(
+                backend,
+                packages.clone(),
+                cli.config_path.as_deref(),
+            )?,
+        },
+        other => other.clone(),
+    };
+
+    let invocations = backend.plan(&command, &runtime)?;
+    execute_invocations(invocations, cli.dry_run, is_upgrade, &runtime)
 }
 
 fn handle_backend_command(
@@ -722,6 +753,7 @@ fn run_interactive_upgrade(
     backends: Vec<Backend>,
     runtime: &RuntimeSettings<'_>,
     dry_run: bool,
+    config_path: Option<&Path>,
 ) -> Result<ExitCode, String> {
     let candidates = collect_upgradable_candidates(&backends, runtime)?;
     if candidates.is_empty() {
@@ -751,148 +783,16 @@ fn run_interactive_upgrade(
             .map(|candidate| candidate.install_id.clone())
             .collect();
         if !packages.is_empty() {
-            invocations.extend(backend.plan_upgrade(&packages, runtime));
+            let packages = filter_held_upgrade_targets(backend, packages, config_path)?;
+            if !packages.is_empty() {
+                invocations.extend(backend.plan_upgrade(&packages, runtime));
+            }
         }
     }
 
     execute_invocations(invocations, dry_run, true, runtime)
 }
 
-/// `waw hold --list`: report pinned packages per backend.
-///
-/// Backends that cannot enumerate their pins are named explicitly rather than
-/// silently omitted, so an empty table is never mistaken for "nothing is held
-/// anywhere".
-/// Parses pin listings into `(backend, package_id, pin_type)` rows.
-///
-/// winget prints a localized table:
-///
-///     名称 ID      版本   源     包钉类型
-///     -----------------------------------
-///     Git  Git.Git 2.52.0 winget Blocking
-///
-/// so the ID is the second whitespace-separated field of each data line. The
-/// header is localized, so the parser keys off structure: a dashed rule ends
-/// the header, and rows start after it.
-///
-/// Chocolatey prints one bare name per line with no type.
-fn parse_hold_rows(backend: Backend, output: &str) -> Vec<(Backend, String, String)> {
-    let mut rows = Vec::new();
-    let mut seen_separator = false;
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if backend == Backend::Chocolatey {
-            if trimmed.starts_with("Chocolatey v") || trimmed.contains(' ') {
-                continue;
-            }
-            rows.push((backend, trimmed.to_string(), "pinned".to_string()));
-            continue;
-        }
-
-        if trimmed.chars().all(|ch| ch == '-') {
-            seen_separator = true;
-            continue;
-        }
-        if !seen_separator {
-            continue;
-        }
-
-        let mut fields = trimmed.split_whitespace();
-        let Some(_name) = fields.next() else { continue };
-        let Some(id) = fields.next() else { continue };
-        let pin_type = trimmed
-            .split_whitespace()
-            .last()
-            .unwrap_or("pinned")
-            .to_string();
-        rows.push((backend, id.to_string(), pin_type));
-    }
-
-    rows
-}
-fn run_hold_list(
-    backends: Vec<Backend>,
-    runtime: &RuntimeSettings<'_>,
-) -> Result<ExitCode, String> {
-    let mut rows: Vec<(Backend, String, String)> = Vec::new();
-    let mut unsupported: Vec<Backend> = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
-
-    for backend in &backends {
-        let Some(invocation) = backend.plan_hold_list() else {
-            unsupported.push(*backend);
-            continue;
-        };
-
-        let capture = match run_capture_detailed_with_label(
-            &invocation,
-            &format!("Listing {backend} pins"),
-            runtime.command_timeout,
-        ) {
-            Ok(capture) if capture.success => capture,
-            Ok(capture) => {
-                failures.push(format!(
-                    "{backend}: {}",
-                    render_command_failure(&invocation, &capture)
-                ));
-                continue;
-            }
-            Err(error) => {
-                failures.push(format!("{backend}: {error}"));
-                continue;
-            }
-        };
-
-        rows.extend(parse_hold_rows(*backend, &capture.stdout));
-    }
-
-    if !rows.is_empty() {
-        println!();
-        let backend_w = rows.iter().map(|r| r.0.to_string().len()).max().unwrap_or(7).max(7);
-        let id_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(7).max(7);
-        let pin_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(8).max(8);
-        println!(
-            "{:<backend_w$}  {:<id_w$}  {:<pin_w$}",
-            "Backend", "Package", "Pin type"
-        );
-        println!("{:-<backend_w$}  {:-<id_w$}  {:-<pin_w$}", "", "", "");
-        for (backend, id, pin) in &rows {
-            println!("{backend:<backend_w$}  {id:<id_w$}  {pin:<pin_w$}");
-        }
-    } else {
-        println!("No held packages found.");
-    }
-
-    if !unsupported.is_empty() {
-        println!();
-        println!(
-            "Cannot list holds for: {}",
-            unsupported
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        println!("  These backends have no way to enumerate pins.");
-    }
-
-    if !failures.is_empty() {
-        for failure in &failures {
-            eprintln!("warning: {failure}");
-        }
-        return Err(format!(
-            "failed to list pins for {} backend(s)",
-            failures.len()
-        ));
-    }
-
-    Ok(ExitCode::SUCCESS)
-}
 fn run_update_all(
     backends: Vec<Backend>,
     dry_run: bool,
@@ -2251,6 +2151,7 @@ Commands:
   remove <query...>        Search installed packages across the selected/auto backends, then choose packages to uninstall
   remove --exact <pkg...>  Uninstall one or more packages directly on the selected backend
   hold [--off] <pkg...>    Add or remove an upgrade hold
+  hold --list              Show every held package across enabled backends
   search [--deep] <query...>
                            Search the selected backend or all enabled+available backends
                            --deep (pip only): search the full PyPI index (~10 MB first run, cached)
@@ -2297,6 +2198,8 @@ Examples:
   {APP_NAME} install --exact Git.Git@2.43.0
   {APP_NAME} remove git
   {APP_NAME} remove --exact Git.Git
+  {APP_NAME} hold git
+  {APP_NAME} hold --list
   {APP_NAME} hold --off Git.Git
   {APP_NAME} search powertoys
   {APP_NAME} list --upgradable

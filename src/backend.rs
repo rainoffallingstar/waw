@@ -16,6 +16,15 @@ pub(crate) enum Backend {
 }
 
 impl Backend {
+    /// Every backend, in the order used for display and for `hold --list`.
+    pub(crate) const ALL: [Backend; 5] = [
+        Backend::Winget,
+        Backend::Scoop,
+        Backend::Chocolatey,
+        Backend::Npm,
+        Backend::Pip,
+    ];
+
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
             "winget" => Ok(Self::Winget),
@@ -223,14 +232,10 @@ impl Backend {
                     .collect::<Vec<_>>(),
                 runtime,
             )),
-            Subcommand::Hold {
-                packages,
-                enable,
-                list: _,
-            } => {
-                // `hold --list` is handled in main.rs before reaching here.
-                Ok(self.plan_hold(packages, *enable, runtime))
-            }
+            // `hold` is routed to commands/hold.rs before reaching here: it
+            // may need to resolve an id or write holds.toml, neither of which
+            // is expressible as a single invocation.
+            Subcommand::Hold { .. } => Ok(Vec::new()),
             Subcommand::Search { query, .. } => Ok(self.plan_search(query, runtime)),
             Subcommand::List { upgradable } => Ok(self.plan_list(*upgradable, runtime)),
             Subcommand::Show { package } => Ok(self.plan_show(package, runtime)),
@@ -569,22 +574,37 @@ impl Backend {
         }
     }
 
-    /// The command that reports this backend's pinned packages, or `None` when
-    /// the backend has no way to enumerate them.
+    /// Whether `hold` for this backend is backed by waw's own `holds.toml`
+    /// rather than a pin the backend itself understands.
     ///
-    /// Scoop is the awkward one: `scoop hold` only *sets* a hold and there is
-    /// no listing subcommand, so this returns None rather than guessing.
+    /// npm and pip have no notion of a held package, so waw has to remember the
+    /// request itself. The other three do, and delegating keeps their own
+    /// upgrade paths (and other tools) honouring the hold.
+    pub(crate) fn uses_waw_holds(self) -> bool {
+        matches!(self, Self::Npm | Self::Pip)
+    }
+
+    /// The command that reports this backend's held packages, or `None` when
+    /// there is nothing to ask.
+    ///
+    /// Scoop has no `hold --list`; its hold state only surfaces in the `Info`
+    /// column of `scoop list` as "Held package".
     pub(crate) fn plan_hold_list(self) -> Option<Invocation> {
         match self {
             Self::Winget | Self::Chocolatey => Some(self.base_invocation(vec![
                 "pin".to_string(),
                 "list".to_string(),
             ])),
-            Self::Scoop | Self::Npm | Self::Pip => None,
+            Self::Scoop => Some(self.base_invocation(vec!["list".to_string()])),
+            Self::Npm | Self::Pip => None,
         }
     }
 
-    pub(crate) fn plan_hold(
+    /// Plans a *native* hold. Only meaningful for the three backends that
+    /// ship one; npm and pip are recorded in `holds.toml` instead (see
+    /// `uses_waw_holds`). An empty result therefore means "nothing to run",
+    /// which is why the caller must have already routed waw-owned holds.
+    pub(crate) fn plan_hold_pin(
         self,
         packages: &[String],
         enable: bool,
@@ -634,9 +654,7 @@ impl Backend {
                     )
                 })
                 .collect(),
-            Self::Npm | Self::Pip => vec![Invocation::message(
-                "This backend does not support a native hold/pin operation.",
-            )],
+            Self::Npm | Self::Pip => Vec::new(),
         }
     }
 
@@ -757,6 +775,31 @@ impl Backend {
             (Self::Npm, true) => parse_npm_upgrade_entries(output),
             (Self::Pip, false) => parse_pip_list_entries(output),
             (Self::Pip, true) => parse_pip_upgrade_entries(output),
+        }
+    }
+
+    /// Parses `hold --list` output into `(package id, pin type)` rows.
+    ///
+    /// Each backend formats this differently and none of them offer JSON here,
+    /// so the shapes are hand-parsed:
+    ///
+    /// winget prints a localized table; the header is translated but the dashed
+    /// rule is not, so rows are read after it and the id is the second field:
+    ///
+    ///     名称 ID      版本   源     包钉类型
+    ///     -----------------------------------
+    ///     Git  Git.Git 2.52.0 winget Blocking
+    ///
+    /// choco prints one bare name per line (after a version banner).
+    ///
+    /// scoop has no listing command; holds appear as an `Info` column value of
+    /// `Held package` in `scoop list`.
+    pub(crate) fn parse_holds(self, output: &str) -> Vec<(String, String)> {
+        match self {
+            Self::Winget => parse_winget_pin_rows(output),
+            Self::Chocolatey => parse_choco_pin_rows(output),
+            Self::Scoop => parse_scoop_held_rows(output),
+            Self::Npm | Self::Pip => Vec::new(),
         }
     }
 

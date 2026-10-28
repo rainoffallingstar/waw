@@ -2039,16 +2039,7 @@ fn chocolatey_hold_plan_uses_pin_add() {
         deep_search: false,
         config: &config,
     };
-    let plan = Backend::Chocolatey
-        .plan(
-            &Subcommand::Hold {
-                packages: vec!["git".to_string()],
-                enable: true,
-                list: false,
-            },
-            &runtime,
-        )
-        .expect("plan should build");
+    let plan = Backend::Chocolatey.plan_hold_pin(&["git".to_string()], true, &runtime);
 
     assert_eq!(plan.len(), 1);
     assert_program_matches(&plan[0].program, &["choco", "choco.exe", "choco.bat"]);
@@ -2061,6 +2052,33 @@ fn chocolatey_hold_plan_uses_pin_add() {
             "git".to_string(),
         ]
     );
+}
+
+#[test]
+fn holding_through_backend_plan_is_a_no_op() {
+    // `hold` is routed to commands/hold.rs: it may need to resolve an id
+    // or write holds.toml, neither of which is one invocation.
+    let config = Config::default();
+    let runtime = RuntimeSettings {
+        assume_yes: false,
+        auto_elevate: true,
+        command_timeout: None,
+        deep_search: false,
+        config: &config,
+    };
+
+    let plan = Backend::Winget
+        .plan(
+            &Subcommand::Hold {
+                packages: vec!["Git.Git".to_string()],
+                enable: true,
+                list: false,
+            },
+            &runtime,
+        )
+        .expect("plan should build");
+
+    assert!(plan.is_empty());
 }
 
 #[test]
@@ -2105,8 +2123,16 @@ fn winget_hold_list_plan_uses_pin_list() {
 }
 
 #[test]
+fn scoop_hold_list_uses_scoop_list_because_hold_has_no_listing() {
+    let invocation = Backend::Scoop
+        .plan_hold_list()
+        .expect("scoop exposes hold state through list");
+    assert_eq!(invocation.args, vec!["list".to_string()]);
+}
+
+#[test]
 fn backends_without_pin_enumeration_return_none() {
-    assert!(Backend::Scoop.plan_hold_list().is_none());
+    // Their holds live in waw's own file, so there is nothing to ask.
     assert!(Backend::Npm.plan_hold_list().is_none());
     assert!(Backend::Pip.plan_hold_list().is_none());
 }
@@ -2121,40 +2147,42 @@ fn parses_winget_localized_pin_table() {
         "PowerToys Microsoft.PowerToys 0.95.0 winget Pinned\r\n",
     );
 
-    let rows = parse_hold_rows(Backend::Winget, output);
     assert_eq!(
-        rows,
+        Backend::Winget.parse_holds(output),
         vec![
-            (
-                Backend::Winget,
-                "Git.Git".to_string(),
-                "Blocking".to_string()
-            ),
-            (
-                Backend::Winget,
-                "Microsoft.PowerToys".to_string(),
-                "Pinned".to_string()
-            ),
+            ("Git.Git".to_string(), "Blocking".to_string()),
+            ("Microsoft.PowerToys".to_string(), "Pinned".to_string()),
         ]
     );
 }
 
 #[test]
 fn parses_chocolatey_pin_list() {
-    let output = concat!("Chocolatey v2.4.1\r\n", "git\r\n", "vlc\r\n",);
+    let output = concat!("Chocolatey v2.4.1\r\n", "git\r\n", "vlc\r\n");
 
-    let rows = parse_hold_rows(Backend::Chocolatey, output);
     assert_eq!(
-        rows,
+        Backend::Chocolatey.parse_holds(output),
         vec![
-            (Backend::Chocolatey, "git".to_string(), "pinned".to_string()),
-            (Backend::Chocolatey, "vlc".to_string(), "pinned".to_string()),
+            ("git".to_string(), "pinned".to_string()),
+            ("vlc".to_string(), "pinned".to_string()),
         ]
     );
 }
 
 #[test]
-fn hold_list_parser_ignores_text_before_the_rule() {
+fn chocolatey_pin_list_ignores_prose_lines() {
+    // `choco pin list` with nothing pinned prints a banner and a sentence,
+    // neither of which is a package name.
+    let output = concat!(
+        "Chocolatey v2.4.1\r\n",
+        "No pins were found in your configuration.\r\n",
+    );
+
+    assert!(Backend::Chocolatey.parse_holds(output).is_empty());
+}
+
+#[test]
+fn winget_pin_parser_ignores_text_before_the_rule() {
     let output = concat!(
         "No pins matched the given criteria.\r\n",
         "\r\n",
@@ -2162,7 +2190,7 @@ fn hold_list_parser_ignores_text_before_the_rule() {
         "-------------------\r\n",
     );
 
-    assert!(parse_hold_rows(Backend::Winget, output).is_empty());
+    assert!(Backend::Winget.parse_holds(output).is_empty());
 }
 
 #[test]
@@ -2954,7 +2982,10 @@ fn npm_upgradable_list_accepts_exit_code_one() {
 }
 
 #[test]
-fn pip_hold_returns_informational_message() {
+fn pip_and_npm_hold_lives_in_waws_own_file() {
+    // Neither backend can pin, so waw records the request instead. The
+    // native planner must stay empty: producing an invocation here would
+    // mean running a command that does not exist.
     let config = Config::default();
     let runtime = RuntimeSettings {
         assume_yes: false,
@@ -2963,22 +2994,200 @@ fn pip_hold_returns_informational_message() {
         deep_search: false,
         config: &config,
     };
-    let plan = Backend::Pip
-        .plan(
-            &Subcommand::Hold {
-                packages: vec!["requests".to_string()],
-                enable: true,
-                list: false,
-            },
-            &runtime,
-        )
-        .expect("plan should build");
+
+    assert!(Backend::Pip.uses_waw_holds());
+    assert!(Backend::Npm.uses_waw_holds());
+    assert!(!Backend::Winget.uses_waw_holds());
+    assert!(!Backend::Scoop.uses_waw_holds());
+    assert!(!Backend::Chocolatey.uses_waw_holds());
+
+    assert!(
+        Backend::Pip
+            .plan_hold_pin(&["requests".to_string()], true, &runtime)
+            .is_empty()
+    );
+}
+
+#[test]
+fn holds_round_trip_through_toml() {
+    let mut holds = Holds::default();
+    holds.insert(Backend::Pip, "requests".to_string());
+    holds.insert(Backend::Pip, "django".to_string());
+    holds.insert(Backend::Npm, "typescript".to_string());
+
+    let rendered = holds.to_toml();
+    let reparsed = Holds::parse(&rendered).expect("round trip should parse");
 
     assert_eq!(
-        plan,
-        vec![Invocation::message(
-            "This backend does not support a native hold/pin operation.",
-        )]
+        reparsed.packages(Backend::Pip),
+        holds.packages(Backend::Pip)
+    );
+    assert_eq!(
+        reparsed.packages(Backend::Pip),
+        vec!["django".to_string(), "requests".to_string()],
+        "packages should be stored in a stable order"
+    );
+    assert_eq!(
+        reparsed.packages(Backend::Npm),
+        vec!["typescript".to_string()]
+    );
+    assert!(reparsed.packages(Backend::Winget).is_empty());
+}
+
+#[test]
+fn holds_insert_dedupes_case_insensitively() {
+    let mut holds = Holds::default();
+    holds.insert(Backend::Pip, "Requests".to_string());
+    holds.insert(Backend::Pip, "requests".to_string());
+
+    assert_eq!(holds.packages(Backend::Pip).len(), 1);
+    assert!(holds.contains(Backend::Pip, "REQUESTS"));
+}
+
+#[test]
+fn holds_remove_reports_whether_anything_changed() {
+    let mut holds = Holds::default();
+    holds.insert(Backend::Pip, "requests".to_string());
+
+    assert!(holds.remove(Backend::Pip, "requests"));
+    assert!(!holds.remove(Backend::Pip, "requests"));
+    assert!(!holds.contains(Backend::Pip, "requests"));
+}
+
+#[test]
+fn holds_reject_unknown_backend_keys() {
+    let error = Holds::parse("conda = [\"numpy\"]\n").expect_err("should reject");
+    assert!(error.contains("unsupported backend"), "{error}");
+}
+
+#[test]
+fn held_upgrade_targets_are_filtered_for_pip_only() {
+    let mut holds = Holds::default();
+    holds.insert(Backend::Pip, "requests".to_string());
+    holds.insert(Backend::Winget, "Git.Git".to_string());
+
+    let (kept, skipped) = holds.filter_upgrade_targets(
+        Backend::Pip,
+        &["requests".to_string(), "flask==2.0".to_string()],
+    );
+    assert_eq!(kept, vec!["flask==2.0".to_string()]);
+    assert_eq!(skipped, vec!["requests".to_string()]);
+
+    // A native pin is enforced by the backend itself; filtering here would
+    // let a stale holds.toml override a pin the user removed there.
+    let (kept, skipped) = holds.filter_upgrade_targets(Backend::Winget, &["Git.Git".to_string()]);
+    assert_eq!(kept, vec!["Git.Git".to_string()]);
+    assert!(skipped.is_empty());
+}
+
+#[test]
+fn upgrade_filter_strips_version_suffix_before_matching() {
+    let mut holds = Holds::default();
+    holds.insert(Backend::Pip, "requests".to_string());
+
+    let (kept, skipped) =
+        holds.filter_upgrade_targets(Backend::Pip, &["requests==2.31".to_string()]);
+    assert!(kept.is_empty());
+    assert_eq!(skipped, vec!["requests==2.31".to_string()]);
+}
+
+#[test]
+fn winget_id_heuristic_recognises_dotted_ids() {
+    assert!(looks_like_winget_id("Git.Git"));
+    assert!(looks_like_winget_id("Microsoft.PowerToys"));
+    assert!(!looks_like_winget_id("git"));
+    assert!(!looks_like_winget_id("power toys"));
+}
+
+#[test]
+fn resolving_a_winget_id_prefers_an_exact_id_then_name_then_suffix() {
+    let entries = vec![
+        PackageListEntry {
+            backend: Backend::Winget,
+            name: "Git".to_string(),
+            package_id: "Git.Git".to_string(),
+            current_version: "2.52.0".to_string(),
+            available_version: None,
+        },
+        PackageListEntry {
+            backend: Backend::Winget,
+            name: "Microsoft Git".to_string(),
+            package_id: "Microsoft.Git".to_string(),
+            current_version: "2.56.0".to_string(),
+            available_version: None,
+        },
+    ];
+
+    assert_eq!(
+        resolve_one_winget_id("Git.Git", &entries).expect("exact id"),
+        "Git.Git"
+    );
+    assert_eq!(
+        resolve_one_winget_id("Git", &entries).expect("exact name"),
+        "Git.Git",
+        "the exact display name wins over a suffix match"
+    );
+    assert_eq!(
+        resolve_one_winget_id("git", &entries).expect("case-insensitive name"),
+        "Git.Git"
+    );
+}
+
+#[test]
+fn resolving_an_ambiguous_winget_suffix_is_an_error() {
+    let entries = vec![
+        PackageListEntry {
+            backend: Backend::Winget,
+            name: "Git".to_string(),
+            package_id: "Git.Git".to_string(),
+            current_version: "2.52.0".to_string(),
+            available_version: None,
+        },
+        PackageListEntry {
+            backend: Backend::Winget,
+            name: "Microsoft Git".to_string(),
+            package_id: "Microsoft.Git".to_string(),
+            current_version: "2.56.0".to_string(),
+            available_version: None,
+        },
+    ];
+
+    let error = resolve_one_winget_id("git-fork", &entries).expect_err("no match");
+    assert!(
+        error.contains("Git.Git") || error.contains("full id"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scoop_hold_list_is_parsed_from_the_info_column() {
+    let output = concat!(
+        "Installed apps:\r\n",
+        "\r\n",
+        "Name         Version      Source Updated             Info        \r\n",
+        "----         -------      ------ -------             ----        \r\n",
+        "aria2        1.37.0-1     main   2025-02-13 13:17:03             \r\n",
+        "sudo         0.2020.01.26 main   2026-10-28 15:39:16 Held package\r\n",
+    );
+
+    assert_eq!(
+        Backend::Scoop.parse_holds(output),
+        vec![("sudo".to_string(), "Held package".to_string())]
+    );
+}
+
+#[test]
+fn scoop_hold_list_accepts_the_other_info_flags() {
+    // A held global app reports two flags comma-joined.
+    let output = concat!(
+        "Name Version Source Updated Info\r\n",
+        "---- ------- ------ ------- ----\r\n",
+        "sudo 1.0     main   2026-01-01 Global install, Held package\r\n",
+    );
+
+    assert_eq!(
+        Backend::Scoop.parse_holds(output),
+        vec![("sudo".to_string(), "Held package".to_string())]
     );
 }
 

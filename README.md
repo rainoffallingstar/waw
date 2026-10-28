@@ -25,7 +25,7 @@ It was originally prototyped from the Rust version built during the UniGetUI-ins
 - `install`
 - `install --exact` (accepts `pkg@1.2.3` or pip's `pkg==1.2.3`)
 - `remove`
-- `hold`
+- `hold [--off] <pkg...>` / `hold --list`
 - `search`
 - `list [--upgradable]`
 - `show`

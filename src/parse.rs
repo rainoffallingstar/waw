@@ -1284,6 +1284,115 @@ pub(crate) fn compact_label(label: &str) -> String {
         .collect()
 }
 
+/// `winget pin list`: a localized header, a dashed rule, then one row each.
+///
+/// Columns are name / id / version / source / pin type. Both the name and the
+/// id can contain spaces in principle, but winget pads with at least two
+/// spaces between columns, so the split is on runs of whitespace.
+pub(crate) fn parse_winget_pin_rows(output: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let mut seen_rule = false;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if !seen_rule {
+            // Localized headers mean structure is the only reliable signal.
+            if trimmed.chars().all(|ch| ch == '-') && trimmed.len() > 3 {
+                seen_rule = true;
+            }
+            continue;
+        }
+
+        let mut fields = trimmed.split_whitespace();
+        let Some(_name) = fields.next() else { continue };
+        let Some(id) = fields.next() else { continue };
+        let pin_type = trimmed
+            .split_whitespace()
+            .last()
+            .unwrap_or("pinned")
+            .to_string();
+        rows.push((id.to_string(), pin_type));
+    }
+
+    rows
+}
+
+/// `choco pin list`: a `Chocolatey vX.Y.Z` banner, then one name per line.
+///
+/// Names never contain spaces in Chocolatey, which is what makes a bare
+/// line-per-name parse safe here.
+pub(crate) fn parse_choco_pin_rows(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("Chocolatey v"))
+        // Anything with a space is prose (a warning, or the empty-state note),
+        // not a package name.
+        .filter(|line| !line.contains(' '))
+        .map(|line| (line.to_string(), "pinned".to_string()))
+        .collect()
+}
+
+/// `scoop list` rows whose `Info` column contains `Held package`.
+///
+/// Scoop has no hold listing at all: `scoop hold` writes a flag into the app's
+/// install manifest and `scoop list` renders it under `Info`. The columns are
+/// found from the `Version`/`Source` headers, and `Info` is everything after
+/// the source column.
+pub(crate) fn parse_scoop_held_rows(output: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let mut previous_line = "";
+    let mut version_index = None;
+    let mut source_index = None;
+    let mut saw_separator = false;
+
+    for line in output.lines() {
+        if !saw_separator && line.contains("---") {
+            version_index = find_char_index(previous_line, "Version");
+            source_index = find_char_index(previous_line, "Source");
+            saw_separator = true;
+            previous_line = line;
+            continue;
+        }
+
+        if !saw_separator {
+            previous_line = line;
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            previous_line = line;
+            continue;
+        }
+
+        let (Some(version_index), Some(source_index)) = (version_index, source_index) else {
+            previous_line = line;
+            continue;
+        };
+        let source_index = source_index.max(version_index);
+
+        // The name column ends where the version column starts.
+        let name = slice_chars(line, 0, version_index).trim().to_string();
+        // `Info` is the rest of the line after the source column, but the
+        // source column itself has a fixed width, so look for the marker
+        // anywhere past it.
+        let tail = slice_chars(line, source_index, usize::MAX);
+        if !name.is_empty() && tail.contains("Held package") {
+            rows.push((name, "Held package".to_string()));
+        }
+
+        previous_line = line;
+    }
+
+    rows
+}
+
 pub(crate) fn split_list_value(value: &str) -> Vec<String> {
     value
         .split([',', '\n'])
